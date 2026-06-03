@@ -11,7 +11,7 @@ npm start
 
 En PowerShell de Windows, si `npm` esta bloqueado por la politica de scripts, usa:
 
-```bash
+```powershell
 npm.cmd install
 npm.cmd start
 ```
@@ -31,37 +31,6 @@ npm.cmd start
 - Seleccion de skins estilo bandeja inferior y accion principal **Aplicar seleccion**.
 - Vista de referencia para endpoints de Riot ID, Match-V5, Spectator-V5 y Data Dragon.
 - Boilerplate legal visible requerido por Riot para productos con su IP.
-
-## Nota sobre Riot API
-
-No incluyas una API key de Riot dentro del codigo.
-
-La forma mas comoda es abrir la app, ir a **Jugador**, pegar la clave en **API key de sesion** y pulsar **Usar key**. Esa clave queda solo en memoria mientras la app esta abierta; no se guarda en disco ni en `localStorage`.
-
-Tambien puedes iniciar la app con la variable de entorno `RIOT_API_KEY`.
-
-PowerShell:
-
-```powershell
-$env:RIOT_API_KEY="RGAPI-tu-clave"
-npm.cmd start
-```
-
-CMD:
-
-```bat
-set RIOT_API_KEY=RGAPI-tu-clave
-npm.cmd start
-```
-
-La busqueda de jugadores usa Riot ID (`gameName#tagLine`) segun la documentacion oficial:
-
-https://developer.riotgames.com/docs/lol
-
-La tier list no viene de Riot API oficial. Usa U.GG como fuente principal por linea activa y cae al dataset publico `HakimT/lol-champion-ranked-stats` de Hugging Face si U.GG no responde:
-
-https://u.gg/lol/tier-list
-https://huggingface.co/datasets/HakimT/lol-champion-ranked-stats
 
 ## Mods y skins
 
@@ -83,3 +52,33 @@ Rift Atlas no ejecuta `mkoverlay`, `runoverlay` ni mantiene overlays vivos desde
 - cslol-manager: https://github.com/LeagueToolkit/cslol-manager
 - LTK Manager: https://github.com/LeagueToolkit/ltk-manager
 - LeagueSkins: https://github.com/Alban1911/LeagueSkins
+
+## Desarrollo
+
+Instalar dependencias:
+
+```bash
+npm install
+```
+
+Ejecutar en desarrollo:
+
+```bash
+npm start
+```
+
+## Git
+
+El repositorio ignora:
+
+```text
+node_modules/
+dist/
+package-lock.json
+```
+
+Para publicar una build, subi el instalador a un host externo o a GitHub Releases. No subas `dist` ni `node_modules` al repositorio.
+
+## Aviso
+
+Rift Atlas es una herramienta local de escritorio. El uso de mods personalizados queda bajo responsabilidad del usuario.
