@@ -8,7 +8,7 @@ Descargá e instalá Rift Atlas.
 
 En **Descargas** bajá:
 
-✅ Engine + DLL
+✅ Engine
 ✅ Skins de LeagueSkins
 
 ## 3. Detectar League
