@@ -1,83 +1,55 @@
-# Rift Atlas
+# Rift Atlas - Instalación y Uso Básico
 
-Aplicacion de escritorio con Electron para explorar campeones de League of Legends usando datos publicos oficiales de Riot Data Dragon.
+## 1. Instalar
 
-## Ejecutar
+Descargá e instalá Rift Atlas.
 
-```bash
-npm install
-npm start
-```
+## 2. Descargar archivos
 
-En PowerShell de Windows, si `npm` esta bloqueado por la politica de scripts, usa:
+En **Descargas** bajá:
 
-```powershell
-npm.cmd install
-npm.cmd start
-```
+✅ Engine + DLL
+✅ Skins de LeagueSkins
 
-## Que incluye
+## 3. Detectar League
 
-- Catalogo de campeones con busqueda y filtro por rol.
-- Tier list por linea con winrate, pickrate, banrate y partidas. Carga solo la linea activa.
-- Detalle con splash art, lore, dificultad, estadisticas y habilidades.
-- Favoritos guardados localmente con `localStorage`.
-- Busqueda de jugadores por Riot ID.
-- Perfil, clasificatorias, partida activa, ultimas partidas, equipos, CS, build final y tiempos de compra usando Riot API.
-- Seccion Skins para configurar rutas, seleccionar paquetes de LeagueSkins e importarlos a cslol.
-- Descarga oficial de `cslol-manager-windows.exe` desde GitHub Releases.
-- Biblioteca LeagueSkins local con busqueda, filtro por campeon, iconos y toggles de skins gestionadas por Rift Atlas.
-- Importacion directa de paquetes `.zip`/`.fantome` hacia la carpeta `installed` de cslol usando `mod-tools.exe`.
-- Seleccion de skins estilo bandeja inferior y accion principal **Aplicar seleccion**.
-- Vista de referencia para endpoints de Riot ID, Match-V5, Spectator-V5 y Data Dragon.
-- Boilerplate legal visible requerido por Riot para productos con su IP.
+Andá a:
 
-## Mods y skins
+**Configuración → Configuración → Detectar**
 
-La seccion Mods no inyecta paquetes en League of Legends ni reemplaza a cslol-manager. Puede importar paquetes locales `.zip`/`.fantome` a la biblioteca `installed` de cslol mediante `mod-tools.exe`, y luego cslol-manager sigue siendo quien activa perfiles y ejecuta los mods. Evita contenido que replique skins pagas, contenido limitado o cualquier mod que de ventaja competitiva.
+La ruta debe apuntar a:
 
-Rift Atlas no copia LeagueSkins dentro de `src/skins`: esa carpeta haria el proyecto enorme y mezclaria assets de terceros con el codigo. En su lugar, selecciona una carpeta local donde tengas LeagueSkins descargado/clonado, y la app indexa esa biblioteca. Las skins marcadas como gestionadas quedan guardadas en `localStorage` como rutas locales.
+`C:\Riot Games\League of Legends\Game\League of Legends.exe`
 
-Para usar Skins:
+No uses `LeagueClient.exe`.
 
-1. Descarga o selecciona `cslol-manager.exe`.
-2. Configura `mod-tools.exe`; normalmente esta en `cslol-tools/mod-tools.exe` al lado de cslol-manager.
-3. Configura `League of Legends.exe`; normalmente esta en `C:\Riot Games\League of Legends\Game\League of Legends.exe`. No uses `LeagueClient.exe`.
-4. Selecciona tu carpeta LeagueSkins.
-5. Pulsa **Seleccionar** en las skins que quieres usar.
-6. Pulsa **Aplicar seleccion**. Rift Atlas importa los paquetes y abre cslol-manager para que ejecutes el perfil desde cslol.
+## 4. Seleccionar skins
 
-Rift Atlas no ejecuta `mkoverlay`, `runoverlay` ni mantiene overlays vivos desde Electron. Esa parte queda dentro de cslol-manager.
+Entrá a **Skins** y elegí las skins/mods que quieras usar.
 
-- cslol-manager: https://github.com/LeagueToolkit/cslol-manager
-- LTK Manager: https://github.com/LeagueToolkit/ltk-manager
-- LeagueSkins: https://github.com/Alban1911/LeagueSkins
+## 5. Ejecutar
 
-## Desarrollo
+Presioná **Ejecutar**.
 
-Instalar dependencias:
+## 6. Esperar
 
-```bash
-npm install
-```
+Estado en la parte superior:
 
-Ejecutar en desarrollo:
+🟡 **Cargando** → Esperá.
+🟢 **Overlay Activo** → Entrá a partida.
 
-```bash
-npm start
-```
+## 7. Jugar
 
-## Git
+Dejá Rift Atlas abierto mientras jugás.
 
-El repositorio ignora:
+## Descripción
 
-```text
-node_modules/
-dist/
-package-lock.json
-```
+Rift Atlas es una aplicación de escritorio para League of Legends que ayuda a gestionar engine, DLL, LeagueSkins y mods desde una interfaz local.
 
-Para publicar una build, subi el instalador a un host externo o a GitHub Releases. No subas `dist` ni `node_modules` al repositorio.
+- Configura League y la DLL.
+- Indexa LeagueSkins locales.
+- Aplica skins y mods a cslol.
+- Ejecuta el overlay desde la app.
 
 ## Aviso
 
