@@ -1,0 +1,60 @@
+{
+  "name": "lol-companion-electron",
+  "version": "1.0.0",
+  "description": "Aplicacion Electron de League of Legends basada en Data Dragon.",
+  "main": "main.js",
+  "scripts": {
+    "start": "set ELECTRON_RUN_AS_NODE=&& electron .",
+    "check": "node --check main.js && node --check preload.js && node --check src/renderer.js",
+    "build": "electron-builder --win nsis",
+    "dist": "electron-builder --win nsis"
+  },
+  "keywords": [
+    "electron",
+    "league-of-legends",
+    "riot",
+    "data-dragon"
+  ],
+  "author": "",
+  "license": "MIT",
+  "build": {
+    "appId": "com.riftatlas.desktop",
+    "productName": "Rift Atlas",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "assets/**/*",
+      "src/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/7z-wasm/**/*",
+      "assets/cslol-dll.dll"
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "electron": "39.8.5",
+    "electron-builder": "^26.8.1"
+  },
+  "dependencies": {
+    "7z-wasm": "^1.2.0",
+    "extract-zip": "^2.0.1",
+    "peerjs": "^1.5.5",
+    "yauzl": "^3.3.2"
+  }
+}
