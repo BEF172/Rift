@@ -77,6 +77,7 @@ const LTK_REPO_API = "https://api.github.com/repos/LeagueToolkit/ltk-manager/rel
 const CSLOL_REPO_API = "https://api.github.com/repos/LeagueToolkit/cslol-manager/releases/latest";
 const HITORI_RELEASE_API = "https://api.github.com/repos/hitori-rebocchi/hitori-bocchi/releases/latest";
 const LEAGUE_SKINS_REPO_API = "https://api.github.com/repos/Alban1911/LeagueSkins";
+const RIFT_ATLAS_RELEASE_API = "https://api.github.com/repos/BEF172/Rift/releases/latest";
 const SKIN_INDEX_CACHE_VERSION = 7;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1332,8 +1333,34 @@ const getAppReleaseInfo = async () => {
   if (process.env.GITHUB_TOKEN || process.env.GH_TOKEN) {
     headers.Authorization = `token ${process.env.GITHUB_TOKEN || process.env.GH_TOKEN}`;
   }
-  return await fetchJsonWithTimeout(APP_UPDATE_API, { headers });
+  return await fetchJsonWithTimeout(RIFT_ATLAS_RELEASE_API, { headers }, 15000);
 };
+
+ipcMain.handle("app:check-updates", async () => {
+  const currentVersion = app.getVersion();
+  const release = await getAppReleaseInfo();
+  const latestVersion = normalizeVersion(release.tag_name || release.name || "");
+  if (!latestVersion) {
+    throw new Error("El ultimo release no tiene version.");
+  }
+
+  const setupAsset = (release.assets || []).find((asset) =>
+    /\.exe$/i.test(asset.name || "") && /setup|rift|atlas/i.test(asset.name || "")
+  ) || (release.assets || []).find((asset) => /\.exe$/i.test(asset.name || ""));
+  const downloadUrl = setupAsset?.browser_download_url || release.html_url || "";
+
+  return {
+    currentVersion,
+    latestVersion,
+    releaseName: release.name || release.tag_name || latestVersion,
+    releaseUrl: release.html_url || "",
+    downloadUrl,
+    assetName: setupAsset?.name || "",
+    publishedAt: release.published_at || "",
+    notes: String(release.body || "").slice(0, 1200),
+    hasUpdate: compareVersions(latestVersion, currentVersion) > 0
+  };
+});
 
 ipcMain.handle("app:open-external", (_event, url) => {
   const target = String(url || "");

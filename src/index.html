@@ -578,6 +578,20 @@
                 <button id="runDiagnosticsButton" class="docs-link" type="button">Comprobar instalacion</button>
               </div>
               <div id="diagnosticsList" class="diagnostics-list"></div>
+              <div id="updatePanel" class="manager-panel update-panel">
+                <div>
+                  <span>Actualizaciones</span>
+                  <strong id="updateStatusLabel">Buscando actualizaciones...</strong>
+                  <small id="updateDetailsLabel">Rift Atlas revisa GitHub Releases al iniciar.</small>
+                </div>
+                <label id="updateHideLabel" class="update-hide-option" hidden>
+                  <input id="updateHideCheckbox" type="checkbox" />
+                  No volver a mostrar esta version
+                </label>
+                <button id="updateDownloadButton" class="docs-link" type="button" hidden>Actualizar</button>
+                <button id="updateDismissButton" class="secondary-button" type="button" hidden>Ahora no</button>
+                <button id="checkUpdatesButton" class="secondary-button" type="button">Buscar</button>
+              </div>
               <div class="manager-panel">
                 <div>
                   <span>Configuracion</span>

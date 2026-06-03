@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld("riftAtlas", {
   getTierLane: (payload) => ipcRenderer.invoke("tiers:get-lane", payload),
   getChampionBuild: (payload) => ipcRenderer.invoke("builds:get-champion", payload),
   openExternal: (url) => ipcRenderer.invoke("app:open-external", url),
+  checkUpdates: () => ipcRenderer.invoke("app:check-updates"),
   getUserDataPath: () => ipcRenderer.invoke("app:get-user-data-path"),
   openUserDataPath: () => ipcRenderer.invoke("app:open-user-data-path"),
   selectModFolder: () => ipcRenderer.invoke("mods:select-folder"),

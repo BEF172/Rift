@@ -1620,6 +1620,27 @@ body {
   border-color: var(--blue);
 }
 
+.update-panel small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.update-hide-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.update-hide-option input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
 .import-config-panel details {
   margin-top: 10px;
 }

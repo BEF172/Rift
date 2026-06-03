@@ -31,6 +31,7 @@ const state = {
   importingQueue: false,
   activeDownloadType: "",
   dllDownloadSource: "bundled",
+  availableUpdate: null,
   overlayRunning: false,
   overlayProfilePath: "",
   overlayActiveMessage: "",
@@ -97,6 +98,14 @@ const els = {
   runDiagnosticsButton: document.querySelector("#runDiagnosticsButton"),
   diagnosticSummary: document.querySelector("#diagnosticSummary"),
   diagnosticsList: document.querySelector("#diagnosticsList"),
+  updatePanel: document.querySelector("#updatePanel"),
+  updateStatusLabel: document.querySelector("#updateStatusLabel"),
+  updateDetailsLabel: document.querySelector("#updateDetailsLabel"),
+  updateHideLabel: document.querySelector("#updateHideLabel"),
+  updateHideCheckbox: document.querySelector("#updateHideCheckbox"),
+  updateDownloadButton: document.querySelector("#updateDownloadButton"),
+  updateDismissButton: document.querySelector("#updateDismissButton"),
+  checkUpdatesButton: document.querySelector("#checkUpdatesButton"),
   ltkOverlaySidecarLabel: document.querySelector("#ltkOverlaySidecarLabel"),
   ltkOverlayDllLabel: document.querySelector("#ltkOverlayDllLabel"),
   appDataPathLabel: document.querySelector("#appDataPathLabel"),
@@ -1874,6 +1883,63 @@ const loadAppDataPath = async () => {
   }
 };
 
+const getIgnoredUpdateVersion = () => localStorage.getItem("riftAtlas:ignoredUpdateVersion") || "";
+
+const setUpdatePanelVisible = ({ hasUpdate = false } = {}) => {
+  if (els.updateHideLabel) els.updateHideLabel.hidden = !hasUpdate;
+  if (els.updateDownloadButton) els.updateDownloadButton.hidden = !hasUpdate;
+  if (els.updateDismissButton) els.updateDismissButton.hidden = !hasUpdate;
+};
+
+const renderUpdateStatus = (result = null, { hiddenByUser = false } = {}) => {
+  state.availableUpdate = result?.hasUpdate ? result : null;
+  if (!els.updateStatusLabel || !els.updateDetailsLabel) return;
+
+  if (!result) {
+    els.updateStatusLabel.textContent = "No se pudo comprobar";
+    els.updateDetailsLabel.textContent = "Toca Buscar para intentar de nuevo.";
+    setUpdatePanelVisible({ hasUpdate: false });
+    return;
+  }
+
+  if (result.hasUpdate && !hiddenByUser) {
+    els.updateStatusLabel.textContent = `Nueva version ${result.latestVersion}`;
+    els.updateDetailsLabel.textContent = `Actual: ${result.currentVersion}. ${result.assetName ? `Descarga: ${result.assetName}.` : "Abre el release para descargar."}`;
+    setUpdatePanelVisible({ hasUpdate: true });
+    if (els.updateHideCheckbox) els.updateHideCheckbox.checked = false;
+    return;
+  }
+
+  els.updateStatusLabel.textContent = hiddenByUser ? `Version ${result.latestVersion} ocultada` : "Rift Atlas esta actualizado";
+  els.updateDetailsLabel.textContent = hiddenByUser
+    ? "Esta version no se volvera a mostrar automaticamente. Podes usar Buscar para revisar igual."
+    : `Version actual: ${result.currentVersion}.`;
+  setUpdatePanelVisible({ hasUpdate: false });
+};
+
+const checkForUpdates = async ({ manual = false } = {}) => {
+  if (!window.riftAtlas.checkUpdates || !els.updateStatusLabel) return null;
+  if (manual && els.updateHideCheckbox) els.updateHideCheckbox.checked = false;
+  els.updateStatusLabel.textContent = "Buscando actualizaciones...";
+  els.updateDetailsLabel.textContent = "Consultando GitHub Releases...";
+  if (els.checkUpdatesButton) els.checkUpdatesButton.disabled = true;
+  try {
+    const result = await window.riftAtlas.checkUpdates();
+    const ignoredVersion = getIgnoredUpdateVersion();
+    const hiddenByUser = !manual && result.hasUpdate && ignoredVersion === result.latestVersion;
+    renderUpdateStatus(result, { hiddenByUser });
+    return result;
+  } catch (error) {
+    state.availableUpdate = null;
+    els.updateStatusLabel.textContent = "Error buscando actualizaciones";
+    els.updateDetailsLabel.textContent = error.message || "No se pudo consultar GitHub Releases.";
+    setUpdatePanelVisible({ hasUpdate: false });
+    return null;
+  } finally {
+    if (els.checkUpdatesButton) els.checkUpdatesButton.disabled = false;
+  }
+};
+
 const autoConfigureOverlay = async ({ silent = false } = {}) => {
   if (!silent && els.importStatusLabel) {
     setConfigStatus("Detectando engine, DLL y League...");
@@ -3090,6 +3156,24 @@ const bindEvents = () => {
     autoConfigureOverlay();
   });
 
+  els.checkUpdatesButton?.addEventListener("click", () => {
+    checkForUpdates({ manual: true });
+  });
+
+  els.updateDownloadButton?.addEventListener("click", async () => {
+    const update = state.availableUpdate;
+    if (!update?.downloadUrl && !update?.releaseUrl) return;
+    await window.riftAtlas.openExternal(update.downloadUrl || update.releaseUrl);
+  });
+
+  els.updateDismissButton?.addEventListener("click", () => {
+    const update = state.availableUpdate;
+    if (update?.latestVersion && els.updateHideCheckbox?.checked) {
+      localStorage.setItem("riftAtlas:ignoredUpdateVersion", update.latestVersion);
+    }
+    renderUpdateStatus(update, { hiddenByUser: Boolean(update?.latestVersion && els.updateHideCheckbox?.checked) });
+  });
+
   els.dllSourceSelect?.addEventListener("change", (event) => {
     setDllDownloadSource(event.target.value);
   });
@@ -3383,6 +3467,9 @@ renderParty();
 loadApiKeyStatus();
 loadAppVersion();
 loadAppDataPath();
+setTimeout(() => {
+  checkForUpdates({ manual: false });
+}, 1200);
 refreshOverlayStatus();
 loadChampions().catch(showError);
 setTimeout(() => {
