@@ -162,6 +162,11 @@ const els = {
   downloadEnginePathLabel: document.querySelector("#downloadEnginePathLabel"),
   downloadLeaguePathLabel: document.querySelector("#downloadLeaguePathLabel"),
   downloadSkinLibraryLabel: document.querySelector("#downloadSkinLibraryLabel"),
+  firstDllModal: document.querySelector("#firstDllModal"),
+  firstDllPathLabel: document.querySelector("#firstDllPathLabel"),
+  firstDllOpenFolderButton: document.querySelector("#firstDllOpenFolderButton"),
+  firstDllDoneButton: document.querySelector("#firstDllDoneButton"),
+  firstDllLaterButton: document.querySelector("#firstDllLaterButton"),
   selectSkinLibraryButton: document.querySelector("#selectSkinLibraryButton"),
   addCustomModFilesButton: document.querySelector("#addCustomModFilesButton"),
   addCustomModFolderButton: document.querySelector("#addCustomModFolderButton"),
@@ -1883,6 +1888,28 @@ const loadAppDataPath = async () => {
   }
 };
 
+const hideFirstDllModal = ({ remember = true } = {}) => {
+  if (els.firstDllModal) els.firstDllModal.hidden = true;
+  if (remember) localStorage.setItem("riftAtlas:firstDllNoticeShown", "1");
+};
+
+const showFirstDllModal = async (status = null) => {
+  if (!els.firstDllModal) return;
+  const dllStatus = status || await window.riftAtlas.getEngineDllStatus?.().catch(() => null);
+  if (els.firstDllPathLabel) {
+    els.firstDllPathLabel.textContent = dllStatus?.dllPath || "AppData\\Roaming\\Rift Atlas\\engine\\cslol-dll.dll";
+  }
+  els.firstDllModal.hidden = false;
+  await window.riftAtlas.openEngineFolder?.().catch(() => null);
+};
+
+const checkFirstDllNotice = async () => {
+  if (!window.riftAtlas.getEngineDllStatus || localStorage.getItem("riftAtlas:firstDllNoticeShown") === "1") return;
+  const status = await window.riftAtlas.getEngineDllStatus().catch(() => null);
+  if (!status || status.exists) return;
+  await showFirstDllModal(status);
+};
+
 const getIgnoredUpdateVersion = () => localStorage.getItem("riftAtlas:ignoredUpdateVersion") || "";
 
 const setUpdatePanelVisible = ({ hasUpdate = false } = {}) => {
@@ -3199,7 +3226,29 @@ const bindEvents = () => {
   });
 
   els.openEngineFolderButton?.addEventListener("click", async () => {
-    await revealPath(state.ltkOverlaySidecarPath || state.ltkPath);
+    await window.riftAtlas.openEngineFolder?.();
+  });
+
+  els.firstDllOpenFolderButton?.addEventListener("click", async () => {
+    await window.riftAtlas.openEngineFolder?.();
+  });
+
+  els.firstDllDoneButton?.addEventListener("click", async () => {
+    const status = await window.riftAtlas.getEngineDllStatus?.().catch(() => null);
+    if (status?.exists) {
+      setLtkOverlayDllPath(status.dllPath);
+      hideFirstDllModal();
+      setConfigStatus("DLL detectada correctamente.");
+      return;
+    }
+    if (els.firstDllPathLabel) {
+      els.firstDllPathLabel.textContent = status?.dllPath || "Todavia no encontre cslol-dll.dll.";
+    }
+    setConfigStatus("Todavia no encontre cslol-dll.dll en la carpeta engine.");
+  });
+
+  els.firstDllLaterButton?.addEventListener("click", () => {
+    hideFirstDllModal();
   });
 
   els.openDllFolderButton?.addEventListener("click", async () => {
@@ -3255,7 +3304,7 @@ const bindEvents = () => {
       const p = await window.riftAtlas.selectBocchiDll();
       if (p) { setLtkOverlayDllPath(p); setConfigStatus("DLL instalada por Rift Atlas."); }
     } catch (error) {
-      setConfigStatus(error.message || "La DLL se instala descargando el engine.");
+      setConfigStatus(error.message || "La DLL se coloca manualmente en la carpeta engine.");
     }
   });
 
@@ -3467,6 +3516,9 @@ renderParty();
 loadApiKeyStatus();
 loadAppVersion();
 loadAppDataPath();
+setTimeout(() => {
+  checkFirstDllNotice();
+}, 700);
 setTimeout(() => {
   checkForUpdates({ manual: false });
 }, 1200);

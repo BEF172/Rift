@@ -1641,6 +1641,57 @@ body {
   accent-color: var(--accent);
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 8, 12, 0.72);
+}
+
+.modal-panel {
+  display: grid;
+  gap: 18px;
+  width: min(560px, 100%);
+  padding: 22px;
+  border: 1px solid var(--line);
+  background: #09151d;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+}
+
+.modal-kicker {
+  color: var(--accent-strong);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.modal-panel h2 {
+  margin: 6px 0 8px;
+}
+
+.modal-panel p {
+  margin: 0 0 14px;
+  color: var(--muted);
+}
+
+.modal-panel code {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 10px;
+  border: 1px solid var(--line);
+  background: #0d1720;
+  color: var(--text);
+}
+
+.modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .import-config-panel details {
   margin-top: 10px;
 }

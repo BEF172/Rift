@@ -675,6 +675,22 @@
       </button>
     </template>
 
+    <div id="firstDllModal" class="modal-backdrop" hidden>
+      <section class="modal-panel">
+        <div>
+          <span class="modal-kicker">Configuracion requerida</span>
+          <h2>Falta cslol-dll.dll</h2>
+          <p>Rift Atlas no incluye el DLL. Pegalo manualmente en la carpeta del engine para poder usar el overlay.</p>
+          <code id="firstDllPathLabel">Cargando ruta...</code>
+        </div>
+        <div class="modal-actions">
+          <button id="firstDllOpenFolderButton" class="docs-link" type="button">Abrir carpeta</button>
+          <button id="firstDllDoneButton" class="secondary-button" type="button">Ya lo pegue</button>
+          <button id="firstDllLaterButton" class="secondary-button" type="button">Despues</button>
+        </div>
+      </section>
+    </div>
+
     <script src="./vendor/peerjs.min.js"></script>
     <script src="./renderer.js"></script>
   </body>

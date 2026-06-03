@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld("riftAtlas", {
   checkUpdates: () => ipcRenderer.invoke("app:check-updates"),
   getUserDataPath: () => ipcRenderer.invoke("app:get-user-data-path"),
   openUserDataPath: () => ipcRenderer.invoke("app:open-user-data-path"),
+  getEngineDllStatus: () => ipcRenderer.invoke("app:get-engine-dll-status"),
+  openEngineFolder: () => ipcRenderer.invoke("app:open-engine-folder"),
   selectModFolder: () => ipcRenderer.invoke("mods:select-folder"),
   selectCustomModFiles: () => ipcRenderer.invoke("mods:select-custom-mod-files"),
   selectCustomModFolder: () => ipcRenderer.invoke("mods:select-custom-mod-folder"),

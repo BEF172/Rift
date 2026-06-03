@@ -1374,6 +1374,23 @@ ipcMain.handle("app:open-external", (_event, url) => {
 
 ipcMain.handle("app:get-user-data-path", () => app.getPath("userData"));
 
+ipcMain.handle("app:get-engine-dll-status", async () => {
+  const engineDir = path.join(app.getPath("userData"), "engine");
+  const dllPath = path.join(engineDir, "cslol-dll.dll");
+  const exists = await fs.access(dllPath).then(() => true).catch(() => false);
+  return { exists, engineDir, dllPath };
+});
+
+ipcMain.handle("app:open-engine-folder", async () => {
+  const engineDir = path.join(app.getPath("userData"), "engine");
+  await fs.mkdir(engineDir, { recursive: true });
+  const error = await shell.openPath(engineDir);
+  if (error) {
+    throw new Error(error);
+  }
+  return engineDir;
+});
+
 ipcMain.handle("app:open-user-data-path", async () => {
   const targetPath = app.getPath("userData");
   await fs.mkdir(targetPath, { recursive: true });
@@ -1682,7 +1699,7 @@ ipcMain.handle("mods:select-bocchi-dll", async () => {
     await fs.access(installedDllPath);
     return installedDllPath;
   } catch {
-    throw new Error("La DLL ya no se selecciona manualmente. Descarga el engine desde Rift Atlas para instalarla.");
+    throw new Error("La DLL se coloca manualmente en la carpeta engine de Rift Atlas.");
   }
 });
 
@@ -2165,7 +2182,7 @@ ipcMain.handle("mods:auto-configure-overlay", async (_event, payload = {}) => {
   dllPath = await resolveCslolDll(payload.dllPath, enginePath);
 
   if (!enginePath) warnings.push("No encontre el engine.");
-  if (!dllPath) warnings.push("No encontre cslol-dll.dll junto al engine. Descarga el engine desde Rift Atlas.");
+  if (!dllPath) warnings.push("No encontre cslol-dll.dll junto al engine. Pegalo manualmente en la carpeta engine.");
   if (!leagueGamePath) warnings.push("No encontre League of Legends.exe.");
 
   return {
@@ -2194,7 +2211,7 @@ const ensureCslolDll = async (enginePath, selectedDllPath) => {
     return bundledDllPath;
   } catch {}
   await appendOverlayLog(`ERROR DLL no encontrada junto al engine: ${bundledDllPath}. No se buscan DLLs locales.`).catch(() => {});
-  throw new Error("cslol-dll.dll no esta junto al engine. Descarga el engine desde Rift Atlas para instalar una DLL limpia.");
+  throw new Error("cslol-dll.dll no esta junto al engine. Pegalo manualmente en AppData\\Roaming\\Rift Atlas\\engine.");
 };
 
 const ensureGameHashtable = async () => {
@@ -2735,7 +2752,7 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
     await fs.access(bundledDll);
   } catch {
     await appendOverlayLog(`ERROR DLL de Rift Atlas no encontrada: ${bundledDll}`);
-    throw new Error(`cslol-dll.dll no encontrada en ${bundledDll}. Descarga el engine desde Rift Atlas.`);
+    throw new Error(`cslol-dll.dll no encontrada en ${bundledDll}. Pegalo manualmente en la carpeta engine.`);
   }
   await appendFileLogInfo("DLL usada por patcher", bundledDll);
 
@@ -2767,7 +2784,7 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
       const sourceText = dllSourceMetadata?.sourceLabel
         ? ` Fuente usada: ${dllSourceMetadata.sourceLabel} ${dllSourceMetadata.version || ""}.`
         : "";
-      currentOverlayError = `La DLL del engine esta vencida (End of life reached).${sourceText} En Descargas cambia la fuente del DLL y descarga engine + DLL otra vez; si ambas fuentes fallan, hay que esperar un release nuevo.`;
+      currentOverlayError = `La DLL del engine esta vencida (End of life reached).${sourceText} Reemplaza cslol-dll.dll manualmente en la carpeta engine.`;
       appendOverlayLog(`ERROR DLL vencida detectada: ${currentOverlayError}`);
       runningOverlayProcess?.stdin?.write("\n");
       runningOverlayProcess?.kill();
@@ -2983,7 +3000,7 @@ ipcMain.handle("mods:diagnose-overlay", async (_event, payload = {}) => {
     value: dllSourceMetadata?.installedPath || "",
     message: dllSourceMetadata
       ? `${dllSourceMetadata.sourceLabel || "desconocida"} ${dllSourceMetadata.version || ""} (${dllSourceMetadata.assetName || "sin asset"})`
-      : "Sin metadata; descarga engine + DLL otra vez para registrar la fuente"
+      : "Sin metadata; coloca el DLL manualmente en la carpeta engine"
   });
 
   if (engineCheck?.ok && dllCheck?.ok) {
