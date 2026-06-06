@@ -1,6 +1,6 @@
 const { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage, shell } = require("electron");
 const { execFile, spawn } = require("node:child_process");
-const { createWriteStream } = require("node:fs");
+const { createWriteStream, existsSync } = require("node:fs");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -11,6 +11,8 @@ const { once } = require("node:events");
 const extractZip = require("extract-zip");
 const SevenZipWasm = require("7z-wasm");
 const yauzl = require("yauzl");
+const { autoUpdater } = require("electron-updater");
+const { WebSocketServer } = require("ws");
 
 app.commandLine.appendSwitch("disk-cache-dir", path.join(os.tmpdir(), "rift-atlas-cache"));
 app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
@@ -44,6 +46,17 @@ const PLATFORM_TO_REGION = {
 let sessionRiotApiKey = "";
 const tierLaneCache = new Map();
 let skinMetadataCache = null;
+let penguBridgeServer = null;
+const penguBridgeClients = new Set();
+let penguAutoActivationTimer = null;
+let penguAutoActivationInFlight = false;
+let penguAutoActivationCompleted = false;
+const startupFlags = {
+  showTutorial: process.argv.includes("--rift-atlas-show-tutorial")
+};
+
+const getFirstRunSentinelPath = () => path.join(app.getPath("userData"), ".first-run-complete");
+const isFirstRun = () => !existsSync(getFirstRunSentinelPath());
 
 const TIER_ROLES = ["top", "jungle", "middle", "bottom", "support"];
 const UGG_ROLE_MAP = {
@@ -78,6 +91,8 @@ const CSLOL_REPO_API = "https://api.github.com/repos/LeagueToolkit/cslol-manager
 const HITORI_RELEASE_API = "https://api.github.com/repos/hitori-rebocchi/hitori-bocchi/releases/latest";
 const LEAGUE_SKINS_REPO_API = "https://api.github.com/repos/Alban1911/LeagueSkins";
 const RIFT_ATLAS_RELEASE_API = "https://api.github.com/repos/BEF172/Rift/releases/latest";
+const PENGU_DISTRO_RELEASE_API = "https://api.github.com/repos/PenguLoader/distro/releases/latest";
+const ROSE_PENGU_REPO_API = "https://api.github.com/repos/Tariolle/ROSE-Pengu";
 const SKIN_INDEX_CACHE_VERSION = 7;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -95,6 +110,14 @@ const getUnpackedAssetPath = (...parts) => {
     ? __dirname.replace("app.asar", "app.asar.unpacked")
     : __dirname;
   return path.join(baseDir, ...parts);
+};
+
+const getPackagedAssetPath = (...parts) => {
+  if (app.isPackaged && process.resourcesPath) {
+    const unpackedPath = path.join(process.resourcesPath, "app.asar.unpacked", ...parts);
+    if (existsSync(unpackedPath)) return unpackedPath;
+  }
+  return path.join(__dirname, ...parts);
 };
 
 const createSevenZip = async () => {
@@ -125,10 +148,42 @@ const getMkoverlayTimeoutMs = (bytes = 0) => {
   return Math.min(MKOVERLAY_MAX_TIMEOUT_MS, Math.max(MKOVERLAY_BASE_TIMEOUT_MS, MKOVERLAY_BASE_TIMEOUT_MS + extra));
 };
 
+const getPackageWadNames = (filePath) => new Promise((resolve) => {
+  const extension = filePath.toLowerCase().endsWith(".wad.client") ? ".wad.client" : path.extname(filePath).toLowerCase();
+  if ([".wad", ".wad.client"].includes(extension)) {
+    resolve([path.basename(filePath)]);
+    return;
+  }
+  if (![".zip", ".fantome"].includes(extension)) {
+    resolve([]);
+    return;
+  }
+
+  yauzl.open(filePath, { lazyEntries: true }, (error, zipfile) => {
+    if (error || !zipfile) {
+      resolve([]);
+      return;
+    }
+
+    const wadNames = new Set();
+    zipfile.readEntry();
+    zipfile.on("entry", (entry) => {
+      const entryName = entry.fileName.replace(/\\/g, "/");
+      if (/(^|\/)WAD\/.+\.wad(\.client)?$/i.test(entryName)) {
+        wadNames.add(path.basename(entryName));
+      }
+      zipfile.readEntry();
+    });
+    zipfile.on("end", () => resolve([...wadNames].sort((a, b) => a.localeCompare(b))));
+    zipfile.on("error", () => resolve([...wadNames].sort((a, b) => a.localeCompare(b))));
+  });
+});
+
 const getOverlayCacheKey = async ({ gamePath, skinPaths = [] }) => {
   const hash = crypto.createHash("sha256");
   hash.update("rift-atlas-overlay-cache-v2");
   const gameStat = await fs.stat(gamePath).catch(() => null);
+  const gameFolder = path.dirname(gamePath);
   hash.update(path.normalize(gamePath).toLowerCase());
   hash.update(`:${gameStat?.size || 0}:${Math.trunc(gameStat?.mtimeMs || 0)}`);
 
@@ -137,6 +192,13 @@ const getOverlayCacheKey = async ({ gamePath, skinPaths = [] }) => {
     hash.update("|");
     hash.update(path.normalize(skinPath).toLowerCase());
     hash.update(`:${stat?.size || 0}:${Math.trunc(stat?.mtimeMs || 0)}`);
+
+    const wadNames = await getPackageWadNames(String(skinPath)).catch(() => []);
+    for (const wadName of wadNames) {
+      const baseWadPath = path.join(gameFolder, "DATA", "FINAL", "Champions", wadName);
+      const baseWadStat = await fs.stat(baseWadPath).catch(() => null);
+      hash.update(`:base-wad:${wadName.toLowerCase()}:${baseWadStat?.size || 0}:${Math.trunc(baseWadStat?.mtimeMs || 0)}`);
+    }
   }
 
   return hash.digest("hex").slice(0, 24);
@@ -283,37 +345,37 @@ const getChampionSkinDetails = async (championKey) => {
       fetchJsonWithTimeout(`https://ddragon.leagueoflegends.com/cdn/${metadata.version}/data/es_AR/champion/${champion.id}.json`),
       fetchJsonWithRetry(`https://ddragon.leagueoflegends.com/cdn/${metadata.version}/data/en_US/champion/${champion.id}.json`, {}, 2).catch(() => null)
     ]);
-  const championDetail = detail.data[champion.id];
-  const englishSkinsByNum = new Map((englishDetail?.data?.[champion.id]?.skins || []).map((skin) => [Number(skin.num), skin]));
-  const names = new Map();
-  const recordsByName = new Map();
-  const recordsById = new Map();
+    const championDetail = detail.data[champion.id];
+    const englishSkinsByNum = new Map((englishDetail?.data?.[champion.id]?.skins || []).map((skin) => [Number(skin.num), skin]));
+    const names = new Map();
+    const recordsByName = new Map();
+    const recordsById = new Map();
 
-  for (const skin of championDetail.skins || []) {
-    const skinNum = Number(skin.num);
-    const fullSkinId = Number(champion.key) * 1000 + skinNum;
-    const englishSkin = englishSkinsByNum.get(skinNum);
-    const displayName = skin.name === "default" ? `${champion.name} clasico` : skin.name;
-    const record = {
-      num: skinNum,
-      fullSkinId,
-      name: displayName
-    };
-    names.set(String(skinNum), displayName);
-    names.set(String(fullSkinId), displayName);
-    recordsById.set(String(skinNum), record);
-    recordsById.set(String(fullSkinId), record);
-    recordsByName.set(normalizeChampionName(displayName), record);
-    recordsByName.set(normalizeChampionName(skin.name), record);
-    if (englishSkin?.name) {
-      recordsByName.set(normalizeChampionName(englishSkin.name), record);
+    for (const skin of championDetail.skins || []) {
+      const skinNum = Number(skin.num);
+      const fullSkinId = Number(champion.key) * 1000 + skinNum;
+      const englishSkin = englishSkinsByNum.get(skinNum);
+      const displayName = skin.name === "default" ? `${champion.name} clasico` : skin.name;
+      const record = {
+        num: skinNum,
+        fullSkinId,
+        name: displayName
+      };
+      names.set(String(skinNum), displayName);
+      names.set(String(fullSkinId), displayName);
+      recordsById.set(String(skinNum), record);
+      recordsById.set(String(fullSkinId), record);
+      recordsByName.set(normalizeChampionName(displayName), record);
+      recordsByName.set(normalizeChampionName(skin.name), record);
+      if (englishSkin?.name) {
+        recordsByName.set(normalizeChampionName(englishSkin.name), record);
+      }
     }
-  }
 
-  const details = { names, recordsByName, recordsById };
-  metadata.skinsByChampionKey.set(String(championKey), names);
-  metadata.skinDetailsByChampionKey.set(String(championKey), details);
-  return details;
+    const details = { names, recordsByName, recordsById };
+    metadata.skinsByChampionKey.set(String(championKey), names);
+    metadata.skinDetailsByChampionKey.set(String(championKey), details);
+    return details;
   })();
 
   metadata.pendingSkinDetailsByChampionKey.set(String(championKey), pendingDetails);
@@ -874,6 +936,74 @@ const isCachedSkinFresh = (cached, item) =>
   cached.size === item.size &&
   Number(cached.mtimeMs || 0) === Number(item.mtimeMs || 0);
 
+const handleChromaDataRequest = async (message, socket) => {
+  try {
+    const championKey = String(message.championKey || message.championId || "");
+    if (!championKey) return;
+    const skinId = Number(message.skinId || 0);
+    if (!skinId) return;
+
+    const cachePath = getSkinIndexCachePath();
+    const content = await fs.readFile(cachePath, "utf8");
+    const payload = JSON.parse(content);
+    const allSkins = Array.isArray(payload.skins) ? payload.skins : [];
+
+    let entries = allSkins.filter((s) => String(s.championId || "") === championKey);
+
+    if (entries.length === 0) {
+      entries = allSkins.filter((s) => String(s.championKey || "") === championKey);
+    }
+
+    if (entries.length === 0 && /^\d+$/.test(championKey)) {
+      try {
+        const metadata = await getSkinMetadata();
+        const champ = metadata?.championsByKey?.get(championKey);
+        if (champ?.id) {
+          entries = allSkins.filter((s) => String(s.championKey || "") === champ.id);
+        }
+      } catch {}
+    }
+
+    if (entries.length === 0) return;
+
+    const reqSkinNum = skinId % 1000;
+
+    let skinGroup = entries.filter((e) => e.imageSkinNum === reqSkinNum);
+
+    if (skinGroup.length === 0) {
+      const chromaEntry = entries.find((e) => e.skinNum === reqSkinNum);
+      if (chromaEntry) {
+        skinGroup = entries.filter((e) => e.imageSkinNum === chromaEntry.imageSkinNum);
+      }
+    }
+
+    if (skinGroup.length === 0) return;
+
+    const baseEntry = skinGroup.find((e) => e.skinNum === e.imageSkinNum);
+    if (!baseEntry) return;
+
+    const chromaVariants = skinGroup.filter((e) => e.skinNum !== e.imageSkinNum);
+    if (chromaVariants.length === 0) return;
+
+    const chromas = chromaVariants.map((v) => ({
+      id: v.skinNum,
+      baseId: baseEntry.skinNum,
+      name: v.variant || v.skin || `Chroma ${v.skinNum}`,
+      imagePath: v.imageUrl || "",
+      colors: [],
+      primaryColor: null,
+      selected: false,
+      locked: false,
+    }));
+
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "chroma-data", championKey, skinId, chromas }));
+    }
+  } catch (e) {
+    console.warn("[Pengu bridge] chroma lookup error:", e.message);
+  }
+};
+
 const inspectArchivePackage = (filePath) => new Promise((resolve) => {
   const extension = filePath.toLowerCase().endsWith(".wad.client") ? ".wad.client" : path.extname(filePath).toLowerCase();
   if ([".wad", ".wad.client"].includes(extension)) {
@@ -984,93 +1114,96 @@ const readArchiveMetaInfo = (filePath) => new Promise((resolve) => {
 });
 
 const processSkinPackage = async (item, metadata) => {
-    const parts = item.relativePath.split(path.sep).filter(Boolean);
-    const offset = parts[0]?.toLowerCase() === "skins" ? 1 : 0;
-    const repoParts = parts.slice(offset);
-    const rawChampion = repoParts[0] || "Sin campeon";
-    const rawSkin = repoParts[1] || stripModExtension(item.name);
-    const rawVariant = repoParts.length > 3 ? repoParts[2] : "";
-    const championEntry = metadata?.championsByKey.get(String(rawChampion));
-    const fileBase = stripModExtension(item.name);
-    const fileBaseId = fileBase.match(/^\d+$/) ? fileBase : "";
-    const archiveInfo = item.archiveInfo || {};
-    const packageExtension = String(item.extension || "").toLowerCase();
-    const metaInfo = archiveInfo.hasMetaInfo ? await readArchiveMetaInfo(item.path).catch(() => null) : null;
-    const baseSkinCandidates = [fileBase, rawSkin, repoParts.at(-2) || "", metaInfo?.Name || "", rawVariant];
+  const parts = item.relativePath.split(path.sep).filter(Boolean);
+  const offset = parts[0]?.toLowerCase() === "skins" ? 1 : 0;
+  const repoParts = parts.slice(offset);
+  const rawChampion = repoParts[0] || "Sin campeon";
+  const rawSkin = repoParts[1] || stripModExtension(item.name);
+  const rawVariant = repoParts.length > 3 ? repoParts[2] : "";
+  const championEntry = metadata?.championsByKey.get(String(rawChampion));
+  const fileBase = stripModExtension(item.name);
+  const fileBaseId = fileBase.match(/^\d+$/) ? fileBase : "";
+  const archiveInfo = item.archiveInfo || {};
+  const packageExtension = String(item.extension || "").toLowerCase();
+  const metaInfo = archiveInfo.hasMetaInfo ? await readArchiveMetaInfo(item.path).catch(() => null) : null;
+  const baseSkinCandidates = [fileBase, rawSkin, repoParts.at(-2) || "", metaInfo?.Name || "", rawVariant];
 
-    let champion = championEntry?.name || rawChampion;
-    let skin = rawSkin;
-    let variant = rawVariant;
-    let skins = championEntry ? await getChampionSkins(rawChampion).catch(() => new Map()) : new Map();
-    let skinDetails = championEntry ? await getChampionSkinDetails(rawChampion).catch(() => null) : null;
-    let championKey = championEntry?.id || "";
-    let skinNum = null;
-    let imageSkinNum = null;
-    let baseImageSkinNum = null;
-    let numericSource = isNumericId(rawChampion) || isNumericId(rawSkin) || isNumericId(fileBaseId);
+  let champion = championEntry?.name || rawChampion;
+  let skin = rawSkin;
+  let variant = rawVariant;
+  let skins = championEntry ? await getChampionSkins(rawChampion).catch(() => new Map()) : new Map();
+  let skinDetails = championEntry ? await getChampionSkinDetails(rawChampion).catch(() => null) : null;
+  let championKey = championEntry?.id || "";
+  let championId = championEntry?.key || "";
+  let skinNum = null;
+  let imageSkinNum = null;
+  let baseImageSkinNum = null;
+  let numericSource = isNumericId(rawChampion) || isNumericId(rawSkin) || isNumericId(fileBaseId);
 
-    if (championEntry) {
-      const skinFromPath = skins.get(String(rawSkin));
-      const skinFromFile = skins.get(String(fileBaseId));
-      const skinFromParent = skins.get(String(repoParts.at(-2) || ""));
-      const skinFromMeta = metaInfo?.Name ? skins.get(String(metaInfo.Name)) : "";
-      skin = skinFromFile || skinFromParent || skinFromMeta || skinFromPath || rawSkin;
-      variant = skins.get(String(rawVariant)) || rawVariant;
+  if (championEntry) {
+    const skinFromPath = skins.get(String(rawSkin));
+    const skinFromFile = skins.get(String(fileBaseId));
+    const skinFromParent = skins.get(String(repoParts.at(-2) || ""));
+    const skinFromMeta = metaInfo?.Name ? skins.get(String(metaInfo.Name)) : "";
+    skin = skinFromFile || skinFromParent || skinFromMeta || skinFromPath || rawSkin;
+    variant = skins.get(String(rawVariant)) || rawVariant;
+    const skinRecord = findSkinRecord(skinDetails, [...baseSkinCandidates, skin]);
+    skinNum =
+      skinDetails?.recordsById.get(String(fileBaseId))?.num ??
+      skinDetails?.recordsById.get(String(rawSkin))?.num ??
+      skinDetails?.recordsById.get(String(repoParts.at(-2) || ""))?.num ??
+      skinRecord?.num ??
+      null;
+    imageSkinNum = getSkinArtNum(skinDetails, skinRecord, skinNum);
+    baseImageSkinNum = imageSkinNum;
+    if (skinRecord?.name) skin = skinRecord.name;
+  } else {
+    const maybeChampion = metadata?.championsByKey
+      ? [...metadata.championsByKey.values()].find((entry) =>
+        normalizeChampionName(entry.name) === normalizeChampionName(rawChampion) ||
+        normalizeChampionName(entry.id) === normalizeChampionName(rawChampion)
+      )
+      : null;
+    if (maybeChampion) {
+      champion = maybeChampion.name;
+      championKey = maybeChampion.id;
+      championId = maybeChampion.key;
+      skins = await getChampionSkins(maybeChampion.key).catch(() => new Map());
+      skinDetails = await getChampionSkinDetails(maybeChampion.key).catch(() => null);
+      skin = skins.get(String(fileBaseId)) || skins.get(String(metaInfo?.Name || "")) || skins.get(String(rawSkin)) || fileBase;
       const skinRecord = findSkinRecord(skinDetails, [...baseSkinCandidates, skin]);
       skinNum =
         skinDetails?.recordsById.get(String(fileBaseId))?.num ??
-        skinDetails?.recordsById.get(String(rawSkin))?.num ??
-        skinDetails?.recordsById.get(String(repoParts.at(-2) || ""))?.num ??
         skinRecord?.num ??
         null;
       imageSkinNum = getSkinArtNum(skinDetails, skinRecord, skinNum);
       baseImageSkinNum = imageSkinNum;
       if (skinRecord?.name) skin = skinRecord.name;
     } else {
-      const maybeChampion = metadata?.championsByKey
-        ? [...metadata.championsByKey.values()].find((entry) =>
-            normalizeChampionName(entry.name) === normalizeChampionName(rawChampion) ||
-            normalizeChampionName(entry.id) === normalizeChampionName(rawChampion)
-          )
-        : null;
-      if (maybeChampion) {
-        champion = maybeChampion.name;
-        championKey = maybeChampion.id;
-        skins = await getChampionSkins(maybeChampion.key).catch(() => new Map());
-        skinDetails = await getChampionSkinDetails(maybeChampion.key).catch(() => null);
-        skin = skins.get(String(fileBaseId)) || skins.get(String(metaInfo?.Name || "")) || skins.get(String(rawSkin)) || fileBase;
-        const skinRecord = findSkinRecord(skinDetails, [...baseSkinCandidates, skin]);
-        skinNum =
-          skinDetails?.recordsById.get(String(fileBaseId))?.num ??
-          skinRecord?.num ??
-          null;
-        imageSkinNum = getSkinArtNum(skinDetails, skinRecord, skinNum);
-        baseImageSkinNum = imageSkinNum;
-        if (skinRecord?.name) skin = skinRecord.name;
-      } else {
-        skin = fileBase || rawSkin;
-      }
+      skin = fileBase || rawSkin;
     }
+  }
 
-    return {
-      ...item,
-      rawChampion,
-      rawSkin,
-      rawVariant,
-      champion,
-      championKey,
-      skin,
-      skinNum,
-      imageSkinNum,
-      baseImageSkinNum,
-      imageUrl: getSkinImageUrl(championKey, imageSkinNum),
-      variant,
-      resolved: Boolean(championEntry || skins.has(String(rawSkin)) || skins.has(String(fileBaseId))),
-      numericSource,
-      archiveInfo,
-      metaName: metaInfo?.Name || "",
-      needsFantonize: Boolean([".zip", ".wad", ".wad.client"].includes(packageExtension) && archiveInfo.suspicious && championKey && skinNum !== null)
-    };
+  return {
+    ...item,
+    rawChampion,
+    rawSkin,
+    rawVariant,
+    champion,
+    championKey,
+    championId,
+    skin,
+    skinNum,
+    imageSkinNum,
+    baseImageSkinNum,
+    imageUrl: getSkinImageUrl(championKey, imageSkinNum),
+    variant,
+    resolved: Boolean(championEntry || skins.has(String(rawSkin)) || skins.has(String(fileBaseId))),
+    numericSource,
+    archiveInfo,
+    metaName: metaInfo?.Name || "",
+    needsFantonize: Boolean([".zip", ".wad", ".wad.client"].includes(packageExtension) && archiveInfo.suspicious && championKey && skinNum !== null)
+  };
 };
 
 const getFallbackSkinPackage = (item) => {
@@ -1084,6 +1217,7 @@ const getFallbackSkinPackage = (item) => {
     rawVariant: repoParts.length > 3 ? repoParts[2] : "",
     champion: repoParts[0] || "Sin campeon",
     championKey: "",
+    championId: "",
     skin: repoParts[1] || stripModExtension(item.name),
     skinNum: null,
     imageSkinNum: null,
@@ -1137,11 +1271,11 @@ const indexSkinLibrary = async (folderPath) => {
   }
 
   const skins = indexed.filter(Boolean);
-  await writeSkinIndexCache(folderPath, skins).catch(() => {});
+  await writeSkinIndexCache(folderPath, skins).catch(() => { });
   return skins;
 };
 
-const downloadFile = async (url, destinationPath, onProgress = () => {}) => {
+const downloadFile = async (url, destinationPath, onProgress = () => { }) => {
   const response = await fetch(url, {
     headers: {
       "user-agent": "RiftAtlas"
@@ -1190,7 +1324,7 @@ const downloadAndIndexLeagueSkins = async (window) => {
   const tempDir = path.join(installRoot, "LeagueSkins.download");
   const zipPath = path.join(tempDir, "LeagueSkins.zip");
 
-  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
   await fs.mkdir(tempDir, { recursive: true });
   await downloadFile(downloadUrl, zipPath, (progress) => {
     sendDownloadProgress(window, {
@@ -1220,9 +1354,9 @@ const downloadAndIndexLeagueSkins = async (window) => {
     throw new Error("No pude encontrar la carpeta extraida de LeagueSkins.");
   }
 
-  await fs.rm(targetDir, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(targetDir, { recursive: true, force: true }).catch(() => { });
   await fs.rename(extractedRoot, targetDir);
-  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
   sendDownloadProgress(window, {
     type: "league-skins",
     message: "Indexando LeagueSkins..."
@@ -1362,6 +1496,108 @@ ipcMain.handle("app:check-updates", async () => {
   };
 });
 
+ipcMain.handle("app:download-update", async (event, payload = {}) => {
+  const release = await getAppReleaseInfo();
+  const currentVersion = app.getVersion();
+  const latestVersion = normalizeVersion(release.tag_name || release.name || "");
+  if (!latestVersion || compareVersions(latestVersion, currentVersion) <= 0) {
+    throw new Error("No hay una actualizacion nueva para instalar.");
+  }
+
+  if (!app.isPackaged && process.env.RIFT_ATLAS_ALLOW_DEV_UPDATE !== "1") {
+    throw new Error("La instalacion automatica solo funciona en la app instalada. En desarrollo, usa el instalador del release.");
+  }
+
+  const latestMetadataAsset = (release.assets || []).find((asset) => /^latest\.ya?ml$/i.test(asset.name || ""));
+  if (!latestMetadataAsset) {
+    throw new Error("El release no tiene latest.yml. Ejecuta npm run dist y sube el .exe, .blockmap y latest.yml al release.");
+  }
+
+  const window = BrowserWindow.fromWebContents(event.sender);
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.setFeedURL({
+    provider: "github",
+    owner: "BEF172",
+    repo: "Rift"
+  });
+
+  const sendUpdateProgress = (payload) => {
+    sendDownloadProgress(window, { type: "app-update", ...payload });
+  };
+  const progressHandler = (progress) => {
+    sendUpdateProgress({
+      message: `Descargando Rift Atlas ${latestVersion}...`,
+      downloaded: progress.transferred,
+      total: progress.total,
+      percent: progress.percent
+    });
+  };
+  const errorHandler = (error) => {
+    sendUpdateProgress({
+      message: `Error descargando actualizacion: ${error.message || error}`
+    });
+  };
+
+  autoUpdater.on("download-progress", progressHandler);
+  autoUpdater.once("error", errorHandler);
+  sendDownloadProgress(BrowserWindow.fromWebContents(event.sender), {
+    type: "app-update",
+    message: `Descargando Rift Atlas ${latestVersion}...`,
+    percent: 0
+  });
+
+  try {
+    const updateCheck = await autoUpdater.checkForUpdates();
+    const updateInfo = updateCheck?.updateInfo;
+    const updaterVersion = normalizeVersion(updateInfo?.version || "");
+    if (!updaterVersion || compareVersions(updaterVersion, currentVersion) <= 0) {
+      throw new Error("No hay una actualizacion nueva disponible para electron-updater.");
+    }
+
+    await autoUpdater.downloadUpdate();
+    sendUpdateProgress({
+      message: "Actualizacion descargada. Reiniciando para instalar...",
+      percent: 100
+    });
+
+    setTimeout(() => {
+      autoUpdater.quitAndInstall(false, true);
+    }, 800);
+
+    return {
+      version: updaterVersion,
+      assetName: payload.assetName || `Rift Atlas ${updaterVersion}`,
+      installing: true
+    };
+  } finally {
+    autoUpdater.removeListener("download-progress", progressHandler);
+    autoUpdater.removeListener("error", errorHandler);
+  }
+});
+
+const cleanupUpdateInstallers = async () => {
+  const candidates = [
+    path.join(app.getPath("userData"), "updates"),
+    path.join(app.getPath("userData"), "pending"),
+    path.join(app.getPath("temp"), "Rift Atlas-updater"),
+    path.join(app.getPath("temp"), "rift-atlas-updater"),
+    path.join(app.getPath("temp"), `${app.getName()}-updater`)
+  ];
+  if (process.platform === "win32") {
+    candidates.push(
+      path.join(app.getPath("appData"), `${app.getName()}-updater`),
+      path.join(process.env.LOCALAPPDATA || "", `${app.getName()}-updater`)
+    );
+  }
+
+  for (const target of [...new Set(candidates.filter(Boolean).map((item) => path.resolve(item)))]) {
+    const base = path.basename(target).toLowerCase();
+    if (!/(updates?|pending|updater)/i.test(base)) continue;
+    await fs.rm(target, { recursive: true, force: true }).catch(() => { });
+  }
+};
+
 ipcMain.handle("app:open-external", (_event, url) => {
   const target = String(url || "");
   if (!target.startsWith("https://github.com/") && !target.startsWith("https://u.gg/") && !target.startsWith("https://www.metasrc.com/") && !target.startsWith("https://op.gg/") && !target.startsWith("https://developer.riotgames.com/")) {
@@ -1373,6 +1609,54 @@ ipcMain.handle("app:open-external", (_event, url) => {
 });
 
 ipcMain.handle("app:get-user-data-path", () => app.getPath("userData"));
+ipcMain.handle("app:get-version", () => app.getVersion());
+
+ipcMain.handle("app:get-startup-flags", () => ({
+  ...startupFlags,
+  firstRun: isFirstRun()
+}));
+
+ipcMain.handle("app:mark-first-run-complete", async () => {
+  await fs.mkdir(path.dirname(getFirstRunSentinelPath()), { recursive: true });
+  await fs.writeFile(getFirstRunSentinelPath(), new Date().toISOString(), "utf8");
+  return true;
+});
+
+ipcMain.on("app:tutorial-log", () => { });
+
+ipcMain.handle("app:factory-reset", async () => {
+  const userDataPath = app.getPath("userData");
+  if (runningOverlayProcess) {
+    runningOverlayProcess.stdin?.write("\n");
+    runningOverlayProcess.kill();
+    runningOverlayProcess = null;
+  }
+
+  const resetTargets = [
+    "cache",
+    "cslol-overlay-cache",
+    "cslol-profiles",
+    "engine",
+    "hashtable",
+    "mod-files",
+    "party-files",
+    "presets",
+    "skin-library-index.json",
+    "engine-version.txt",
+    "overlay.log",
+    ".first-run-complete"
+  ].map((entry) => path.join(userDataPath, entry));
+
+  for (const target of resetTargets) {
+    await fs.rm(target, { recursive: true, force: true }).catch(() => { });
+  }
+
+  app.relaunch({
+    args: [...process.argv.slice(1), "--rift-atlas-show-tutorial"]
+  });
+  app.exit(0);
+  return { scheduled: true, userDataPath };
+});
 
 ipcMain.handle("app:get-engine-dll-status", async () => {
   const engineDir = path.join(app.getPath("userData"), "engine");
@@ -1400,6 +1684,46 @@ ipcMain.handle("app:open-user-data-path", async () => {
   }
   return targetPath;
 });
+
+ipcMain.handle("pengu:download-loader", async (event) => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  return downloadAndInstallPenguLoaderPortable(window);
+});
+
+ipcMain.handle("pengu:open-loader-folder", async () => {
+  const targetPath = getPenguLoaderRuntimeDir();
+  await fs.mkdir(targetPath, { recursive: true });
+  const error = await shell.openPath(targetPath);
+  if (error) {
+    throw new Error(error);
+  }
+  return targetPath;
+});
+
+ipcMain.handle("pengu:get-loader-status", async () => {
+  const executablePath = await findBundledPenguLoaderExecutable();
+  return {
+    executablePath,
+    running: await isPenguLoaderRunning(),
+    ...(await getPenguLoaderActivationStatus(executablePath))
+  };
+});
+
+ipcMain.handle("pengu:launch-loader", async () => launchPenguLoader({
+  allowElevation: true,
+  requireLeagueReady: true,
+  source: "manual"
+}));
+
+ipcMain.handle("pengu:deactivate-loader", async () => deactivatePenguLoader({ allowElevation: true }));
+
+ipcMain.handle("pengu:close-loader-ui", async () => ({ closed: await terminatePenguLoaderUi() }));
+
+ipcMain.handle("pengu:install-rift-plugin", async () => installRiftAtlasPenguPlugin());
+
+ipcMain.handle("pengu:send-message", async (_event, payload = {}) => ({
+  sent: sendPenguBridgeMessage(payload)
+}));
 
 ipcMain.handle("mods:select-folder", async () => {
   const result = await dialog.showOpenDialog({
@@ -1475,6 +1799,99 @@ ipcMain.handle("mods:select-league-game", async () => {
   return resolveLeagueGameExecutable(result.filePaths[0]);
 });
 
+const getLeagueFinalDirFromGamePath = async (leagueGamePath = "") => {
+  const executablePath = await resolveLeagueGameExecutable(String(leagueGamePath || ""));
+  return path.join(path.dirname(executablePath), "Data", "FINAL");
+};
+
+const readLeagueFinalManifest = async () => {
+  const manifestPath = getPackagedAssetPath("assets", "league-final-manifest.txt");
+  const content = await fs.readFile(manifestPath, "utf8");
+  const entries = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => {
+      const [relativePath = "", fileName = "", sizeText = "0"] = line.split("\t");
+      return {
+        relativePath: relativePath.replace(/\\/g, "/"),
+        fileName,
+        size: Number(sizeText) || 0
+      };
+    })
+    .filter((entry) => entry.relativePath);
+  return { manifestPath, entries };
+};
+
+const listLeagueFinalFiles = async (finalDir) => {
+  const entries = [];
+  const walk = async (currentDir) => {
+    const dirEntries = await fs.readdir(currentDir, { withFileTypes: true });
+    for (const entry of dirEntries) {
+      const entryPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(entryPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const stat = await fs.stat(entryPath);
+      entries.push({
+        absolutePath: entryPath,
+        relativePath: path.relative(finalDir, entryPath).replace(/\\/g, "/"),
+        fileName: entry.name,
+        size: stat.size
+      });
+    }
+  };
+  await walk(finalDir);
+  return entries;
+};
+
+ipcMain.handle("mods:check-league-install", async (_event, payload = {}) => {
+  const finalDir = await getLeagueFinalDirFromGamePath(payload.leagueGamePath);
+  await fs.access(finalDir);
+
+  const { manifestPath, entries: expectedEntries } = await readLeagueFinalManifest();
+  const actualEntries = await listLeagueFinalFiles(finalDir);
+  const actualByPath = new Map(actualEntries.map((entry) => [entry.relativePath.toLowerCase(), entry]));
+  const expectedByPath = new Map(expectedEntries.map((entry) => [entry.relativePath.toLowerCase(), entry]));
+  const missing = [];
+  const sizeMismatch = [];
+
+  for (const expected of expectedEntries) {
+    const actual = actualByPath.get(expected.relativePath.toLowerCase());
+    if (!actual) {
+      missing.push(expected);
+      continue;
+    }
+    if (actual.size !== expected.size) {
+      sizeMismatch.push({
+        relativePath: expected.relativePath,
+        fileName: expected.fileName,
+        expectedSize: expected.size,
+        actualSize: actual.size
+      });
+    }
+  }
+
+  const extra = actualEntries.filter((entry) => !expectedByPath.has(entry.relativePath.toLowerCase()));
+  const ok = missing.length === 0 && sizeMismatch.length === 0;
+
+  return {
+    ok,
+    finalDir,
+    manifestPath,
+    expectedCount: expectedEntries.length,
+    actualCount: actualEntries.length,
+    missingCount: missing.length,
+    mismatchCount: sizeMismatch.length,
+    extraCount: extra.length,
+    missing: missing.slice(0, 30),
+    sizeMismatch: sizeMismatch.slice(0, 30),
+    extra: extra.slice(0, 30)
+  };
+});
+
 ipcMain.handle("mods:select-ltk", async () => {
   const result = await dialog.showOpenDialog({
     title: "Seleccionar LTK Manager",
@@ -1517,7 +1934,7 @@ ipcMain.handle("ltk:detect", async () => {
     try {
       await fs.access(candidate);
       return candidate;
-    } catch {}
+    } catch { }
   }
   return null;
 });
@@ -1525,17 +1942,17 @@ ipcMain.handle("ltk:detect", async () => {
 ipcMain.handle("ltk:get-status", async (_event, payload) => {
   const exePath = String(payload?.exePath || "");
   let exeExists = false;
-  try { await fs.access(exePath); exeExists = true; } catch {}
+  try { await fs.access(exePath); exeExists = true; } catch { }
 
   const dataDir = LTK_DATA_DIR;
   let dataDirExists = false;
-  try { await fs.access(dataDir); dataDirExists = true; } catch {}
+  try { await fs.access(dataDir); dataDirExists = true; } catch { }
 
   let library = null;
   try {
     const content = await fs.readFile(path.join(dataDir, "library.json"), "utf8");
     library = JSON.parse(content);
-  } catch {}
+  } catch { }
 
   return { exePath, exeExists, dataDir, dataDirExists, library };
 });
@@ -1562,13 +1979,13 @@ ipcMain.handle("ltk:import-mods", async (_event, payload) => {
     if (!library.mods) library.mods = [];
     if (!library.profiles) library.profiles = [];
     if (!library.folders) library.folders = [];
-  } catch {}
+  } catch { }
 
   try {
     const archContent = await fs.readFile(archivesMetaPath, "utf8");
     archivesMeta = JSON.parse(archContent);
     if (!archivesMeta.archives) archivesMeta.archives = [];
-  } catch {}
+  } catch { }
 
   const existingNames = new Set();
   for (const m of library.mods) {
@@ -1694,13 +2111,21 @@ ipcMain.handle("mods:select-bocchi-sidecar", async () => {
 });
 
 ipcMain.handle("mods:select-bocchi-dll", async () => {
-  const installedDllPath = path.join(app.getPath("userData"), "engine", "cslol-dll.dll");
-  try {
-    await fs.access(installedDllPath);
-    return installedDllPath;
-  } catch {
-    throw new Error("La DLL se coloca manualmente en la carpeta engine de Rift Atlas.");
-  }
+  const result = await dialog.showOpenDialog({
+    title: "Seleccionar cslol-dll.dll",
+    buttonLabel: "Seleccionar DLL",
+    properties: ["openFile"],
+    filters: [{ name: "DLL", extensions: ["dll"] }]
+  });
+
+  if (result.canceled || !result.filePaths?.[0]) return null;
+  const selectedPath = result.filePaths[0];
+  const engineDir = path.join(app.getPath("userData"), "engine");
+  const installedDllPath = path.join(engineDir, "cslol-dll.dll");
+
+  await fs.mkdir(engineDir, { recursive: true });
+  await fs.copyFile(selectedPath, installedDllPath);
+  return installedDllPath;
 });
 
 const findExistingPath = async (candidates) => {
@@ -1708,7 +2133,7 @@ const findExistingPath = async (candidates) => {
     try {
       await fs.access(candidate);
       return candidate;
-    } catch {}
+    } catch { }
   }
   return null;
 };
@@ -1737,7 +2162,7 @@ const extractSevenZipSfx = async (archivePath, extractPath) => {
 
   try {
     sevenZip.FS.mkdir(mountRoot);
-  } catch {}
+  } catch { }
   sevenZip.FS.mount(sevenZip.NODEFS, { root: tempDir }, mountRoot);
   sevenZip.FS.chdir(mountRoot);
   sevenZip.callMain(["x", archiveName, `-o${extractDirName}`, "-y"]);
@@ -1773,6 +2198,781 @@ const getLatestCslolWindowsAsset = async () => {
   }
 
   return { release, asset };
+};
+
+const getPenguLoaderDownloadDir = () => path.join(app.getPath("userData"), "pengu-loader");
+const getPenguLoaderRuntimeDir = () => path.join(app.getPath("userData"), "Pengu Loader");
+const getRiftAtlasPenguPluginsRuntimeDir = () => path.join(getPenguLoaderRuntimeDir(), "plugins");
+const getRiftAtlasPenguPluginRuntimeDir = () => path.join(getRiftAtlasPenguPluginsRuntimeDir(), "rift-atlas-party");
+const PENGU_LOADER_EXE_NAMES = ["Pengu Loader.exe", "pengu-loader.exe", "PenguLoader.exe"];
+
+const execFileText = (file, args = [], options = {}) => new Promise((resolve, reject) => {
+  execFile(file, args, { windowsHide: true, timeout: 15000, ...options }, (error, stdout, stderr) => {
+    if (error) {
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+      return;
+    }
+    resolve(String(stdout || ""));
+  });
+});
+
+const fileExists = async (filePath) => {
+  if (!filePath) return false;
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
+};
+
+const directoryExists = async (dirPath) => {
+  if (!dirPath) return false;
+  try {
+    const stat = await fs.stat(dirPath);
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+};
+
+const getBundledRiftAtlasPenguPluginDir = () => getPackagedAssetPath("pengu", "rift-atlas-party");
+const getBundledRiftAtlasPenguPluginsDir = () => getPackagedAssetPath("pengu");
+
+const installRiftAtlasPenguPlugin = async () => {
+  const sourceRoot = getBundledRiftAtlasPenguPluginsDir();
+  const fallbackSourceDir = getBundledRiftAtlasPenguPluginDir();
+  if (!await directoryExists(sourceRoot) && !await directoryExists(fallbackSourceDir)) {
+    throw new Error(`No encontre los plugins de Pengu en ${sourceRoot}.`);
+  }
+  const targetRoot = getRiftAtlasPenguPluginsRuntimeDir();
+  await fs.mkdir(targetRoot, { recursive: true });
+  const sourcePlugins = await directoryExists(sourceRoot)
+    ? (await fs.readdir(sourceRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({ name: entry.name, sourceDir: path.join(sourceRoot, entry.name) }))
+    : [{ name: "rift-atlas-party", sourceDir: fallbackSourceDir }];
+
+  for (const plugin of sourcePlugins) {
+    const targetDir = path.join(targetRoot, plugin.name);
+    await fs.rm(targetDir, { recursive: true, force: true }).catch(() => { });
+    await fs.cp(plugin.sourceDir, targetDir, {
+      recursive: true,
+      force: true,
+      errorOnExist: false
+    });
+  }
+  const targetDir = getRiftAtlasPenguPluginRuntimeDir();
+  return {
+    pluginDir: targetDir,
+    entryPath: path.join(targetDir, "index.js"),
+    plugins: sourcePlugins.map((plugin) => plugin.name)
+  };
+};
+
+const getPenguLoaderCandidatePaths = () => {
+  const bases = [
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "Pengu Loader"),
+    path.join(process.env.LOCALAPPDATA || "", "Pengu Loader"),
+    path.join(process.env.APPDATA || "", "Pengu Loader"),
+    path.join(process.env.PROGRAMFILES || "", "Pengu Loader"),
+    path.join(process.env["PROGRAMFILES(X86)"] || "", "Pengu Loader")
+  ].filter(Boolean);
+
+  return bases.flatMap((basePath) => PENGU_LOADER_EXE_NAMES.map((exeName) => path.join(basePath, exeName)));
+};
+
+const parseWindowsCommandPath = (value = "") => {
+  const trimmed = String(value || "").trim();
+  const quoted = trimmed.match(/^"([^"]+\.exe)"/i);
+  if (quoted) return quoted[1];
+  const plain = trimmed.match(/^(.+?\.exe)(?:\s|$)/i);
+  return plain ? plain[1].trim() : trimmed;
+};
+
+const findPenguLoaderFromRegistry = async () => {
+  if (process.platform !== "win32") return "";
+  const roots = [
+    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
+  ];
+
+  for (const root of roots) {
+    let output = "";
+    try {
+      output = await execFileText("reg", ["query", root, "/s"]);
+    } catch {
+      continue;
+    }
+
+    const chunks = output.split(/\r?\n\r?\n/);
+    for (const chunk of chunks) {
+      if (!/DisplayName\s+REG_\w+\s+Pengu Loader/i.test(chunk)) continue;
+      const installLocation = chunk.match(/InstallLocation\s+REG_\w+\s+(.+)/i)?.[1]?.trim();
+      const displayIcon = chunk.match(/DisplayIcon\s+REG_\w+\s+(.+)/i)?.[1]?.trim();
+      const candidates = [
+        ...PENGU_LOADER_EXE_NAMES.map((exeName) => installLocation ? path.join(installLocation, exeName) : ""),
+        parseWindowsCommandPath(displayIcon)
+      ];
+      for (const candidate of candidates) {
+        if (await fileExists(candidate)) return candidate;
+      }
+    }
+  }
+
+  return "";
+};
+
+const findPenguLoaderExecutable = async () => {
+  for (const candidate of getPenguLoaderCandidatePaths()) {
+    if (await fileExists(candidate)) return candidate;
+  }
+  return findPenguLoaderFromRegistry();
+};
+
+const findBundledPenguLoaderExecutable = async () => {
+  for (const exeName of PENGU_LOADER_EXE_NAMES) {
+    const candidate = path.join(getPenguLoaderRuntimeDir(), exeName);
+    if (await fileExists(candidate)) return candidate;
+  }
+  return "";
+};
+
+const isPenguLoaderRunning = async () => {
+  if (process.platform !== "win32") return false;
+  for (const exeName of PENGU_LOADER_EXE_NAMES) {
+    try {
+      const output = await execFileText("tasklist", ["/FI", `IMAGENAME eq ${exeName}`, "/NH"]);
+      if (output.toLowerCase().includes(exeName.toLowerCase())) return true;
+    } catch {
+      // Keep trying other names.
+    }
+  }
+  return false;
+};
+
+const isLeagueClientRunning = async () => {
+  if (process.platform !== "win32") return false;
+  const names = ["LeagueClient.exe", "LeagueClientUx.exe", "LeagueClientUxRender.exe"];
+  for (const name of names) {
+    try {
+      const output = await execFileText("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/NH"]);
+      if (output.toLowerCase().includes(name.toLowerCase())) return true;
+    } catch {
+      // Keep trying other League client processes.
+    }
+  }
+  return false;
+};
+
+const findLeagueClientLockfile = async (leagueClientPath = "") => {
+  const candidates = [
+    process.env.LCU_LOCKFILE || "",
+    leagueClientPath ? path.join(leagueClientPath, "lockfile") : "",
+    "C:\\Riot Games\\League of Legends\\lockfile",
+    "D:\\Riot Games\\League of Legends\\lockfile",
+    path.join(process.env.PROGRAMFILES || "", "Riot Games", "League of Legends", "lockfile"),
+    path.join(process.env["PROGRAMFILES(X86)"] || "", "Riot Games", "League of Legends", "lockfile")
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) return candidate;
+  }
+
+  if (process.platform === "win32") {
+    try {
+      const runningPath = (await execFileText("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        "(Get-Process LeagueClient -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path)"
+      ], { timeout: 10000 })).trim();
+      if (runningPath) {
+        const lockfilePath = path.join(path.dirname(runningPath), "lockfile");
+        if (await fileExists(lockfilePath)) return lockfilePath;
+      }
+    } catch {
+      // Fall back to static candidates.
+    }
+  }
+
+  return "";
+};
+
+const terminatePenguLoaderUi = async () => {
+  if (process.platform !== "win32") return false;
+  let terminated = false;
+  for (const exeName of PENGU_LOADER_EXE_NAMES) {
+    try {
+      await execFileText("taskkill", ["/IM", exeName, "/F"], { timeout: 10000 });
+      terminated = true;
+    } catch {
+      // taskkill returns an error when the process is not running.
+    }
+  }
+  return terminated;
+};
+
+const getPenguLeagueClientPath = async () => {
+  if (process.platform === "win32") {
+    try {
+      const runningPath = (await execFileText("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        "(Get-Process LeagueClientUx -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path)"
+      ], { timeout: 10000 })).trim();
+      if (runningPath) {
+        const runningDir = path.dirname(runningPath);
+        if (await fileExists(path.join(runningDir, "LeagueClient.exe"))) return runningDir;
+      }
+    } catch {
+      // Fall back to the configured game executable.
+    }
+  }
+
+  const gamePath = await resolveLeagueGameExecutableOptional("");
+  if (!gamePath) return "";
+  const gameDir = path.dirname(gamePath);
+  const leagueRoot = path.dirname(gameDir);
+  return await fileExists(path.join(leagueRoot, "LeagueClient.exe")) ? leagueRoot : gameDir;
+};
+
+const getPenguLeagueGamePath = async (leagueClientPath = "") => {
+  const gameDirFromClient = leagueClientPath ? path.join(leagueClientPath, "Game") : "";
+  if (gameDirFromClient && await fileExists(path.join(gameDirFromClient, "League of Legends.exe"))) {
+    return gameDirFromClient;
+  }
+
+  const gameExe = await resolveLeagueGameExecutableOptional("");
+  return gameExe ? path.dirname(gameExe) : "";
+};
+
+const getLeagueClientReadyState = async () => {
+  const leagueClientPath = await getPenguLeagueClientPath();
+  const leagueGamePath = await getPenguLeagueGamePath(leagueClientPath);
+  const running = await isLeagueClientRunning();
+  const lockfilePath = await findLeagueClientLockfile(leagueClientPath);
+  return {
+    running,
+    ready: Boolean(running && lockfilePath),
+    lockfilePath,
+    leagueClientPath,
+    leagueGamePath
+  };
+};
+
+const getRosePenguConfigPath = () => path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "Rose", "config.ini");
+
+const setIniValue = (content, section, key, value) => {
+  const lines = String(content || "").replace(/^\uFEFF/, "").split(/\r?\n/);
+  const sectionPattern = new RegExp(`^\\s*\\[${section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\s*$`, "i");
+  const keyPattern = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=`, "i");
+  let sectionIndex = lines.findIndex((line) => sectionPattern.test(line));
+  if (sectionIndex === -1) {
+    if (lines.length && lines[lines.length - 1].trim()) lines.push("");
+    lines.push(`[${section}]`);
+    sectionIndex = lines.length - 1;
+  }
+
+  let insertIndex = lines.length;
+  for (let index = sectionIndex + 1; index < lines.length; index += 1) {
+    if (/^\s*\[.+\]\s*$/.test(lines[index])) {
+      insertIndex = index;
+      break;
+    }
+    if (keyPattern.test(lines[index])) {
+      lines[index] = `${key}=${value}`;
+      return lines.join("\n").replace(/\n+$/, "\n");
+    }
+  }
+
+  lines.splice(insertIndex, 0, `${key}=${value}`);
+  return lines.join("\n").replace(/\n+$/, "\n");
+};
+
+const writeRosePenguConfig = async ({ executablePath, leagueClientPath }) => {
+  if (!executablePath || !leagueClientPath) return "";
+  const loaderDir = path.dirname(executablePath);
+  const leagueGameDir = path.join(leagueClientPath, "Game");
+  const configPath = getRosePenguConfigPath();
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  let content = await fs.readFile(configPath, "utf8").catch(() => "[General]\n");
+  content = setIniValue(content, "General", "clientpath", leagueClientPath);
+  if (await directoryExists(leagueGameDir)) {
+    content = setIniValue(content, "General", "leaguepath", leagueGameDir);
+  }
+  content = setIniValue(content, "General", "disabled", "0");
+  content = setIniValue(content, "General", "loaderpath", loaderDir);
+  await fs.writeFile(configPath, content, "utf8");
+  return configPath;
+};
+
+const setRosePenguDisabled = async (disabled) => {
+  const configPath = getRosePenguConfigPath();
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  let content = await fs.readFile(configPath, "utf8").catch(() => "[General]\n");
+  content = setIniValue(content, "General", "disabled", disabled ? "1" : "0");
+  await fs.writeFile(configPath, content, "utf8");
+  return configPath;
+};
+
+const ensurePenguProxyInstalled = async (executablePath, leagueClientPath) => {
+  if (!executablePath || !leagueClientPath) {
+    return { proxyInstalled: false, proxyPath: "", proxyError: "No encontre la ruta de League." };
+  }
+
+  const loaderDir = path.dirname(executablePath);
+  const corePath = path.join(loaderDir, "core.dll");
+  const proxyPath = path.join(leagueClientPath, "d3d9.dll");
+
+  try {
+    const configPath = await writeRosePenguConfig({ executablePath, leagueClientPath });
+    const [coreStat, proxyStat] = await Promise.all([
+      fs.stat(corePath),
+      fs.stat(proxyPath).catch(() => null)
+    ]);
+    if (proxyStat && proxyStat.size === coreStat.size) {
+      return { proxyInstalled: true, proxyPath, configPath };
+    }
+
+    await fs.copyFile(corePath, proxyPath);
+    const copiedStat = await fs.stat(proxyPath);
+    return {
+      proxyInstalled: copiedStat.size === coreStat.size,
+      proxyPath,
+      configPath,
+      proxyError: copiedStat.size === coreStat.size ? "" : "El proxy d3d9.dll quedo con un tamano inesperado."
+    };
+  } catch (error) {
+    return {
+      proxyInstalled: false,
+      proxyPath,
+      proxyError: error.message || "No pude escribir d3d9.dll en la carpeta de League."
+    };
+  }
+};
+
+const removePenguProxyIfManaged = async (executablePath, leagueClientPath) => {
+  if (!executablePath || !leagueClientPath) {
+    return { proxyRemoved: false, proxyPath: "", proxyError: "No encontre la ruta de League." };
+  }
+
+  const corePath = path.join(path.dirname(executablePath), "core.dll");
+  const proxyPath = path.join(leagueClientPath, "d3d9.dll");
+  const configPath = await setRosePenguDisabled(true);
+
+  try {
+    const [coreStat, proxyStat] = await Promise.all([
+      fs.stat(corePath).catch(() => null),
+      fs.stat(proxyPath).catch(() => null)
+    ]);
+    if (!proxyStat) {
+      return { proxyRemoved: true, proxyPath, configPath, proxyExisted: false };
+    }
+    if (coreStat && proxyStat.size === coreStat.size) {
+      await fs.rm(proxyPath, { force: true });
+      return { proxyRemoved: true, proxyPath, configPath, proxyExisted: true };
+    }
+    return {
+      proxyRemoved: false,
+      proxyPath,
+      configPath,
+      proxyError: "No borre d3d9.dll porque no parece ser el proxy de Rift Atlas."
+    };
+  } catch (error) {
+    return {
+      proxyRemoved: false,
+      proxyPath,
+      configPath,
+      proxyError: error.message || "No pude quitar d3d9.dll de League."
+    };
+  }
+};
+
+const getPenguLoaderActivationStatus = async (executablePath) => {
+  const leagueReadyState = await getLeagueClientReadyState();
+  const { leagueClientPath, leagueGamePath, lockfilePath, ready: leagueReady } = leagueReadyState;
+  if (!executablePath || !leagueClientPath) {
+    return { active: false, proxyInstalled: false, proxyPath: "", leagueClientPath, leagueGamePath, lockfilePath, leagueReady };
+  }
+
+  const loaderDir = path.dirname(executablePath);
+  const corePath = path.join(loaderDir, "core.dll");
+  const proxyPath = path.join(leagueClientPath, "d3d9.dll");
+
+  try {
+    const [coreStat, proxyStat] = await Promise.all([
+      fs.stat(corePath),
+      fs.stat(proxyPath).catch(() => null)
+    ]);
+    const configPath = getRosePenguConfigPath();
+    const configContent = await fs.readFile(configPath, "utf8").catch(() => "");
+    const disabled = /^\s*disabled\s*=\s*1\s*$/im.test(configContent);
+    const proxyInstalled = Boolean(proxyStat && proxyStat.size === coreStat.size);
+    return {
+      active: proxyInstalled && !disabled,
+      proxyInstalled,
+      disabled,
+      configPath,
+      proxyPath,
+      leagueClientPath,
+      leagueGamePath,
+      lockfilePath,
+      leagueReady
+    };
+  } catch {
+    return { active: false, proxyInstalled: false, proxyPath, leagueClientPath, leagueGamePath, lockfilePath, leagueReady };
+  }
+};
+
+const runPenguLoaderCli = async (executablePath, args = []) =>
+  execFileText(executablePath, args, {
+    cwd: path.dirname(executablePath),
+    timeout: 30000
+  });
+
+const launchPenguLoader = async ({ allowElevation = false, requireLeagueReady = false, source = "manual" } = {}) => {
+  const executablePath = await findBundledPenguLoaderExecutable();
+  if (!executablePath) {
+    return { launched: false, alreadyRunning: false, executablePath: "", missing: true };
+  }
+
+  const leagueReadyState = await getLeagueClientReadyState();
+  const { leagueClientPath, leagueGamePath, lockfilePath, ready: leagueReady } = leagueReadyState;
+  const restartClient = leagueReadyState.running;
+  if (requireLeagueReady && !leagueReady) {
+    await appendOverlayLog(`[Pengu Loader] Activacion ${source} en espera: League Client no esta listo. running=${leagueReadyState.running} lockfile=${lockfilePath || "no encontrado"}`).catch(() => { });
+    return {
+      launched: false,
+      activated: false,
+      waitingForLeague: true,
+      executablePath,
+      leagueClientPath,
+      leagueGamePath,
+      lockfilePath,
+      message: "Abri League Client hasta que aparezca el cliente real; Rift Atlas activara Pengu cuando detecte el lockfile."
+    };
+  }
+  try {
+    await installRiftAtlasPenguPlugin().catch(() => null);
+    await terminatePenguLoaderUi();
+    await writeRosePenguConfig({ executablePath, leagueClientPath });
+    await appendOverlayLog(`[Pengu Loader] Configurando ruta estilo Rose: client=${leagueClientPath || "no encontrado"} game=${leagueGamePath || "no encontrado"}`).catch(() => { });
+    const leagueRootPath = leagueGamePath
+      ? path.dirname(leagueGamePath)
+      : "";
+    if (leagueGamePath) {
+      await runPenguLoaderCli(executablePath, ["--set-league-path", leagueRootPath, "--silent"]);
+    } else {
+      await appendOverlayLog("[Pengu Loader] No se ejecuto --set-league-path porque no se encontro la carpeta Game de League.").catch(() => { });
+    }
+    await runPenguLoaderCli(executablePath, ["--force-activate", "--silent"]);
+    const proxyState = await getPenguLoaderActivationStatus(executablePath);
+    let restartedClient = false;
+    if (restartClient) {
+      try {
+        await runPenguLoaderCli(executablePath, ["--restart-client", "--silent"]);
+        restartedClient = true;
+      } catch (restartError) {
+        return {
+          launched: true,
+          activated: true,
+          alreadyRunning: await isPenguLoaderRunning(),
+          executablePath,
+          leagueClientPath,
+          leagueGamePath,
+          needsClientRestart: true,
+          restartedClient: false,
+          restartError: restartError.message,
+          method: "rose-cli",
+          ...proxyState
+        };
+      }
+    }
+    await terminatePenguLoaderUi();
+    return {
+      launched: true,
+      activated: true,
+      alreadyRunning: await isPenguLoaderRunning(),
+      executablePath,
+      leagueClientPath,
+      leagueGamePath,
+      needsClientRestart: restartClient,
+      restartedClient,
+      method: "rose-cli",
+      ...proxyState
+    };
+  } catch (error) {
+    let proxyState = {};
+    try {
+      proxyState = await ensurePenguProxyInstalled(executablePath, leagueClientPath);
+    } catch {
+      proxyState = {};
+    }
+
+    if (allowElevation) {
+      return {
+        launched: Boolean(proxyState.proxyInstalled),
+        activated: Boolean(proxyState.active || proxyState.proxyInstalled),
+        elevated: false,
+        alreadyRunning: await isPenguLoaderRunning(),
+        executablePath,
+        leagueClientPath,
+        leagueGamePath,
+        error: error.message,
+        code: error.code || "",
+        method: "rose-cli-fallback",
+        ...proxyState
+      };
+    }
+
+    return {
+      launched: Boolean(proxyState.proxyInstalled),
+      activated: Boolean(proxyState.active || proxyState.proxyInstalled),
+      alreadyRunning: await isPenguLoaderRunning(),
+      executablePath,
+      leagueClientPath,
+      leagueGamePath,
+      error: error.message,
+      code: error.code || "",
+      method: "rose-cli-fallback",
+      ...proxyState
+    };
+  }
+};
+
+const deactivatePenguLoader = async ({ allowElevation = false } = {}) => {
+  const executablePath = await findBundledPenguLoaderExecutable();
+  const leagueClientPath = await getPenguLeagueClientPath();
+  const restartClient = await isLeagueClientRunning();
+
+  if (!executablePath) {
+    const proxyState = await removePenguProxyIfManaged("", leagueClientPath);
+    return {
+      deactivated: proxyState.proxyRemoved,
+      executablePath: "",
+      leagueClientPath,
+      missing: true,
+      ...proxyState
+    };
+  }
+
+  try {
+    await terminatePenguLoaderUi();
+    let proxyState = {};
+    try {
+      await runPenguLoaderCli(executablePath, ["--force-deactivate", "--silent"]);
+      proxyState = await getPenguLoaderActivationStatus(executablePath);
+    } catch {
+      proxyState = await removePenguProxyIfManaged(executablePath, leagueClientPath);
+    }
+    let restartedClient = false;
+    if (restartClient) {
+      try {
+        await runPenguLoaderCli(executablePath, ["--restart-client", "--silent"]);
+        restartedClient = true;
+      } catch {
+        restartedClient = false;
+      }
+    }
+    await terminatePenguLoaderUi();
+    return {
+      deactivated: !proxyState.active && !proxyState.proxyInstalled,
+      executablePath,
+      leagueClientPath,
+      needsClientRestart: restartClient,
+      restartedClient,
+      method: "rose-cli",
+      ...proxyState
+    };
+  } catch (error) {
+    if (allowElevation) {
+      return {
+        deactivated: false,
+        elevated: false,
+        executablePath,
+        leagueClientPath,
+        error: error.message,
+        code: error.code || "",
+        method: "manual-proxy"
+      };
+    }
+
+    return {
+      deactivated: false,
+      executablePath,
+      leagueClientPath,
+      error: error.message,
+      code: error.code || "",
+      method: "manual-proxy"
+    };
+  }
+};
+
+const preparePenguRuntime = async () => {
+  const executablePath = await findBundledPenguLoaderExecutable();
+  if (!executablePath) {
+    return { prepared: false, missing: true };
+  }
+  const leagueClientPath = await getPenguLeagueClientPath();
+  const leagueGamePath = await getPenguLeagueGamePath(leagueClientPath);
+  const plugin = await installRiftAtlasPenguPlugin();
+  const proxyState = await ensurePenguProxyInstalled(executablePath, leagueClientPath);
+  await appendOverlayLog(`[Pengu Loader] Runtime preparado estilo Rose. No se abre Riot Client automaticamente. client=${leagueClientPath || "no encontrado"} game=${leagueGamePath || "no encontrado"}`).catch(() => { });
+  return {
+    prepared: Boolean(proxyState.proxyInstalled),
+    executablePath,
+    leagueClientPath,
+    leagueGamePath,
+    leagueLaunch: {
+      launched: false,
+      skipped: true,
+      reason: "Rose-style startup: solo prepara Pengu; League se abre manualmente o por restart-client si ya estaba corriendo."
+    },
+    plugin,
+    ...proxyState
+  };
+};
+
+const tryAutoActivatePenguWhenLeagueReady = async () => {
+  if (penguAutoActivationCompleted || penguAutoActivationInFlight) return;
+  penguAutoActivationInFlight = true;
+  try {
+    const executablePath = await findBundledPenguLoaderExecutable();
+    if (!executablePath) return;
+
+    const readyState = await getLeagueClientReadyState();
+    if (!readyState.ready) return;
+
+    await appendOverlayLog(`[Pengu Loader] League Client detectado estilo Rose. lockfile=${readyState.lockfilePath} client=${readyState.leagueClientPath}`).catch(() => { });
+    const result = await launchPenguLoader({
+      allowElevation: true,
+      requireLeagueReady: true,
+      source: "auto-rose"
+    });
+    penguAutoActivationCompleted = Boolean(result?.activated || result?.proxyInstalled || result?.active);
+    if (penguAutoActivationCompleted) {
+      await appendOverlayLog("[Pengu Loader] Auto-activacion estilo Rose completada.").catch(() => { });
+    }
+  } catch (error) {
+    await appendOverlayLog(`[Pengu Loader] Auto-activacion estilo Rose fallo: ${error.message || error}`).catch(() => { });
+  } finally {
+    penguAutoActivationInFlight = false;
+  }
+};
+
+const startPenguAutoActivationWatcher = () => {
+  if (penguAutoActivationTimer) return;
+  penguAutoActivationTimer = setInterval(() => {
+    tryAutoActivatePenguWhenLeagueReady();
+  }, 2500);
+  tryAutoActivatePenguWhenLeagueReady();
+};
+
+const getLatestPenguLoaderZipAsset = async () => {
+  try {
+    const repo = await fetchJsonWithTimeout(ROSE_PENGU_REPO_API, {
+      headers: { "user-agent": "RiftAtlas" }
+    });
+    const branch = repo.default_branch || "main";
+    return {
+      release: { tag_name: "ROSE-Pengu", source: "Tariolle/ROSE-Pengu" },
+      asset: {
+        name: `ROSE-Pengu-${branch}.zip`,
+        browser_download_url: `https://codeload.github.com/Tariolle/ROSE-Pengu/zip/refs/heads/${encodeURIComponent(branch)}`
+      }
+    };
+  } catch {
+    // Fall back to the official portable release only if the Rose fork is unavailable.
+  }
+
+  try {
+    const release = await fetchJsonWithTimeout(PENGU_DISTRO_RELEASE_API, {
+      headers: { "user-agent": "RiftAtlas" }
+    });
+    const asset = (release.assets || []).find((item) => /portable\.zip$/i.test(item.name || ""))
+      || (release.assets || []).find((item) => /\.zip$/i.test(item.name || ""));
+    if (asset?.browser_download_url) {
+      return { release, asset };
+    }
+  } catch {
+    // Surface a consistent error below.
+  }
+
+  throw new Error("No pude encontrar un ZIP de Pengu Loader para descargar.");
+};
+
+const findFileRecursive = async (rootDir, predicate) => {
+  const entries = await fs.readdir(rootDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (entry.isFile() && predicate(entryPath, entry.name)) return entryPath;
+    if (entry.isDirectory()) {
+      const found = await findFileRecursive(entryPath, predicate);
+      if (found) return found;
+    }
+  }
+  return "";
+};
+
+const downloadAndInstallPenguLoaderPortable = async (window) => {
+  const { release, asset } = await getLatestPenguLoaderZipAsset();
+  const downloadDir = getPenguLoaderDownloadDir();
+  const runtimeDir = getPenguLoaderRuntimeDir();
+  const tempDir = path.join(downloadDir, "extract");
+  const zipPath = path.join(downloadDir, sanitizeFileName(asset.name || "pengu-loader.zip"));
+
+  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
+  await fs.mkdir(downloadDir, { recursive: true });
+  sendDownloadProgress(window, {
+    type: "pengu-loader",
+    message: `Descargando Pengu Loader ${release.tag_name || ""}...`
+  });
+  await downloadFile(asset.browser_download_url, zipPath, (progress) => {
+    sendDownloadProgress(window, {
+      type: "pengu-loader",
+      message: "Descargando Pengu Loader...",
+      ...progress
+    });
+  });
+
+  sendDownloadProgress(window, {
+    type: "pengu-loader",
+    message: "Extrayendo Pengu Loader...",
+    percent: 100
+  });
+
+  await fs.mkdir(tempDir, { recursive: true });
+  await extractZip(zipPath, { dir: tempDir });
+
+  const extractedExe = await findFileRecursive(tempDir, (_filePath, fileName) =>
+    PENGU_LOADER_EXE_NAMES.some((exeName) => exeName.toLowerCase() === fileName.toLowerCase())
+  );
+  if (!extractedExe) {
+    throw new Error("El ZIP de Pengu Loader no contiene Pengu Loader.exe.");
+  }
+
+  const extractedRoot = path.dirname(extractedExe);
+  await terminatePenguLoaderUi();
+  await fs.rm(runtimeDir, { recursive: true, force: true }).catch(() => { });
+  await fs.mkdir(runtimeDir, { recursive: true });
+  await fs.cp(extractedRoot, runtimeDir, {
+    recursive: true,
+    force: true,
+    errorOnExist: false
+  });
+  const plugin = await installRiftAtlasPenguPlugin();
+  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
+
+  return {
+    version: release.tag_name || "",
+    executablePath: path.join(runtimeDir, path.basename(extractedExe)),
+    plugin,
+    downloadDir,
+    runtimeDir
+  };
 };
 
 const normalizeDllSource = (source) => {
@@ -1818,7 +3018,9 @@ const getDllDownloadSources = (preferredSource = "cslol") => {
     }
   };
   const first = normalizeDllSource(preferredSource);
-  if (first === "bundled") return [sources.bundled];
+  if (first === "bundled") {
+    return [sources.bundled, sources.cslol, sources.ltk];
+  }
   const fallback = first === "cslol" ? "ltk" : "cslol";
   return [sources[first], sources[fallback]];
 };
@@ -1828,7 +3030,7 @@ const downloadAndExtractLtkDll = async (window = null, { forceDownload = false, 
   const installedDllPath = path.join(targetDir, "cslol-dll.dll");
 
   if (forceDownload) {
-    await fs.rm(installedDllPath, { force: true }).catch(() => {});
+    await fs.rm(installedDllPath, { force: true }).catch(() => { });
   } else {
     try {
       await fs.access(installedDllPath);
@@ -1843,7 +3045,7 @@ const downloadAndExtractLtkDll = async (window = null, { forceDownload = false, 
         version: "",
         assetName: path.basename(installedDllPath)
       };
-    } catch {}
+    } catch { }
   }
 
   const previousNoAsar = process.noAsar;
@@ -1878,7 +3080,7 @@ const downloadAndExtractLtkDll = async (window = null, { forceDownload = false, 
 
     const failures = [];
     for (const source of downloadSources) {
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
       await fs.mkdir(tempDir, { recursive: true });
 
       try {
@@ -1891,7 +3093,7 @@ const downloadAndExtractLtkDll = async (window = null, { forceDownload = false, 
             type: "engine",
             message: `Trayendo DLL incluido con Rift Atlas: ${bundledDllPath} -> ${installedDllPath}`
           });
-          await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+          await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
           return {
             path: installedDllPath,
             sourceId: source.id,
@@ -1934,7 +3136,7 @@ const downloadAndExtractLtkDll = async (window = null, { forceDownload = false, 
           type: "engine",
           message: `Trayendo DLL de ${source.label} ${version}: ${dllSource} -> ${installedDllPath}`
         });
-        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
         return {
           path: installedDllPath,
           sourceId: source.id,
@@ -1951,7 +3153,7 @@ const downloadAndExtractLtkDll = async (window = null, { forceDownload = false, 
       }
     }
 
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
     throw new Error(`No pude descargar cslol-dll.dll. ${failures.join(" | ")}`);
   } finally {
     process.noAsar = previousNoAsar;
@@ -1976,12 +3178,19 @@ const downloadAndInstallHitoriEngine = async (window, options = {}) => {
     const setupExtractPath = path.join(tempDir, "setup");
     const appExtractPath = path.join(setupExtractPath, "$PLUGINSDIR", "app");
     const downloadPath = path.join(tempDir, asset.name);
+    const installedDllPath = path.join(targetDir, "cslol-dll.dll");
+    const preservedDllPath = path.join(tempDir, "preserved-cslol-dll.dll");
 
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
     await fs.mkdir(tempDir, { recursive: true });
+    const hadCustomDll = await fs.copyFile(installedDllPath, preservedDllPath)
+      .then(() => true)
+      .catch(() => false);
     sendDownloadProgress(window, {
       type: "engine",
-      message: "Instalando engine limpio; no se buscan DLLs locales."
+      message: hadCustomDll
+        ? "Instalando engine limpio; se conserva la DLL custom instalada."
+        : "Instalando engine limpio; no se encontro DLL custom instalada."
     });
 
     await downloadFile(asset.browser_download_url, downloadPath, (progress) => {
@@ -2006,48 +3215,82 @@ const downloadAndInstallHitoriEngine = async (window, options = {}) => {
       throw new Error("No encontre el sidecar resources\\ltk-manager.exe dentro del engine.");
     }
 
-    await fs.rm(targetDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(targetDir, { recursive: true, force: true }).catch(() => { });
     await fs.mkdir(targetDir, { recursive: true });
     const installedEnginePath = path.join(targetDir, "ltk-manager.exe");
     await fs.copyFile(sourceEnginePath, installedEnginePath);
 
-    const installedDllPath = path.join(targetDir, "cslol-dll.dll");
-    const dllResult = await downloadAndExtractLtkDll(window, {
-      forceDownload: true,
-      dllSource: options.dllSource
-    }).catch(() => null);
-    const extractedDllPath = dllResult?.path || "";
-    if (extractedDllPath) {
-      await fs.copyFile(extractedDllPath, installedDllPath);
-      await writeDllSourceMetadata({
-        sourceId: dllResult?.sourceId || "unknown",
-        sourceLabel: dllResult?.sourceLabel || "LeagueToolkit",
-        version: dllResult?.version || "",
-        assetName: dllResult?.assetName || "",
-        cachePath: extractedDllPath,
-        installedPath: installedDllPath
-      });
+    if (hadCustomDll) {
+      await fs.copyFile(preservedDllPath, installedDllPath);
+    }
+    let extractedDllPath = await findExistingPath([installedDllPath]);
+    let dllInstallInfo = extractedDllPath
+      ? {
+        sourceId: hadCustomDll ? "custom" : "engine",
+        sourceLabel: hadCustomDll ? "DLL custom preservada" : "DLL local en carpeta engine",
+        version: hadCustomDll ? "" : (release.tag_name || release.name || ""),
+        assetName: path.basename(extractedDllPath),
+        installedPath: extractedDllPath
+      }
+      : null;
+
+    if (!extractedDllPath) {
       sendDownloadProgress(window, {
         type: "engine",
-        message: `DLL descargada por Rift Atlas: ${extractedDllPath} -> ${installedDllPath}`
+        message: "DLL no encontrada junto al engine; intentando descargar cslol-dll.dll automaticamente..."
+      });
+      const downloadedDll = await downloadAndExtractLtkDll(window, {
+        forceDownload: false,
+        dllSource: normalizeDllSource(options?.dllSource)
+      });
+      await fs.copyFile(downloadedDll.path, installedDllPath);
+      extractedDllPath = await findExistingPath([installedDllPath]);
+      dllInstallInfo = {
+        ...downloadedDll,
+        sourceLabel: downloadedDll.sourceLabel || "DLL descargada por Rift Atlas",
+        installedPath: extractedDllPath || installedDllPath
+      };
+    }
+
+    if (extractedDllPath && dllInstallInfo) {
+      await writeDllSourceMetadata({
+        sourceId: dllInstallInfo.sourceId || "",
+        sourceLabel: dllInstallInfo.sourceLabel || "",
+        version: dllInstallInfo.version || "",
+        assetName: dllInstallInfo.assetName || path.basename(extractedDllPath),
+        sourcePath: dllInstallInfo.path || extractedDllPath,
+        installedPath: extractedDllPath
+      }).catch(() => { });
+    }
+    if (extractedDllPath) {
+      sendDownloadProgress(window, {
+        type: "engine",
+        message: hadCustomDll
+          ? `DLL custom preservada junto al engine: ${extractedDllPath}`
+          : `DLL lista junto al engine: ${extractedDllPath}`
       });
     } else {
-      throw new Error("No pude descargar cslol-dll.dll durante la instalacion del engine.");
+      sendDownloadProgress(window, {
+        type: "engine",
+        message: `DLL no encontrada. Colócala manualmente en ${installedDllPath}`
+      });
     }
 
     await fs.access(installedEnginePath);
     await fs.writeFile(path.join(app.getPath("userData"), "engine-version.txt"), release.tag_name || release.name || "");
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
 
     return {
       version: release.tag_name || release.name,
       assetName: asset.name,
       toolsDir: targetDir,
       enginePath: installedEnginePath,
-      dllPath: await findExistingPath([installedDllPath]),
+      dllPath: extractedDllPath,
       dllSourcePath: extractedDllPath,
-      dllSourceLabel: dllResult?.sourceLabel || "LeagueToolkit descargado por Rift Atlas",
-      dllInstallMessage: `DLL descargada desde ${dllResult?.sourceLabel || "LeagueToolkit"} ${dllResult?.version || ""} (${dllResult?.assetName || "asset desconocido"}): ${extractedDllPath} -> ${installedDllPath}`.trim()
+      dllSourceLabel: dllInstallInfo?.sourceLabel || (extractedDllPath ? "DLL local en carpeta engine" : "DLL manual requerida"),
+      dllInstallMessage: extractedDllPath
+        ? `DLL lista junto al engine: ${extractedDllPath}`
+        : `DLL no encontrada. Pégala manualmente en ${installedDllPath}`
     };
   } finally {
     process.noAsar = previousNoAsar;
@@ -2156,12 +3399,12 @@ const getLeagueCandidates = (selectedPath = "") => [
 const resolveLeagueGameExecutableOptional = async (selectedPath = "") => {
   try {
     return await resolveLeagueGameExecutable(selectedPath);
-  } catch {}
+  } catch { }
 
   for (const candidate of getLeagueCandidates(selectedPath)) {
     try {
       return await resolveLeagueGameExecutable(candidate);
-    } catch {}
+    } catch { }
   }
   return null;
 };
@@ -2207,10 +3450,10 @@ const ensureCslolDll = async (enginePath, selectedDllPath) => {
 
   try {
     await fs.access(bundledDllPath);
-    await appendOverlayLog(`DLL instalada por Rift Atlas: ${bundledDllPath}`).catch(() => {});
+    await appendOverlayLog(`DLL instalada por Rift Atlas: ${bundledDllPath}`).catch(() => { });
     return bundledDllPath;
-  } catch {}
-  await appendOverlayLog(`ERROR DLL no encontrada junto al engine: ${bundledDllPath}. No se buscan DLLs locales.`).catch(() => {});
+  } catch { }
+  await appendOverlayLog(`ERROR DLL no encontrada junto al engine: ${bundledDllPath}. No se buscan DLLs locales.`).catch(() => { });
   throw new Error("cslol-dll.dll no esta junto al engine. Pegalo manualmente en AppData\\Roaming\\Rift Atlas\\engine.");
 };
 
@@ -2221,7 +3464,7 @@ const ensureGameHashtable = async () => {
     if (stat.size > 1024 * 1024 * 10) {
       return hashtablePath;
     }
-  } catch {}
+  } catch { }
 
   await fs.mkdir(path.dirname(hashtablePath), { recursive: true });
 
@@ -2232,7 +3475,7 @@ const ensureGameHashtable = async () => {
       await fs.copyFile(bocchiHashtable, hashtablePath);
       return hashtablePath;
     }
-  } catch {}
+  } catch { }
 
   const tempPath = `${hashtablePath}.download`;
   const response = await fetch(HASHTABLE_URL, {
@@ -2288,10 +3531,10 @@ const resolveFantonizeSkinEntry = async (skin = {}) => {
   await appendOverlayLog(`Inferencia de ruta: champion=${guessed.champion} skin=${guessed.skin} fileBase=${guessed.fileBase} parent=${guessed.parent}`);
   const championEntry = metadata?.championsByKey
     ? [...metadata.championsByKey.values()].find((entry) =>
-        normalizeChampionName(entry.name) === normalizeChampionName(guessed.champion) ||
-        normalizeChampionName(entry.id) === normalizeChampionName(guessed.champion) ||
-        String(entry.key) === String(guessed.champion)
-      )
+      normalizeChampionName(entry.name) === normalizeChampionName(guessed.champion) ||
+      normalizeChampionName(entry.id) === normalizeChampionName(guessed.champion) ||
+      String(entry.key) === String(guessed.champion)
+    )
     : null;
 
   if (!championEntry) {
@@ -2352,7 +3595,7 @@ const createZipArchiveFromPackageDir = async ({ sourceDir, outputPath }) => {
   const mountRoot = "/nodefs";
   try {
     sevenZip.FS.mkdir(mountRoot);
-  } catch {}
+  } catch { }
   sevenZip.FS.mount(sevenZip.NODEFS, { root: tempRoot }, mountRoot);
   sevenZip.FS.chdir(path.posix.join(mountRoot, path.basename(sourceDir)));
   sevenZip.callMain(["a", "-tzip", path.posix.join("..", relativeOutputDir.replace(/\\/g, "/"), outputName), "META", "WAD"]);
@@ -2450,7 +3693,7 @@ const normalizeZipPackageForOverlay = async (skin = {}) => {
       await appendFileLogInfo(".fantome normalizado cache", outputPath);
       return outputPath;
     }
-  } catch {}
+  } catch { }
 
   const tempRoot = path.join(app.getPath("temp"), `rift-atlas-normalize-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const extractDir = path.join(tempRoot, "package");
@@ -2484,7 +3727,7 @@ const normalizeZipPackageForOverlay = async (skin = {}) => {
       }, null, 2));
     }
 
-    await fs.rm(outputPath, { force: true }).catch(() => {});
+    await fs.rm(outputPath, { force: true }).catch(() => { });
     const tempOutputPath = path.join(tempRoot, "out", path.basename(outputPath));
     await createZipArchiveFromPackageDir({ sourceDir: extractDir, outputPath: tempOutputPath });
     await fs.mkdir(outputDir, { recursive: true });
@@ -2493,7 +3736,7 @@ const normalizeZipPackageForOverlay = async (skin = {}) => {
     await appendFileLogInfo(".fantome normalizado escrito", outputPath);
     return outputPath;
   } finally {
-    await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => { });
   }
 };
 
@@ -2533,7 +3776,7 @@ const generateResolvedFantonizePackage = async ({ sidecarPath, gamePath, resolve
       await appendFileLogInfo(".fantome cache fantonize", expectedPath);
       return expectedPath;
     }
-  } catch {}
+  } catch { }
 
   const hashtablePath = await ensureGameHashtable();
   await appendFileLogInfo("Hashtable", hashtablePath);
@@ -2614,6 +3857,11 @@ const generateFantomeFromLeagueWad = async ({ sidecarPath, gamePath, skin }) => 
 };
 
 ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
+  if (activeOverlayRun) {
+    await cancelOverlayRun("Nueva ejecucion solicitada.");
+  }
+  const runToken = createOverlayRunToken();
+  activeOverlayRun = runToken;
   const sidecarPath = await resolveHitoriEngineExecutable(payload?.sidecarPath);
   const dllPath = String(payload?.dllPath || "");
   const gamePath = String(payload?.gamePath || "");
@@ -2621,202 +3869,213 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
     ? payload.skinEntries
     : (payload?.skinPaths || []).map((skinPath) => ({ path: skinPath }));
 
-  await appendOverlayLog("============================================================");
-  await appendOverlayLog(`INICIO OVERLAY runId=${Date.now()} appUserData=${app.getPath("userData")}`);
-  await appendOverlayLog(`Payload: skins=${skinEntries.length} sidecar=${sidecarPath} dllConfigurada=${dllPath || "no configurada"} game=${gamePath}`);
-
-  if (!gamePath.toLowerCase().endsWith("league of legends.exe")) {
-    await appendOverlayLog(`ERROR configuracion League invalida: ${gamePath}`);
-    throw new Error("League of Legends.exe no configurado.");
-  }
-  if (!skinEntries.length) {
-    await appendOverlayLog("ERROR no hay skins seleccionadas.");
-    throw new Error("No hay skins seleccionadas.");
-  }
-
-  const ensuredDllPath = await ensureCslolDll(sidecarPath, dllPath);
-  const dllSourceMetadata = await readDllSourceMetadata();
-  await appendOverlayLog(`Engine: ${sidecarPath}`);
-  await appendOverlayLog(`DLL: ${ensuredDllPath}`);
-  if (dllSourceMetadata) {
-    await appendOverlayLog(`Fuente DLL: ${dllSourceMetadata.sourceLabel || "desconocida"} ${dllSourceMetadata.version || ""} asset=${dllSourceMetadata.assetName || ""} descargada=${dllSourceMetadata.downloadedAt || ""}`);
-  } else {
-    await appendOverlayLog("Fuente DLL: sin metadata guardada.");
-  }
-  await appendOverlayLog(`League: ${gamePath}`);
-  await appendFileLogInfo("Engine detalle", sidecarPath);
-  await appendFileLogInfo("DLL detalle", ensuredDllPath);
-  await appendFileLogInfo("League exe detalle", gamePath);
-
-  for (const [index, entry] of skinEntries.entries()) {
-    const sp = entry?.path;
-    await appendOverlayLog(`Skin entrada #${index + 1}: champion=${entry?.champion || ""} skin=${entry?.skin || entry?.name || ""} variant=${entry?.variant || ""} path=${sp}`);
-    await appendFileLogInfo(`Skin entrada #${index + 1} archivo`, sp);
-    try { await fs.access(sp); } catch {
-      await appendOverlayLog(`ERROR archivo seleccionado no encontrado: ${sp}`);
-      throw new Error(`Archivo no encontrado: ${sp}`);
-    }
-  }
-
-  const skinPaths = [];
-  for (const [index, entry] of skinEntries.entries()) {
-    console.log('[DEBUG] generateFantomeFromLeagueWad for:', entry?.path);
-    await appendOverlayLog(`Procesando skin #${index + 1}/${skinEntries.length}`);
-    const modPath = await generateFantomeFromLeagueWad({ sidecarPath, gamePath, skin: entry });
-    console.log('[DEBUG] result path:', modPath);
-    await appendFileLogInfo(`Mod final #${index + 1}`, modPath);
-    skinPaths.push(modPath);
-  }
-  await appendOverlayLog(`Mods finales para mkoverlay: ${skinPaths.join(" | ")}`);
-
-  const gameFolder = path.dirname(gamePath);
-  const toolsDir = path.dirname(sidecarPath);
-  const profilesDir = path.join(app.getPath("userData"), "cslol-profiles");
-  const overlayCacheDir = path.join(app.getPath("userData"), "cslol-overlay-cache");
-  const overlayStateDir = path.join(profilesDir, ".mkoverlay-state");
-  const overlayCacheKey = await getOverlayCacheKey({ gamePath, skinPaths });
-  const overlayPath = path.join(overlayCacheDir, overlayCacheKey);
-  const statePath = overlayStateDir;
-  await appendOverlayLog(`Rutas overlay: gameFolder=${gameFolder} toolsDir=${toolsDir} profilesDir=${profilesDir} overlayCache=${overlayPath} statePath=${statePath} cacheKey=${overlayCacheKey}`);
-
-  await fs.mkdir(profilesDir, { recursive: true });
-  await fs.mkdir(overlayCacheDir, { recursive: true });
-  const oldProfiles = await fs.readdir(profilesDir, { withFileTypes: true }).catch(() => []);
-  await Promise.all(oldProfiles
-    .filter((entry) => entry.name !== ".mkoverlay-state")
-    .map((entry) => fs.rm(path.join(profilesDir, entry.name), { recursive: true, force: true }).catch(() => {})));
-  await fs.mkdir(profilesDir, { recursive: true });
-  await fs.mkdir(overlayStateDir, { recursive: true });
-  await appendOverlayLog("Directorio de perfiles limpiado para nueva ejecucion; cache mkoverlay conservada.");
-
-  const overlayCacheHit = await isUsableOverlayPath(overlayPath);
-  if (overlayCacheHit) {
-    await appendOverlayLog(`Overlay cache HIT: ${overlayPath}. Se salta mkoverlay.`);
-    await appendDirectoryLogInfo("Overlay cache reutilizado", overlayPath);
-  } else {
-    await appendOverlayLog(`Overlay cache MISS: ${overlayPath}. Construyendo por partes con mkoverlay.`);
-    await fs.rm(overlayPath, { recursive: true, force: true }).catch(() => {});
-  }
-
-  const mkoverlayArgs = [
-    "mkoverlay",
-    "--game",
-    path.normalize(gameFolder),
-    "--overlay",
-    path.normalize(overlayPath),
-    "--state",
-    path.normalize(statePath)
-  ];
-  for (const skinPath of skinPaths) {
-    mkoverlayArgs.push("--mod", path.normalize(skinPath));
-  }
-
-  if (!overlayCacheHit) {
-    await appendOverlayLog(`Ejecutando mkoverlay en: ${overlayPath}`);
-    await appendOverlayLog(`mkoverlay args: ${mkoverlayArgs.join(" ")}`);
-    const mkoverlayInputBytes = await getFilesTotalSize(skinPaths);
-    const mkoverlayTimeoutMs = getMkoverlayTimeoutMs(mkoverlayInputBytes);
-    await appendOverlayLog(`mkoverlay timeout: ${Math.round(mkoverlayTimeoutMs / 1000)}s para ${formatLogBytes(mkoverlayInputBytes)} de mods.`);
-    let mkoverlayStdout = "";
-    try {
-      mkoverlayStdout = await execToolWithTimeout(sidecarPath, mkoverlayArgs, mkoverlayTimeoutMs, { cwd: toolsDir });
-    } catch (error) {
-      await appendOverlayLog(`mkoverlay fallo: ${error.message}`);
-      throw new Error(`mkoverlay fallo: ${error.message}`);
-    }
-    await appendOverlayLog(`mkoverlay OK${mkoverlayStdout ? `: ${mkoverlayStdout.slice(0, 500)}` : ""}`);
-    console.log('[DEBUG] mkoverlay stdout:', mkoverlayStdout.slice(0, 2000));
-  }
-
-  // Verificar que el overlay tenga archivos
-  const overlayFiles = await fs.readdir(overlayPath).catch(() => []);
-  await appendOverlayLog(`Archivos generados por overlay: ${overlayFiles.length}${overlayFiles.length ? ` (${overlayFiles.slice(0, 8).join(", ")})` : ""}`);
-  await appendDirectoryLogInfo("Overlay generado detalle", overlayPath);
-  await appendFileLogInfo("Overlay state detalle", statePath);
-  console.log('[DEBUG] overlay files:', overlayFiles);
-  if (overlayFiles.length === 0) {
-    await appendOverlayLog(`mkoverlay no genero archivos en ${overlayPath}`);
-    throw new Error(`mkoverlay no genero archivos en ${overlayPath}`);
-  }
-
-  if (runningOverlayProcess) {
-    await appendOverlayLog(`Deteniendo patcher anterior antes de iniciar uno nuevo. PID=${runningOverlayProcess.pid}`);
-    runningOverlayProcess.stdin?.write("\n");
-    runningOverlayProcess.kill();
-    runningOverlayProcess = null;
-  }
-  currentOverlayError = "";
-
-  const bundledDll = ensuredDllPath;
   try {
-    await fs.access(bundledDll);
-  } catch {
-    await appendOverlayLog(`ERROR DLL de Rift Atlas no encontrada: ${bundledDll}`);
-    throw new Error(`cslol-dll.dll no encontrada en ${bundledDll}. Pegalo manualmente en la carpeta engine.`);
-  }
-  await appendFileLogInfo("DLL usada por patcher", bundledDll);
+    await appendOverlayLog("============================================================");
+    await appendOverlayLog(`INICIO OVERLAY runId=${Date.now()} appUserData=${app.getPath("userData")}`);
+    await appendOverlayLog(`Payload: skins=${skinEntries.length} sidecar=${sidecarPath} dllConfigurada=${dllPath || "no configurada"} game=${gamePath}`);
 
-  const runoverlayArgs = [
-    "patcher",
-    "--dll",
-    bundledDll,
-    "--overlay-root",
-    path.normalize(overlayPath),
-    "--flags",
-    "0"
-  ];
-
-  await appendOverlayLog(`Iniciando patcher con overlay: ${overlayPath}`);
-  await appendOverlayLog(`patcher args: ${runoverlayArgs.join(" ")}`);
-  runningOverlayProcess = spawn(sidecarPath, runoverlayArgs, {
-    cwd: toolsDir,
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true
-  });
-
-  currentProfilePath = overlayPath;
-  let patcherExited = false;
-  const handlePatcherOutput = (label, data) => {
-    const text = String(data).trim();
-    console.log(`[${label}]: ${String(data)}`);
-    if (text) appendOverlayLog(`[${label}] ${text}`);
-    if (/end of life reached|EOL_TIMESTAMP|timestamp\s*>\s*EOL/i.test(text)) {
-      const sourceText = dllSourceMetadata?.sourceLabel
-        ? ` Fuente usada: ${dllSourceMetadata.sourceLabel} ${dllSourceMetadata.version || ""}.`
-        : "";
-      currentOverlayError = `La DLL del engine esta vencida (End of life reached).${sourceText} Reemplaza cslol-dll.dll manualmente en la carpeta engine.`;
-      appendOverlayLog(`ERROR DLL vencida detectada: ${currentOverlayError}`);
-      runningOverlayProcess?.stdin?.write("\n");
-      runningOverlayProcess?.kill();
+    if (!gamePath.toLowerCase().endsWith("league of legends.exe")) {
+      await appendOverlayLog(`ERROR configuracion League invalida: ${gamePath}`);
+      throw new Error("League of Legends.exe no configurado.");
     }
-  };
-  runningOverlayProcess.stdout?.on("data", (d) => handlePatcherOutput("PATCHER STDOUT", d));
-  runningOverlayProcess.stderr?.on("data", (d) => handlePatcherOutput("PATCHER STDERR", d));
-  runningOverlayProcess.on("exit", (code) => {
-    patcherExited = true;
-    runningOverlayProcess = null;
-    currentProfilePath = "";
-    console.log(`[DEBUG] Patcher exit code: ${code}`);
-    appendOverlayLog(`[DEBUG] Patcher exit code: ${code}`);
-  });
-  runningOverlayProcess.on("error", (err) => {
-    patcherExited = true;
-    runningOverlayProcess = null;
-    currentProfilePath = "";
-    console.log(`[DEBUG] Patcher error: ${err.message}`);
-    appendOverlayLog(`[DEBUG] Patcher error: ${err.message}`);
-  });
+    if (!skinEntries.length) {
+      await appendOverlayLog("ERROR no hay skins seleccionadas.");
+      throw new Error("No hay skins seleccionadas.");
+    }
+    throwIfOverlayRunCanceled(runToken);
 
-  await sleepMs(2000);
+    const ensuredDllPath = await ensureCslolDll(sidecarPath, dllPath);
+    throwIfOverlayRunCanceled(runToken);
+    const dllSourceMetadata = await readDllSourceMetadata();
+    await appendOverlayLog(`Engine: ${sidecarPath}`);
+    await appendOverlayLog(`DLL: ${ensuredDllPath}`);
+    if (dllSourceMetadata) {
+      await appendOverlayLog(`Fuente DLL: ${dllSourceMetadata.sourceLabel || "desconocida"} ${dllSourceMetadata.version || ""} asset=${dllSourceMetadata.assetName || ""} descargada=${dllSourceMetadata.downloadedAt || ""}`);
+    } else {
+      await appendOverlayLog("Fuente DLL: sin metadata guardada.");
+    }
+    await appendOverlayLog(`League: ${gamePath}`);
+    await appendFileLogInfo("Engine detalle", sidecarPath);
+    await appendFileLogInfo("DLL detalle", ensuredDllPath);
+    await appendFileLogInfo("League exe detalle", gamePath);
 
-  if (patcherExited || !runningOverlayProcess) {
-    await appendOverlayLog("El patcher fallo al iniciar (salio antes de tiempo).");
-    throw new Error("El patcher fallo al iniciar (salio antes de tiempo).");
+    for (const [index, entry] of skinEntries.entries()) {
+      throwIfOverlayRunCanceled(runToken);
+      const sp = entry?.path;
+      await appendOverlayLog(`Skin entrada #${index + 1}: champion=${entry?.champion || ""} skin=${entry?.skin || entry?.name || ""} variant=${entry?.variant || ""} path=${sp}`);
+      await appendFileLogInfo(`Skin entrada #${index + 1} archivo`, sp);
+      try { await fs.access(sp); } catch {
+        await appendOverlayLog(`ERROR archivo seleccionado no encontrado: ${sp}`);
+        throw new Error(`Archivo no encontrado: ${sp}`);
+      }
+    }
+
+    const skinPaths = [];
+    for (const [index, entry] of skinEntries.entries()) {
+      throwIfOverlayRunCanceled(runToken);
+      await appendOverlayLog(`Procesando skin #${index + 1}/${skinEntries.length}`);
+      const modPath = await generateFantomeFromLeagueWad({ sidecarPath, gamePath, skin: entry });
+      await appendFileLogInfo(`Mod final #${index + 1}`, modPath);
+      skinPaths.push(modPath);
+    }
+    await appendOverlayLog(`Mods finales para mkoverlay: ${skinPaths.join(" | ")}`);
+    throwIfOverlayRunCanceled(runToken);
+
+    const gameFolder = path.dirname(gamePath);
+    const toolsDir = path.dirname(sidecarPath);
+    const profilesDir = path.join(app.getPath("userData"), "cslol-profiles");
+    const overlayCacheDir = path.join(app.getPath("userData"), "cslol-overlay-cache");
+    const overlayStateDir = path.join(profilesDir, ".mkoverlay-state");
+    const overlayCacheKey = await getOverlayCacheKey({ gamePath, skinPaths });
+    const overlayPath = path.join(overlayCacheDir, overlayCacheKey);
+    const statePath = overlayStateDir;
+    await appendOverlayLog(`Rutas overlay: gameFolder=${gameFolder} toolsDir=${toolsDir} profilesDir=${profilesDir} overlayCache=${overlayPath} statePath=${statePath} cacheKey=${overlayCacheKey}`);
+
+    await fs.mkdir(profilesDir, { recursive: true });
+    await fs.mkdir(overlayCacheDir, { recursive: true });
+    const oldProfiles = await fs.readdir(profilesDir, { withFileTypes: true }).catch(() => []);
+    await Promise.all(oldProfiles
+      .filter((entry) => entry.name !== ".mkoverlay-state")
+      .map((entry) => fs.rm(path.join(profilesDir, entry.name), { recursive: true, force: true }).catch(() => { })));
+    await fs.mkdir(profilesDir, { recursive: true });
+    await fs.mkdir(overlayStateDir, { recursive: true });
+    await appendOverlayLog("Directorio de perfiles limpiado para nueva ejecucion; cache mkoverlay conservada.");
+
+    const overlayCacheHit = await isUsableOverlayPath(overlayPath);
+    if (overlayCacheHit) {
+      await appendOverlayLog(`Overlay cache HIT: ${overlayPath}. Se salta mkoverlay.`);
+      await appendDirectoryLogInfo("Overlay cache reutilizado", overlayPath);
+    } else {
+      await appendOverlayLog(`Overlay cache MISS: ${overlayPath}. Construyendo por partes con mkoverlay.`);
+      await fs.rm(overlayPath, { recursive: true, force: true }).catch(() => { });
+    }
+
+    const mkoverlayArgs = [
+      "mkoverlay",
+      "--game",
+      path.normalize(gameFolder),
+      "--overlay",
+      path.normalize(overlayPath),
+      "--state",
+      path.normalize(statePath)
+    ];
+    for (const skinPath of skinPaths) {
+      mkoverlayArgs.push("--mod", path.normalize(skinPath));
+    }
+
+    if (!overlayCacheHit) {
+      await appendOverlayLog(`Ejecutando mkoverlay en: ${overlayPath}`);
+      await appendOverlayLog(`mkoverlay args: ${mkoverlayArgs.join(" ")}`);
+      const mkoverlayInputBytes = await getFilesTotalSize(skinPaths);
+      const mkoverlayTimeoutMs = getMkoverlayTimeoutMs(mkoverlayInputBytes);
+      await appendOverlayLog(`mkoverlay timeout: ${Math.round(mkoverlayTimeoutMs / 1000)}s para ${formatLogBytes(mkoverlayInputBytes)} de mods.`);
+      let mkoverlayStdout = "";
+      try {
+        mkoverlayStdout = await execToolWithTimeout(sidecarPath, mkoverlayArgs, mkoverlayTimeoutMs, { cwd: toolsDir, runToken });
+      } catch (error) {
+        await appendOverlayLog(`mkoverlay fallo: ${error.message}`);
+        throw new Error(`mkoverlay fallo: ${error.message}`);
+      }
+      throwIfOverlayRunCanceled(runToken);
+      await appendOverlayLog(`mkoverlay OK${mkoverlayStdout ? `: ${mkoverlayStdout.slice(0, 500)}` : ""}`);
+    }
+
+    // Verificar que el overlay tenga archivos
+    const overlayFiles = await fs.readdir(overlayPath).catch(() => []);
+    await appendOverlayLog(`Archivos generados por overlay: ${overlayFiles.length}${overlayFiles.length ? ` (${overlayFiles.slice(0, 8).join(", ")})` : ""}`);
+    await appendDirectoryLogInfo("Overlay generado detalle", overlayPath);
+    await appendFileLogInfo("Overlay state detalle", statePath);
+    if (overlayFiles.length === 0) {
+      await appendOverlayLog(`mkoverlay no genero archivos en ${overlayPath}`);
+      throw new Error(`mkoverlay no genero archivos en ${overlayPath}`);
+    }
+
+    if (runningOverlayProcess) {
+      await appendOverlayLog(`Deteniendo patcher anterior antes de iniciar uno nuevo. PID=${runningOverlayProcess.pid}`);
+      runningOverlayProcess.stdin?.write("\n");
+      runningOverlayProcess.kill();
+      runningOverlayProcess = null;
+    }
+    throwIfOverlayRunCanceled(runToken);
+    currentOverlayError = "";
+
+    const bundledDll = ensuredDllPath;
+    try {
+      await fs.access(bundledDll);
+    } catch {
+      await appendOverlayLog(`ERROR DLL de Rift Atlas no encontrada: ${bundledDll}`);
+      throw new Error(`cslol-dll.dll no encontrada en ${bundledDll}. Pegalo manualmente en la carpeta engine.`);
+    }
+    await appendFileLogInfo("DLL usada por patcher", bundledDll);
+
+    const runoverlayArgs = [
+      "patcher",
+      "--dll",
+      bundledDll,
+      "--overlay-root",
+      path.normalize(overlayPath),
+      "--flags",
+      "0"
+    ];
+
+    await appendOverlayLog(`Iniciando patcher con overlay: ${overlayPath}`);
+    await appendOverlayLog(`patcher args: ${runoverlayArgs.join(" ")}`);
+    runningOverlayProcess = spawn(sidecarPath, runoverlayArgs, {
+      cwd: toolsDir,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+    runToken.processes.add(runningOverlayProcess);
+
+    currentProfilePath = overlayPath;
+    let patcherExited = false;
+    const handlePatcherOutput = (label, data) => {
+      const text = String(data).trim();
+      console.log(`[${label}]: ${String(data)}`);
+      if (text) appendOverlayLog(`[${label}] ${text}`);
+      if (/end of life reached|EOL_TIMESTAMP|timestamp\s*>\s*EOL/i.test(text)) {
+        const sourceText = dllSourceMetadata?.sourceLabel
+          ? ` Fuente usada: ${dllSourceMetadata.sourceLabel} ${dllSourceMetadata.version || ""}.`
+          : "";
+        currentOverlayError = `La DLL del engine esta vencida (End of life reached).${sourceText} Reemplaza cslol-dll.dll manualmente en la carpeta engine.`;
+        appendOverlayLog(`ERROR DLL vencida detectada: ${currentOverlayError}`);
+        runningOverlayProcess?.stdin?.write("\n");
+        runningOverlayProcess?.kill();
+      }
+    };
+    runningOverlayProcess.stdout?.on("data", (d) => handlePatcherOutput("PATCHER STDOUT", d));
+    runningOverlayProcess.stderr?.on("data", (d) => handlePatcherOutput("PATCHER STDERR", d));
+    runningOverlayProcess.on("exit", (code) => {
+      patcherExited = true;
+      runToken.processes.delete(runningOverlayProcess);
+      runningOverlayProcess = null;
+      currentProfilePath = "";
+      appendOverlayLog(`Patcher exit code: ${code}`);
+    });
+    runningOverlayProcess.on("error", (err) => {
+      patcherExited = true;
+      runToken.processes.delete(runningOverlayProcess);
+      runningOverlayProcess = null;
+      currentProfilePath = "";
+      appendOverlayLog(`Patcher error: ${err.message}`);
+    });
+
+    await sleepMs(2000);
+    throwIfOverlayRunCanceled(runToken);
+
+    if (patcherExited || !runningOverlayProcess) {
+      await appendOverlayLog("El patcher fallo al iniciar (salio antes de tiempo).");
+      throw new Error("El patcher fallo al iniciar (salio antes de tiempo).");
+    }
+
+    await appendOverlayLog(`Patcher activo. PID: ${runningOverlayProcess.pid}`);
+    await appendOverlayLog("FIN INICIO OVERLAY: patcher sigue corriendo; entra a partida para validar skins.");
+    return { success: true, pid: runningOverlayProcess.pid, profilePath: overlayPath, enginePath: sidecarPath };
+  } finally {
+    if (activeOverlayRun === runToken) {
+      activeOverlayRun = null;
+    }
   }
-
-  await appendOverlayLog(`Patcher activo. PID: ${runningOverlayProcess.pid}`);
-  await appendOverlayLog("FIN INICIO OVERLAY: patcher sigue corriendo; entra a partida para validar skins.");
-  return { success: true, pid: runningOverlayProcess.pid, profilePath: overlayPath, enginePath: sidecarPath };
 });
 
 ipcMain.handle("ltk:download-and-install", async () => {
@@ -2840,20 +4099,45 @@ let runningOverlayProcess = null;
 let currentProfilePath = "";
 let currentOverlayLog = "";
 let currentOverlayError = "";
+let activeOverlayRun = null;
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const createOverlayRunToken = () => ({
+  canceled: false,
+  processes: new Set()
+});
+
+const cancelOverlayRun = async (reason = "Cancelado por el usuario.") => {
+  if (!activeOverlayRun) return false;
+  activeOverlayRun.canceled = true;
+  activeOverlayRun.reason = reason;
+  for (const proc of activeOverlayRun.processes) {
+    proc.stdin?.write("\n");
+    proc.kill();
+  }
+  activeOverlayRun.processes.clear();
+  await appendOverlayLog(`Cancelacion solicitada: ${reason}`);
+  return true;
+};
+
+const throwIfOverlayRunCanceled = (token = activeOverlayRun) => {
+  if (token?.canceled) {
+    throw new Error(token.reason || "Ejecucion cancelada por el usuario.");
+  }
+};
 
 const appendOverlayLog = async (line) => {
   const text = String(line || "").trim();
   if (!text) return;
   currentOverlayLog = `${currentOverlayLog}${text}\n`.slice(-30000);
-  await fs.appendFile(path.join(app.getPath("userData"), "last-overlay-log.txt"), `${new Date().toISOString()} ${text}\n`).catch(() => {});
+  await fs.appendFile(path.join(app.getPath("userData"), "last-overlay-log.txt"), `${new Date().toISOString()} ${text}\n`).catch(() => { });
 };
 
 const testCslolDllLoad = async ({ enginePath, dllPath }) => {
   const tempRoot = path.join(app.getPath("temp"), "rift-atlas-dll-check");
   const overlayRoot = path.join(tempRoot, "overlay");
-  await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => { });
   await fs.mkdir(path.join(overlayRoot, "DATA"), { recursive: true });
 
   return new Promise((resolve) => {
@@ -2865,7 +4149,7 @@ const testCslolDllLoad = async ({ enginePath, dllPath }) => {
       clearTimeout(timeout);
       child?.stdin?.write("\n");
       child?.kill();
-      await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => { });
       resolve(result);
     };
 
@@ -2926,6 +4210,7 @@ const testCslolDllLoad = async ({ enginePath, dllPath }) => {
 };
 
 ipcMain.handle("mods:stop-overlay", async () => {
+  const canceledRun = await cancelOverlayRun("Detenido manualmente desde la UI.");
   if (runningOverlayProcess) {
     await appendOverlayLog(`STOP solicitado desde UI. PID=${runningOverlayProcess.pid} profile=${currentProfilePath}`);
     runningOverlayProcess.stdin?.write("\n");
@@ -2934,6 +4219,12 @@ ipcMain.handle("mods:stop-overlay", async () => {
     currentProfilePath = "";
     currentOverlayError = "";
     await appendOverlayLog("STOP completado: proceso marcado como detenido.");
+    return { stopped: true };
+  }
+  if (canceledRun) {
+    currentProfilePath = "";
+    currentOverlayError = "";
+    await appendOverlayLog("STOP completado: ejecucion en preparacion cancelada.");
     return { stopped: true };
   }
   await appendOverlayLog("STOP solicitado desde UI, pero no habia patcher activo.");
@@ -3099,7 +4390,7 @@ ipcMain.handle("party:write-file", async (_event, payload = {}) => {
   await fs.writeFile(outputPath, Buffer.concat(buffers));
   const actualHash = await hashFileSha256(outputPath);
   if (expectedHash && actualHash !== expectedHash) {
-    await fs.rm(outputPath, { force: true }).catch(() => {});
+    await fs.rm(outputPath, { force: true }).catch(() => { });
     throw new Error("Hash mismatch al recibir archivo P2P.");
   }
   const stat = await fs.stat(outputPath);
@@ -3119,25 +4410,49 @@ ipcMain.handle("party:write-file", async (_event, payload = {}) => {
   };
 });
 
+ipcMain.handle("party:delete-file", async (_event, filePath) => {
+  const target = path.resolve(String(filePath || ""));
+  const p2pDir = path.resolve(path.join(app.getPath("userData"), "p2p"));
+  const oldP2pDir = path.resolve(path.join(app.getPath("userData"), "party-transfers"));
+  if (!target.startsWith(`${p2pDir}${path.sep}`) && !target.startsWith(`${oldP2pDir}${path.sep}`)) {
+    throw new Error("Solo se pueden borrar archivos P2P recibidos por Rift Atlas.");
+  }
+  await fs.rm(target, { force: true }).catch(() => { });
+  return true;
+});
+
 ipcMain.handle("party:clear-p2p-files", async () => {
   const outputDir = path.join(app.getPath("userData"), "p2p");
   const oldOutputDir = path.join(app.getPath("userData"), "party-transfers");
-  await fs.rm(outputDir, { recursive: true, force: true }).catch(() => {});
-  await fs.rm(oldOutputDir, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(outputDir, { recursive: true, force: true }).catch(() => { });
+  await fs.rm(oldOutputDir, { recursive: true, force: true }).catch(() => { });
   await fs.mkdir(outputDir, { recursive: true });
   return { folderPath: outputDir };
 });
 
 const execToolWithTimeout = (command, args, timeout, options = {}) => {
   return new Promise((resolve, reject) => {
-    const { input, ...spawnOptions } = options;
+    const { input, runToken, ...spawnOptions } = options;
+    if (runToken?.canceled) {
+      reject(new Error(runToken.reason || "Ejecucion cancelada por el usuario."));
+      return;
+    }
     const proc = spawn(command, args, { windowsHide: true, ...spawnOptions });
+    runToken?.processes?.add(proc);
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finish = (callback) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      runToken?.processes?.delete(proc);
+      callback();
+    };
     const timer = setTimeout(() => {
       proc.kill();
       const detail = [stderr, stdout].filter(Boolean).join("\n").slice(-1000);
-      reject(new Error(`Process timed out after ${Math.round(timeout / 1000)}s${detail ? `: ${detail}` : ""}`));
+      finish(() => reject(new Error(`Process timed out after ${Math.round(timeout / 1000)}s${detail ? `: ${detail}` : ""}`)));
     }, timeout);
     proc.stdout?.on("data", (d) => { stdout += String(d); });
     proc.stderr?.on("data", (d) => { stderr += String(d); });
@@ -3146,11 +4461,19 @@ const execToolWithTimeout = (command, args, timeout, options = {}) => {
       proc.stdin?.end();
     }
     proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve(stdout);
-      else reject(new Error(stderr.slice(0, 500) || `exit code ${code}`));
+      finish(() => {
+        if (runToken?.canceled) {
+          reject(new Error(runToken.reason || "Ejecucion cancelada por el usuario."));
+        } else if (code === 0) {
+          resolve(stdout);
+        } else {
+          reject(new Error(stderr.slice(0, 500) || `exit code ${code}`));
+        }
+      });
     });
-    proc.on("error", (err) => { clearTimeout(timer); reject(err); });
+    proc.on("error", (err) => {
+      finish(() => reject(runToken?.canceled ? new Error(runToken.reason || "Ejecucion cancelada por el usuario.") : err));
+    });
   });
 };
 
@@ -3299,11 +4622,131 @@ const createWindow = () => {
   mainWindow.setIcon(appIcon);
   mainWindow.setMenuBarVisibility(false);
   mainWindow.loadFile(path.join(__dirname, "src", "index.html"));
+  mainWindow.webContents.once("did-finish-load", () => {
+    const flags = {
+      ...startupFlags,
+      firstRun: isFirstRun()
+    };
+    if (flags.showTutorial || flags.firstRun) {
+      setTimeout(() => {
+        if (mainWindow.isDestroyed()) return;
+        mainWindow.webContents.send("app:start-tutorial", flags);
+      }, 1200);
+    }
+  });
   mainWindow.once("ready-to-show", () => mainWindow.maximize());
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: "deny" };
+  });
+};
+
+const sendPenguBridgeToWindows = (channel, payload = {}) => {
+  BrowserWindow.getAllWindows().forEach((window) => {
+    if (!window.isDestroyed()) {
+      window.webContents.send(channel, payload);
+    }
+  });
+};
+
+const sendPenguBridgeMessage = (payload = {}) => {
+  const outbound = {
+    source: "rift-atlas-app",
+    at: new Date().toISOString(),
+    ...payload
+  };
+  if (outbound.type === "skin-catalog" || outbound.type === "skin-apply-result") {
+    const compact = {
+      ...outbound,
+      skins: Array.isArray(outbound.skins) ? `count=${outbound.skins.length}` : outbound.skins,
+      queued: Array.isArray(outbound.queued) ? outbound.queued.slice(0, 8) : outbound.queued
+    };
+    appendOverlayLog(`[Pengu App] ${JSON.stringify(compact).slice(0, 1200)}`).catch(() => { });
+  }
+  const message = JSON.stringify(outbound);
+  let sent = 0;
+  penguBridgeClients.forEach((socket) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(message);
+      sent += 1;
+    }
+  });
+  return sent;
+};
+
+const startPenguBridgeServer = () => {
+  if (penguBridgeServer) return;
+  penguBridgeServer = new WebSocketServer({
+    host: "127.0.0.1",
+    port: 45731,
+    maxPayload: 1024 * 1024
+  });
+
+  penguBridgeServer.on("connection", (socket, request) => {
+    penguBridgeClients.add(socket);
+    sendPenguBridgeToWindows("pengu:bridge-status", {
+      connected: true,
+      clients: penguBridgeClients.size,
+      remote: request.socket.remoteAddress || "local"
+    });
+
+    socket.on("message", (rawMessage) => {
+      const text = rawMessage.toString("utf8");
+      console.log("[BRIDGE RAW]", text.slice(0, 500));
+      try {
+        const message = JSON.parse(text);
+        sendPenguBridgeToWindows("pengu:message", {
+          ...message,
+          receivedAt: Date.now()
+        });
+        if (message?.type === "carousel-status") {
+          appendOverlayLog(`[Pengu Carousel] ${JSON.stringify(message).slice(0, 1200)}`).catch(() => { });
+        }
+        if (
+          message?.type === "skin-sync" ||
+          message?.type === "skin-apply" ||
+          message?.type === "skin-apply-result"
+        ) {
+          console.log("[PENGU]", message);
+
+          appendOverlayLog(
+            `[Pengu Skin] ${JSON.stringify(message, null, 2)}`
+          ).catch(() => { });
+        }
+        if (message?.type === "lobby-state") {
+          sendPenguBridgeToWindows("pengu:lobby-state", {
+            ...message,
+            receivedAt: Date.now()
+          });
+        }
+        if (message?.type === "request-chroma-data") {
+          handleChromaDataRequest(message, socket);
+        }
+      } catch (error) {
+        console.warn("[Pengu bridge] invalid message", error.message);
+      }
+    });
+
+    socket.on("close", () => {
+      penguBridgeClients.delete(socket);
+      sendPenguBridgeToWindows("pengu:bridge-status", {
+        connected: penguBridgeClients.size > 0,
+        clients: penguBridgeClients.size
+      });
+    });
+
+    socket.on("error", (error) => {
+      console.warn("[Pengu bridge] socket error", error.message);
+    });
+  });
+
+  penguBridgeServer.on("error", (error) => {
+    console.warn("[Pengu bridge] server error", error.message);
+    sendPenguBridgeToWindows("pengu:bridge-status", {
+      connected: false,
+      error: error.message
+    });
   });
 };
 
@@ -3320,15 +4763,19 @@ const resetOverlayLogForSession = async () => {
   ].join("\n");
 
   await fs.mkdir(path.dirname(logPath), { recursive: true });
-  await fs.rm(previousLogPath, { force: true }).catch(() => {});
-  await fs.rename(logPath, previousLogPath).catch(() => {});
+  await fs.rm(previousLogPath, { force: true }).catch(() => { });
+  await fs.rename(logPath, previousLogPath).catch(() => { });
   currentOverlayLog = header;
-  await fs.writeFile(logPath, header).catch(() => {});
+  await fs.writeFile(logPath, header).catch(() => { });
 };
 
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
+  await cleanupUpdateInstallers();
   await resetOverlayLogForSession();
+  startPenguBridgeServer();
+  await appendOverlayLog("[Pengu Loader] Inicio estilo Rose: no se abre Riot Client. Se espera LCU/lockfile para activar Pengu.").catch(() => { });
+  startPenguAutoActivationWatcher();
   createWindow();
 
   app.on("activate", () => {
@@ -3342,4 +4789,21 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", () => {
+  if (penguAutoActivationTimer) {
+    clearInterval(penguAutoActivationTimer);
+    penguAutoActivationTimer = null;
+  }
+  penguBridgeClients.forEach((socket) => socket.close());
+  penguBridgeClients.clear();
+  if (penguBridgeServer) {
+    penguBridgeServer.close();
+    penguBridgeServer = null;
+  }
+  if (!runningOverlayProcess) return;
+  runningOverlayProcess.stdin?.write("\n");
+  runningOverlayProcess.kill();
+  runningOverlayProcess = null;
 });

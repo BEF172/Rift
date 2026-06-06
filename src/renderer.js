@@ -30,7 +30,6 @@ const state = {
   importingSkinPath: "",
   importingQueue: false,
   activeDownloadType: "",
-  dllDownloadSource: "bundled",
   availableUpdate: null,
   overlayRunning: false,
   overlayProfilePath: "",
@@ -40,6 +39,11 @@ const state = {
   partyStatus: "disconnected",
   selectedPartyFile: null,
   partyAutoApply: localStorage.getItem("riftAtlas:partyAutoApply") === "1",
+  penguBridgeConnected: false,
+  penguLobby: null,
+  penguGameflowPhase: "",
+  penguAutoParty: localStorage.getItem("riftAtlas:penguAutoParty") !== "0",
+  penguAutoPartyRoom: "",
   favorites: new Set(JSON.parse(localStorage.getItem("riftAtlas:favorites") || "[]")),
   ltkOverlaySidecarPath: localStorage.getItem("riftAtlas:ltkOverlaySidecarPath") || "",
   ltkOverlayDllPath: localStorage.getItem("riftAtlas:ltkOverlayDllPath") || ""
@@ -98,6 +102,10 @@ const els = {
   runDiagnosticsButton: document.querySelector("#runDiagnosticsButton"),
   diagnosticSummary: document.querySelector("#diagnosticSummary"),
   diagnosticsList: document.querySelector("#diagnosticsList"),
+  checkLeagueInstallButton: document.querySelector("#checkLeagueInstallButton"),
+  leagueCheckSummary: document.querySelector("#leagueCheckSummary"),
+  leagueCheckDetails: document.querySelector("#leagueCheckDetails"),
+  leagueCheckList: document.querySelector("#leagueCheckList"),
   updatePanel: document.querySelector("#updatePanel"),
   updateStatusLabel: document.querySelector("#updateStatusLabel"),
   updateDetailsLabel: document.querySelector("#updateDetailsLabel"),
@@ -110,6 +118,7 @@ const els = {
   ltkOverlayDllLabel: document.querySelector("#ltkOverlayDllLabel"),
   appDataPathLabel: document.querySelector("#appDataPathLabel"),
   openAppDataFolderButton: document.querySelector("#openAppDataFolderButton"),
+  factoryResetButton: document.querySelector("#factoryResetButton"),
   selectLtkOverlaySidecarButton: document.querySelector("#selectLtkOverlaySidecarButton"),
   selectLtkOverlayDllButton: document.querySelector("#selectLtkOverlayDllButton"),
   ltkPathLabel: document.querySelector("#ltkPathLabel"),
@@ -123,6 +132,9 @@ const els = {
   skinsOverlayStatusLabel: document.querySelector("#skinsOverlayStatusLabel"),
   skinsOverlayStatusMessage: document.querySelector("#skinsOverlayStatusMessage"),
   stopOverlayButton: document.querySelector("#stopOverlayButton"),
+  overlayLaunchPenguButton: document.querySelector("#overlayLaunchPenguButton"),
+  overlayDeactivatePenguButton: document.querySelector("#overlayDeactivatePenguButton"),
+  overlayPenguStatusLabel: document.querySelector("#overlayPenguStatusLabel"),
   partyStatusPill: document.querySelector("#partyStatusPill"),
   partyNameInput: document.querySelector("#partyNameInput"),
   partyLinkInput: document.querySelector("#partyLinkInput"),
@@ -135,6 +147,9 @@ const els = {
   partyReadyDetails: document.querySelector("#partyReadyDetails"),
   partyTransferList: document.querySelector("#partyTransferList"),
   partyAutoApplyCheckbox: document.querySelector("#partyAutoApplyCheckbox"),
+  penguBridgeLabel: document.querySelector("#penguBridgeLabel"),
+  penguLobbyLabel: document.querySelector("#penguLobbyLabel"),
+  penguAutoPartyCheckbox: document.querySelector("#penguAutoPartyCheckbox"),
   applyPartyButton: document.querySelector("#applyPartyButton"),
   partyShareLinkLabel: document.querySelector("#partyShareLinkLabel"),
   copyPartyLinkButton: document.querySelector("#copyPartyLinkButton"),
@@ -153,15 +168,17 @@ const els = {
   downloadLeagueSkinsButton: document.querySelector("#downloadLeagueSkinsButton"),
   downloadEngineButton: document.querySelector("#downloadEngineButton"),
   downloadLeagueSkinsButtonDownload: document.querySelector("#downloadLeagueSkinsButtonDownload"),
-  dllSourceSelect: document.querySelector("#dllSourceSelect"),
-  settingsDllSourceSelect: document.querySelector("#settingsDllSourceSelect"),
+  downloadPenguLoaderButton: document.querySelector("#downloadPenguLoaderButton"),
+  launchPenguLoaderButton: document.querySelector("#launchPenguLoaderButton"),
   openEngineFolderButton: document.querySelector("#openEngineFolderButton"),
   openDllFolderButton: document.querySelector("#openDllFolderButton"),
   openLeagueSkinsFolderButton: document.querySelector("#openLeagueSkinsFolderButton"),
+  openPenguLoaderFolderButton: document.querySelector("#openPenguLoaderFolderButton"),
   downloadProgressLabel: document.querySelector("#downloadProgressLabel"),
   downloadEnginePathLabel: document.querySelector("#downloadEnginePathLabel"),
   downloadLeaguePathLabel: document.querySelector("#downloadLeaguePathLabel"),
   downloadSkinLibraryLabel: document.querySelector("#downloadSkinLibraryLabel"),
+  downloadPenguLoaderLabel: document.querySelector("#downloadPenguLoaderLabel"),
   firstDllModal: document.querySelector("#firstDllModal"),
   firstDllPathLabel: document.querySelector("#firstDllPathLabel"),
   firstDllOpenFolderButton: document.querySelector("#firstDllOpenFolderButton"),
@@ -247,11 +264,15 @@ const cleanText = (value = "") =>
     .replace(/\s+/g, " ")
     .trim();
 
-const fetchJsonWithTimeout = async (url, timeoutMs = 20000) => {
+const fetchJsonWithTimeout = async (url, options = {}, timeoutMs = 20000) => {
+  if (typeof options === "number") {
+    timeoutMs = options;
+    options = {};
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, { signal: controller.signal });
+    const response = await fetch(url, { ...options, signal: controller.signal });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -290,6 +311,45 @@ const getChampionByDatasetName = (name) => {
   const normalizedName = normalizeChampionName(name);
   return state.champions.find((champion) => normalizeChampionName(champion.name) === normalizedName || normalizeChampionName(champion.id) === normalizedName);
 };
+
+const getChampionByTextHint = (...parts) => {
+  const rawText = parts.filter(Boolean).map((part) => String(part)).join(" ");
+  if (!rawText.trim()) return null;
+
+  const compactText = normalizeChampionName(rawText);
+  const tokens = new Set(
+    rawText
+      .toLowerCase()
+      .split(/[^a-z0-9]+/i)
+      .map(normalizeChampionName)
+      .filter(Boolean)
+  );
+
+  return state.champions
+    .slice()
+    .sort((left, right) => normalizeChampionName(right.name).length - normalizeChampionName(left.name).length)
+    .find((champion) => {
+      const aliases = [champion.name, champion.id].map(normalizeChampionName).filter(Boolean);
+      return aliases.some((alias) => {
+        if (alias.length <= 2) return tokens.has(alias);
+        return tokens.has(alias) || compactText.includes(alias);
+      });
+    }) || null;
+};
+
+const getSkinChampionFromHints = (skin = {}) =>
+  getChampionByNumericId(skin.rawChampion) ||
+  getChampionByDatasetName(skin.champion) ||
+  getChampionByTextHint(
+    skin.champion,
+    skin.rawChampion,
+    skin.name,
+    skin.skin,
+    skin.metaName,
+    skin.variant,
+    skin.relativePath,
+    skin.path
+  );
 
 const METASRC_SLUG_OVERRIDES = {
   MonkeyKing: "wukong"
@@ -379,7 +439,7 @@ const getChampionIconByKey = (championKey, fallbackName) => {
 
 const getSkinChampionId = (skin) => {
   if (skin.championKey && !/^\d+$/.test(String(skin.championKey))) return skin.championKey;
-  return getChampionByNumericId(skin.rawChampion)?.id || getChampionByDatasetName(skin.champion)?.id || "";
+  return getSkinChampionFromHints(skin)?.id || "";
 };
 
 const getSkinLoadingImage = (skin) => {
@@ -391,6 +451,16 @@ const getSkinLoadingImage = (skin) => {
   const skinNum = Number(artNum);
   if (!Number.isFinite(skinNum)) return "";
   return `${CDN}/cdn/img/champion/loading/${championId}_${skinNum}.jpg`;
+};
+
+const getSkinDefaultLoadingImage = (skin) => {
+  const championId = getSkinChampionId(skin);
+  return championId ? `${CDN}/cdn/img/champion/loading/${championId}_0.jpg` : "";
+};
+
+const getSkinDefaultSplashImage = (skin) => {
+  const championId = getSkinChampionId(skin);
+  return championId ? `${CDN}/cdn/img/champion/splash/${championId}_0.jpg` : "";
 };
 
 const getSkinBaseLoadingImage = (skin) => {
@@ -435,6 +505,10 @@ const saveManagedSkins = () => {
 };
 
 const saveQueuedSkins = () => {
+  const normalizedKeys = normalizeQueuedSkinKeys([...state.queuedSkins]);
+  if (normalizedKeys.length !== state.queuedSkins.size) {
+    state.queuedSkins = new Set(normalizedKeys);
+  }
   localStorage.setItem("riftAtlas:queuedSkins", JSON.stringify([...state.queuedSkins]));
   // Update only the queue counters and status, not the entire library
   if (els.queuedSkinsCount) els.queuedSkinsCount.textContent = `${state.queuedSkins.size} seleccionadas`;
@@ -458,7 +532,9 @@ const saveQueuedSkins = () => {
   renderPresets();
   renderCompactLauncher();
   renderSelectionTray();
+  if (state.partyStatus === "connected") renderParty();
   schedulePartySync();
+  sendPenguSkinCatalog("queue-updated");
 };
 
 const saveCustomMods = () => {
@@ -467,6 +543,7 @@ const saveCustomMods = () => {
   renderSelectionTray();
   renderPresets();
   renderCompactLauncher();
+  sendPenguSkinCatalog("custom-mods-updated");
 };
 
 const saveFavoriteSkins = () => {
@@ -514,6 +591,7 @@ const setSkinLibrary = (result) => {
   if (els.downloadSkinLibraryLabel) els.downloadSkinLibraryLabel.textContent = state.skinLibraryPath || "No configurado";
   renderSkinChampionOptions();
   renderSkinLibrary();
+  sendPenguSkinCatalog("library-updated");
 };
 
 const clearSkinSelection = () => {
@@ -521,6 +599,45 @@ const clearSkinSelection = () => {
   state.managedSkins.clear();
   localStorage.setItem("riftAtlas:managedSkins", JSON.stringify([]));
   saveQueuedSkins();
+};
+
+const GAMEFLOW_CLEAR_PHASES = new Set([
+  "EndOfGame",
+  "PreEndOfGame",
+  "WaitingForStats",
+  "None",
+  "Lobby",
+  "Matchmaking",
+  "ReadyCheck"
+]);
+
+const handlePenguPhaseChange = (payload = {}) => {
+  const phase = String(payload.phase || "").trim();
+  if (!phase) return;
+
+  const previousPhase = state.penguGameflowPhase || String(payload.previousPhase || "").trim();
+  state.penguGameflowPhase = phase;
+
+  if (previousPhase !== "InProgress" || !GAMEFLOW_CLEAR_PHASES.has(phase)) return;
+  if (state.queuedSkins.size === 0 && state.managedSkins.size === 0) return;
+
+  clearSkinSelection();
+  setOverlayPanelStatus({
+    label: state.overlayRunning ? "Overlay activo" : "Sin overlay",
+    message: "Partida finalizada: se limpio la seleccion.",
+    active: state.overlayRunning
+  });
+};
+
+const handlePenguCarouselStatus = (payload = {}) => {
+  if (!els.overlayPenguStatusLabel) return;
+  const stage = payload.stage || "carousel";
+  const injected = Number(payload.injected || 0);
+  const championId = Number(payload.championId || 0);
+  const catalogCount = Number(payload.catalogCount || 0);
+  const suffix = championId ? ` champ=${championId}` : "";
+  const injectedText = injected ? ` inyectadas=${injected}` : "";
+  els.overlayPenguStatusLabel.textContent = `Pengu Loader: carousel ${stage}${suffix}${injectedText} catalogo=${catalogCount}`;
 };
 
 const savePresets = () => {
@@ -545,10 +662,82 @@ const getSkinByKey = (key) =>
   state.skinLibrary.find((skin) => getSkinKey(skin) === key) ||
   state.customMods.find((mod) => getSkinKey(mod) === key);
 
+const getQueueChampionKey = (skin = {}) => {
+  const champion = String(skin.champion || skin.rawChampion || "").trim().toLowerCase();
+  if (!champion || champion === "mod propio" || champion === "party") return "";
+  return champion;
+};
+
+const removeQueuedSkinsForChampion = (championKey, exceptKey = "") => {
+  if (!championKey) return 0;
+  let removed = 0;
+  [...state.queuedSkins].forEach((queuedKey) => {
+    if (queuedKey === exceptKey) return;
+    const queuedSkin = getSkinByKey(queuedKey);
+    if (queuedSkin && getQueueChampionKey(queuedSkin) === championKey) {
+      state.queuedSkins.delete(queuedKey);
+      setTimeout(() => removeP2PFileIfUnused(queuedKey), 0);
+      removed += 1;
+    }
+  });
+  return removed;
+};
+
+const queueSkinKey = (key) => {
+  const skin = getSkinByKey(key);
+  if (!skin) return { queued: false, replaced: 0 };
+  const replaced = removeQueuedSkinsForChampion(getQueueChampionKey(skin), key);
+  state.queuedSkins.add(key);
+  return { queued: true, replaced };
+};
+
+const removeP2PFileIfUnused = async (key = "") => {
+  const mod = state.customMods.find((item) => item.source === "p2p" && getSkinKey(item) === key);
+  if (!mod?.path || state.queuedSkins.has(key)) return false;
+  partySyncedQueuedSkins.forEach((localKey, remoteKey) => {
+    if (localKey === key) partySyncedQueuedSkins.delete(remoteKey);
+  });
+  partyReceivedFiles.forEach((localKey, remoteKey) => {
+    if (localKey === key) partyReceivedFiles.delete(remoteKey);
+  });
+  state.customMods = state.customMods.filter((item) => getSkinKey(item) !== key);
+  await window.riftAtlas.deletePartyFile?.(mod.path).catch(() => null);
+  saveCustomMods();
+  return true;
+};
+
+const removeQueuedSkinKey = (key = "") => {
+  if (!key || !state.queuedSkins.delete(key)) return false;
+  removeP2PFileIfUnused(key);
+  return true;
+};
+
+const normalizeQueuedSkinKeys = (skinKeys = []) => {
+  const normalized = [];
+  const championIndexes = new Map();
+
+  skinKeys.forEach((key) => {
+    const skin = getSkinByKey(key);
+    if (!skin) {
+      normalized.push(key);
+      return;
+    }
+    const championKey = getQueueChampionKey(skin);
+    if (championKey && championIndexes.has(championKey)) {
+      normalized[championIndexes.get(championKey)] = key;
+      return;
+    }
+    if (championKey) championIndexes.set(championKey, normalized.length);
+    normalized.push(key);
+  });
+
+  return normalized;
+};
+
 const getActivePreset = () => state.presets.find((preset) => preset.id === state.activePresetId);
 
 const renderSelectedMiniCard = (skin) => {
-  const art = getSkinLoadingImage(skin);
+  const art = getSkinLoadingImage(skin) || getSkinBaseLoadingImage(skin) || getSkinDefaultLoadingImage(skin);
   const icon = art || getChampionIconByKey(skin.rawChampion, skin.champion);
   return `
     <button class="selected-mini-card" type="button" data-path="${escapeHtml(getSkinKey(skin))}">
@@ -575,6 +764,288 @@ const addCustomMods = (items = []) => {
   state.customMods = [...nextByPath.values()].sort((a, b) => String(a.name).localeCompare(String(b.name), "es"));
   saveCustomMods();
 };
+
+function buildPenguSkinCatalog() {
+  const customKeys = new Set(state.customMods.map(getSkinKey));
+  return [...state.customMods, ...state.skinLibrary]
+    .filter((skin) => getSkinKey(skin) && skin.path)
+    .map((skin) => {
+      const key = getSkinKey(skin);
+      const inferredChampion = getSkinChampionFromHints(skin);
+      return {
+        key,
+        path: skin.path,
+        name: getSkinDisplayName(skin),
+        champion: inferredChampion?.name || skin.champion || "Mod propio",
+        championId: getSkinCatalogChampionNumber(skin),
+        championKey: getSkinChampionId(skin),
+        rawChampion: skin.rawChampion,
+
+        skin: skin.skin || skin.name || "Skin",
+        rawSkin: skin.rawSkin,
+        rawVariant: skin.rawVariant,
+
+        skinNum: skin.skinNum,
+        imageSkinNum: skin.imageSkinNum,
+        baseImageSkinNum: skin.baseImageSkinNum,
+
+        variant: skin.variant || "",
+        metaName: skin.metaName || "",
+        numericSource: Boolean(skin.numericSource),
+        extension: skin.extension || "",
+
+        image: getSkinLoadingImage(skin) || getSkinDefaultSplashImage(skin) || getSkinBaseLoadingImage(skin),
+
+        custom: Boolean(skin.custom || customKeys.has(key)),
+        queued: state.queuedSkins.has(key)
+      };
+    });
+}
+
+function sendPenguSkinCatalog(reason = "catalog") {
+  if (!window.riftAtlas.sendPenguMessage) return;
+  window.riftAtlas.sendPenguMessage({
+    type: "skin-catalog",
+    reason,
+    skins: buildPenguSkinCatalog(),
+    queued: [...state.queuedSkins]
+  }).catch(() => null);
+}
+
+let penguBackgroundApplyKey = "";
+let penguBackgroundApplyAt = 0;
+let penguBackgroundApplyPromise = Promise.resolve();
+
+const applyPenguSelectedSkin = async (key = "") => {
+  if (!key) return false;
+  const now = Date.now();
+  if (key === penguBackgroundApplyKey && now - penguBackgroundApplyAt < 12000) {
+    return true;
+  }
+
+  penguBackgroundApplyKey = key;
+  penguBackgroundApplyAt = now;
+  penguBackgroundApplyPromise = penguBackgroundApplyPromise
+    .catch(() => null)
+    .then(async () => {
+      const skin = getSkinByKey(key);
+      if (!skin?.path) {
+        throw new Error("La skin seleccionada no tiene archivo local.");
+      }
+
+      if (state.overlayRunning) {
+        await window.riftAtlas.stopOverlay();
+        state.importingQueue = false;
+        state.overlayRunning = false;
+        setOverlayPanelStatus({
+          label: "Sin overlay",
+          message: "Overlay anterior detenido para aplicar la skin elegida."
+        });
+      }
+
+      await applyQueuedSkins([key]);
+      return true;
+    });
+
+  return penguBackgroundApplyPromise;
+};
+
+async function handlePenguSkinApply(payload = {}) {
+  const key = payload.key || payload.path;
+  const skin = getSkinByKey(key);
+  if (!skin) {
+    await window.riftAtlas.sendPenguMessage?.({
+      type: "skin-apply-result",
+      ok: false,
+      key,
+      message: "La skin ya no esta en la biblioteca de Rift Atlas."
+    }).catch(() => null);
+    return;
+  }
+
+  queueSkinKey(getSkinKey(skin));
+  saveQueuedSkins();
+  renderSkinLibrary();
+  renderSelectionTray();
+  sendPenguSkinCatalog("skin-selected-in-client");
+
+  let applied = false;
+  let applyMessage = "";
+  if (payload.apply !== false) {
+    try {
+      applied = await applyPenguSelectedSkin(getSkinKey(skin));
+      applyMessage = applied ? "Skin aplicada en background desde champ select." : "";
+    } catch (error) {
+      applyMessage = error.message || "No pude aplicar la skin en background.";
+    }
+  }
+
+  await window.riftAtlas.sendPenguMessage?.({
+    type: "skin-apply-result",
+    ok: !applyMessage || applied,
+    key: getSkinKey(skin),
+    name: getSkinDisplayName(skin),
+    queuedOnly: !applied,
+    applied,
+    message: applyMessage
+  }).catch(() => null);
+  sendPenguSkinCatalog("skin-applied");
+}
+
+let lastPenguSkinSyncKey = "";
+let lastPenguSkinSyncAt = 0;
+
+const normalizeSkinSyncText = (value = "") =>
+  String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const getSkinSyncTokens = (value = "") =>
+  normalizeSkinSyncText(value)
+    .split(/\s+/)
+    .filter((token) => token.length > 1);
+
+const tokenSimilarity = (left = "", right = "") => {
+  const leftTokens = new Set(getSkinSyncTokens(left));
+  const rightTokens = new Set(getSkinSyncTokens(right));
+  if (!leftTokens.size || !rightTokens.size) return 0;
+  let shared = 0;
+  leftTokens.forEach((token) => {
+    if (rightTokens.has(token)) shared += 1;
+  });
+  return (2 * shared) / (leftTokens.size + rightTokens.size);
+};
+
+const getSkinSyncChampionNumber = (skin = {}) => {
+  const raw = Number(skin.rawChampion);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  const champion = getSkinChampionFromHints(skin);
+  const key = Number(champion?.key);
+  return Number.isFinite(key) ? key : 0;
+};
+
+const getSkinCatalogChampionNumber = (skin = {}) => getSkinSyncChampionNumber(skin);
+
+const getSkinSyncIdCandidates = (skin = {}, championIdOverride = 0) => {
+  const championId = Number(championIdOverride || getSkinSyncChampionNumber(skin) || 0);
+  const values = [
+    skin.selectedSkinId,
+    skin.skinId,
+    skin.id,
+    skin.rawSkin,
+    skin.rawVariant,
+    skin.skinNum,
+    skin.imageSkinNum,
+    skin.baseImageSkinNum,
+    skin.metaName
+  ].map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0);
+
+  const ids = new Set();
+  values.forEach((value) => {
+    ids.add(value);
+    if (championId && value < 1000) {
+      ids.add((championId * 1000) + value);
+      ids.add((championId * 100) + value);
+    }
+  });
+  return ids;
+};
+
+const getSelectedSkinNumCandidates = (selectedSkinId = 0, championId = 0) => {
+  const skinIdText = String(Number(selectedSkinId) || "");
+  const championText = String(Number(championId) || "");
+  if (!skinIdText || !championText || !skinIdText.startsWith(championText)) return [];
+  const suffix = skinIdText.slice(championText.length);
+  if (!suffix) return [];
+  const num = Number(suffix);
+  return Number.isFinite(num) ? [num] : [];
+};
+
+const findSkinFromPenguSync = (payload = {}) => {
+  const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
+  const chromaId = Number(payload.chromaId || payload.selectedChromaId || 0);
+  const championId = Number(payload.championId || payload.champion?.id || 0);
+  const candidates = [...state.customMods, ...state.skinLibrary].filter((skin) => getSkinKey(skin) && skin.path);
+  const selectedIds = [...new Set([chromaId, selectedSkinId].filter((value) => Number.isFinite(value) && value > 0))];
+
+  if (selectedIds.length) {
+    const idMatches = candidates.filter((skin) => {
+      const skinChampionId = getSkinSyncChampionNumber(skin);
+      if (championId && skinChampionId && skinChampionId !== championId) return false;
+      const idCandidates = getSkinSyncIdCandidates(skin, championId || skinChampionId);
+      return selectedIds.some((selectedId) => {
+        if (idCandidates.has(selectedId)) return true;
+        return getSelectedSkinNumCandidates(selectedId, championId || skinChampionId)
+          .some((num) => idCandidates.has(num));
+      });
+    });
+    const byId = idMatches.find((skin) => !state.queuedSkins.has(getSkinKey(skin))) || idMatches[0];
+    if (byId) return byId;
+  }
+
+  const skinText = payload.skin || payload.originalName || "";
+  const normalizedSkinText = normalizeSkinSyncText(skinText);
+  if (!normalizedSkinText) return null;
+
+  let best = null;
+  let bestScore = 0;
+  candidates.forEach((skin) => {
+    const skinChampionId = getSkinSyncChampionNumber(skin);
+    if (championId && skinChampionId && skinChampionId !== championId) return;
+    const names = [
+      skin.skin,
+      skin.name,
+      getSkinDisplayName(skin),
+      skin.variant ? `${skin.skin} ${skin.variant}` : "",
+      skin.variant ? `${skin.name} ${skin.variant}` : ""
+    ];
+    const score = Math.max(...names.map((name) => {
+      const normalizedName = normalizeSkinSyncText(name);
+      if (!normalizedName) return 0;
+      if (normalizedName === normalizedSkinText) return 1;
+      if (normalizedName.includes(normalizedSkinText) || normalizedSkinText.includes(normalizedName)) return 0.92;
+      return tokenSimilarity(normalizedSkinText, normalizedName);
+    }));
+    const scoreWithQueueBias = score + (state.queuedSkins.has(getSkinKey(skin)) ? 0 : 0.08);
+    if (scoreWithQueueBias > bestScore) {
+      bestScore = scoreWithQueueBias;
+      best = skin;
+    }
+  });
+
+  return bestScore >= 0.9 ? best : null;
+};
+
+async function handlePenguSkinSync(payload = {}) {
+  const directKey = payload.key || payload.path;
+  if (directKey && getSkinByKey(directKey)) {
+    await handlePenguSkinApply({ ...payload, key: directKey });
+    return;
+  }
+
+  if (!payload.skin && !Number(payload.chromaId || payload.selectedChromaId || payload.selectedSkinId || payload.skinId || 0)) return;
+  const skin = findSkinFromPenguSync(payload);
+  if (!skin) {
+    await window.riftAtlas.sendPenguMessage?.({
+      type: "skin-apply-result",
+      ok: false,
+      stage: "match",
+      message: `No encontre en Rift Atlas la skin seleccionada: ${payload.skin || payload.chromaId || payload.selectedSkinId || "desconocida"}`
+    }).catch(() => null);
+    return;
+  }
+
+  const key = getSkinKey(skin);
+  const signature = `${key}:${payload.chromaId || ""}:${payload.selectedSkinId || ""}:${payload.skin || ""}`;
+  const now = Date.now();
+  if (signature === lastPenguSkinSyncKey && now - lastPenguSkinSyncAt < 30000) return;
+  lastPenguSkinSyncKey = signature;
+  lastPenguSkinSyncAt = now;
+  await handlePenguSkinApply({ ...payload, key });
+}
 
 const renderCustomMods = () => {
   if (!els.customModsList) return;
@@ -618,9 +1089,9 @@ const renderCustomMods = () => {
   els.customModsList.querySelectorAll(".custom-mod-queue").forEach((button) => {
     button.addEventListener("click", () => {
       if (state.queuedSkins.has(button.dataset.path)) {
-        state.queuedSkins.delete(button.dataset.path);
+        removeQueuedSkinKey(button.dataset.path);
       } else {
-        state.queuedSkins.add(button.dataset.path);
+        queueSkinKey(button.dataset.path);
       }
       saveQueuedSkins();
       renderCustomMods();
@@ -642,7 +1113,7 @@ const renderCustomMods = () => {
   els.customModsList.querySelectorAll(".custom-mod-remove").forEach((button) => {
     button.addEventListener("click", () => {
       state.customMods = state.customMods.filter((item) => getSkinKey(item) !== button.dataset.path);
-      state.queuedSkins.delete(button.dataset.path);
+      removeQueuedSkinKey(button.dataset.path);
       saveCustomMods();
       saveQueuedSkins();
     });
@@ -665,8 +1136,8 @@ const renderSkinProfile = () => {
   const key = getSkinKey(skin);
   const queued = state.queuedSkins.has(key);
   const favorite = state.favoriteSkins.has(key);
-  const art = getSkinLoadingImage(skin);
-  const fallbackArt = getSkinBaseLoadingImage(skin);
+  const art = getSkinLoadingImage(skin) || getSkinDefaultLoadingImage(skin);
+  const fallbackArt = getSkinBaseLoadingImage(skin) || getSkinDefaultLoadingImage(skin);
   els.skinProfilePanel.innerHTML = `
     <article class="skin-profile-card">
       <div class="skin-profile-art ${art ? "" : "missing-art"}">
@@ -701,8 +1172,8 @@ const renderSkinProfile = () => {
     image.remove();
   });
   els.skinProfilePanel.querySelector(".profile-queue")?.addEventListener("click", () => {
-    if (state.queuedSkins.has(key)) state.queuedSkins.delete(key);
-    else state.queuedSkins.add(key);
+    if (state.queuedSkins.has(key)) removeQueuedSkinKey(key);
+    else queueSkinKey(key);
     saveQueuedSkins();
   });
   els.skinProfilePanel.querySelector(".profile-favorite")?.addEventListener("click", () => {
@@ -725,15 +1196,25 @@ let partyPeer = null;
 let partyConnections = new Map();
 let partyIsHost = false;
 let partyTransferSeq = 0;
-const PARTY_CHUNK_SIZE = 64 * 1024;
+const PARTY_CHUNK_SIZE = 256 * 1024;
 const PARTY_CHUNK_ACK_TIMEOUT_MS = 15000;
+const PARTY_CHUNK_MAX_ATTEMPTS = 3;
+const PARTY_AUTO_REQUEST_DELAY_MS = 450;
 const partyIncomingTransfers = new Map();
+const partyTransferControls = new Map();
 const partyRequestedHashes = new Set();
 const partyChunkAckWaiters = new Map();
 const partyFileInfoCache = new Map();
 const partyTransferStatus = new Map();
+const partySyncedQueuedSkins = new Map();
+const partyReceivedFiles = new Map();
 let partyAutoApplyTriggered = false;
 let partySyncTimer = null;
+let penguAutoConnectInFlight = false;
+let penguAutoConnectTimer = null;
+let penguLastAutoConnectKey = "";
+
+const isPartyConnected = () => state.partyStatus === "connected";
 
 const getPartyDisplayName = () => els.partyNameInput?.value.trim() || localStorage.getItem("riftAtlas:partyName") || "Rift Atlas";
 
@@ -750,8 +1231,91 @@ const normalizePartyCode = (value = "") =>
     .replace(/[^a-z0-9_-]/gi, "")
     .toUpperCase();
 
-const getPartySkinFiles = () =>
-  [...state.queuedSkins]
+const hashPenguPartyRoom = (value = "") => {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36).toUpperCase().padStart(6, "0");
+};
+
+const getPenguLobbyMembers = (payload = state.penguLobby || {}) =>
+  (payload.members || [])
+    .map((member) => ({
+      puuid: String(member.puuid || member.id || "").trim(),
+      name: String(member.displayName || member.summonerName || member.gameName || "Jugador").trim(),
+      isLocal: Boolean(member.isLocal)
+    }))
+    .filter((member) => member.puuid);
+
+const getPenguPartyPlan = (payload = state.penguLobby || {}) => {
+  const members = getPenguLobbyMembers(payload);
+  if (members.length < 2) return null;
+  const sortedPuuids = [...new Set(members.map((member) => member.puuid))].sort();
+  const localPuuid = String(payload.localPuuid || members.find((member) => member.isLocal)?.puuid || "").trim();
+  if (!localPuuid || !sortedPuuids.includes(localPuuid)) return null;
+  const localMember = members.find((member) => member.puuid === localPuuid) || members.find((member) => member.isLocal);
+  return {
+    roomId: `PENGU-${hashPenguPartyRoom(sortedPuuids.join("|"))}`,
+    isHost: sortedPuuids[0] === localPuuid,
+    displayName: localMember?.name || getPartyDisplayName(),
+    members
+  };
+};
+
+const renderPenguBridgeStatus = () => {
+  if (els.penguBridgeLabel) {
+    els.penguBridgeLabel.textContent = state.penguBridgeConnected
+      ? "Pengu Loader conectado a Rift Atlas."
+      : "Pengu Loader: esperando plugin.";
+  }
+  if (els.penguLobbyLabel) {
+    const plan = getPenguPartyPlan();
+    if (!state.penguLobby) {
+      els.penguLobbyLabel.textContent = "Lobby de League no detectado.";
+    } else if (!plan) {
+      const count = getPenguLobbyMembers().length;
+      els.penguLobbyLabel.textContent = count
+        ? `Lobby detectado con ${count} miembro(s). Esperando party de 2 o mas.`
+        : "Lobby de League sin miembros sincronizables.";
+    } else {
+      els.penguLobbyLabel.textContent = `Lobby detectado: sala ${plan.roomId}, ${plan.members.length} miembro(s).`;
+    }
+  }
+  if (els.penguAutoPartyCheckbox) {
+    els.penguAutoPartyCheckbox.checked = state.penguAutoParty;
+  }
+};
+
+const schedulePenguAutoParty = (delay = 700) => {
+  clearTimeout(penguAutoConnectTimer);
+  penguAutoConnectTimer = setTimeout(() => {
+    penguAutoConnectTimer = null;
+    handlePenguAutoParty().catch((error) => {
+      if (els.penguLobbyLabel) els.penguLobbyLabel.textContent = `Pengu auto-party: ${error.message}`;
+    });
+  }, delay);
+};
+
+function getMissingRemotePartyFiles() {
+  if (state.partyStatus !== "connected" || !state.partyRoom || !partyPeer) return [];
+  const missingByKey = new Map();
+  getAllPartyMembers()
+    .filter((member) => member.id !== partyPeer.id)
+    .flatMap((member) => (member.activeSkins || []).map((file) => ({ ...file, ownerId: member.id, ownerName: member.name || "Jugador" })))
+    .forEach((file) => {
+      const key = getPartyTransferKey(file);
+      if (!key || getLocalPartyFile(file)) return;
+      missingByKey.set(key, file);
+    });
+  return [...missingByKey.values()];
+}
+
+const getPartySkinFiles = () => {
+  const syncedLocalKeys = new Set(partySyncedQueuedSkins.values());
+  return [...state.queuedSkins]
+    .filter((key) => !syncedLocalKeys.has(key))
     .map(getSkinByKey)
     .filter(Boolean)
     .map((skin) => ({
@@ -765,6 +1329,27 @@ const getPartySkinFiles = () =>
       extension: skin.extension || "",
       mtimeMs: skin.mtimeMs || 0
     }));
+};
+
+const getPartySharedKeys = () => {
+  const syncedLocalKeys = new Set(partySyncedQueuedSkins.values());
+  return [...state.queuedSkins].filter((key) => !syncedLocalKeys.has(key) && Boolean(getSkinByKey(key)));
+};
+
+const getPartyApplyKeys = () => {
+  const keys = new Set(getPartySharedKeys());
+  const activeRemoteKeys = getRemotePartyTransferKeys();
+  partyReceivedFiles.forEach((localKey, remoteKey) => {
+    if (activeRemoteKeys.has(remoteKey) && getSkinByKey(localKey)) keys.add(localKey);
+  });
+  getAllPartyFiles()
+    .filter((file) => file.ownerId !== partyPeer?.id)
+    .forEach((file) => {
+      const localFile = getLocalPartyFile(file);
+      if (localFile?.path) keys.add(localFile.path);
+    });
+  return [...keys];
+};
 
 const getPartySkinFilesWithInfo = async () =>
   Promise.all(getPartySkinFiles().map(async (skin) => {
@@ -777,10 +1362,17 @@ const getPartySkinFilesWithInfo = async () =>
       const info = await window.riftAtlas.getPartyFileInfo(skin.localPath);
       partyFileInfoCache.set(cacheKey, info);
       return { ...skin, fileName: info.fileName, size: info.size, hash: info.hash, mimeType: info.mimeType };
-    } catch {
-      return skin;
+    } catch (error) {
+      setPartyTransferStatus(getPartyTransferKey(skin), {
+        fileName: skin.fileName || skin.name,
+        champion: skin.champion || "",
+        status: "error",
+        error: `No pude leer el archivo local: ${error.message}`
+      });
+      return { ...skin, unavailable: true, error: error.message };
     }
-  }));
+  }))
+    .then((skins) => skins.filter((skin) => !skin.unavailable && skin.hash));
 
 const getPartyTransferKey = (skin = {}, fallback = "") => skin.hash || skin.key || skin.fileName || fallback;
 
@@ -789,8 +1381,64 @@ const getLocalPartyFile = (remoteSkin = {}) =>
     const sameHash = remoteSkin.hash && skin.partyHash === remoteSkin.hash;
     const sameName = !remoteSkin.hash && remoteSkin.fileName && String(skin.path || "").endsWith(remoteSkin.fileName);
     const sameKey = remoteSkin.key && getSkinKey(skin) === remoteSkin.key;
-    return sameHash || sameName || sameKey;
+    const sameSize = !remoteSkin.size || !skin.size || Number(skin.size) === Number(remoteSkin.size);
+    return sameHash || sameKey || (sameName && sameSize);
   });
+
+const findLocalPartyFileByHash = async (remoteSkin = {}) => {
+  if (!remoteSkin.hash) return getLocalPartyFile(remoteSkin);
+  const localByKnownHash = getLocalPartyFile(remoteSkin);
+  if (localByKnownHash?.partyHash === remoteSkin.hash) return localByKnownHash;
+
+  const candidates = [...state.customMods, ...state.skinLibrary].filter((skin) => {
+    const sameName = remoteSkin.fileName && String(skin.path || "").endsWith(remoteSkin.fileName);
+    const sameSize = !remoteSkin.size || !skin.size || Number(skin.size) === Number(remoteSkin.size);
+    return skin.path && sameName && sameSize;
+  });
+
+  for (const candidate of candidates) {
+    try {
+      const info = await window.riftAtlas.getPartyFileInfo(candidate.path);
+      if (info.hash === remoteSkin.hash) {
+        candidate.partyHash = remoteSkin.hash;
+        return candidate;
+      }
+    } catch {
+      // Ignore unreadable candidates; the transfer request can still fetch the file.
+    }
+  }
+
+  return null;
+};
+
+const queueLocalPartyFile = (localFile, remoteSkin = {}) => {
+  const key = getSkinKey(localFile);
+  if (!key) return false;
+  if (remoteSkin.hash) localFile.partyHash = remoteSkin.hash;
+  const alreadyQueued = state.queuedSkins.has(key);
+  if (alreadyQueued) return true;
+  trackPartySyncedQueue(remoteSkin, key);
+  queueSkinKey(key);
+  saveQueuedSkins();
+  return true;
+};
+
+const ensurePartySkinSelectedLocally = async (remoteSkin = {}) => {
+  const localFile = await findLocalPartyFileByHash(remoteSkin);
+  if (!localFile) return false;
+  const queued = queueLocalPartyFile(localFile, remoteSkin);
+  if (queued) {
+    setPartyTransferStatus(getPartyTransferKey(remoteSkin), {
+      fileName: remoteSkin.fileName || remoteSkin.name || localFile.name,
+      champion: remoteSkin.champion || localFile.champion || "",
+      owner: remoteSkin.ownerName || "",
+      status: "local",
+      progress: 100,
+      localPath: localFile.path
+    });
+  }
+  return queued;
+};
 
 const enforcePartyP2PSelection = () => {
   // No force selection of local party P2P files.
@@ -809,10 +1457,14 @@ const getLocalPartyReadyState = () => {
   const activeTransfers = [...partyTransferStatus.values()].filter((item) =>
     ["solicitando", "descargando", "recibiendo", "enviando"].includes(item.status)
   );
+  const activeTransferKeys = new Set(activeTransfers.map((item) => item.key).filter(Boolean));
+  const missingRemoteFiles = getMissingRemotePartyFiles()
+    .filter((file) => !activeTransferKeys.has(getPartyTransferKey(file)));
+  const pending = activeTransfers.length + missingRemoteFiles.length;
   return {
-    ready: activeTransfers.length === 0,
-    pending: activeTransfers.length,
-    label: activeTransfers.length ? `${activeTransfers.length} transferencia(s) pendientes` : "Listo"
+    ready: pending === 0,
+    pending,
+    label: pending ? `${pending} archivo(s) pendientes` : "Listo"
   };
 };
 
@@ -837,6 +1489,38 @@ const schedulePartySync = (delay = 350) => {
 const getAllPartyMembers = () => {
   if (!state.partyRoom) return [];
   return [state.partyRoom.host, ...(state.partyRoom.members || [])].filter(Boolean);
+};
+
+const getRemotePartyTransferKeys = () =>
+  new Set(
+    getAllPartyMembers()
+      .filter((member) => member.id !== partyPeer?.id)
+      .flatMap((member) => member.activeSkins || [])
+      .map((file) => getPartyTransferKey(file))
+      .filter(Boolean)
+  );
+
+const trackPartySyncedQueue = (remoteSkin = {}, localKey = "") => {
+  const remoteKey = getPartyTransferKey(remoteSkin);
+  if (remoteKey && localKey) partySyncedQueuedSkins.set(remoteKey, localKey);
+};
+
+const prunePartySyncedQueue = ({ removeAll = false } = {}) => {
+  const activeRemoteKeys = removeAll ? new Set() : getRemotePartyTransferKeys();
+  let changed = false;
+
+  partySyncedQueuedSkins.forEach((localKey, remoteKey) => {
+    if (activeRemoteKeys.has(remoteKey)) return;
+    partySyncedQueuedSkins.delete(remoteKey);
+    if (removeQueuedSkinKey(localKey)) changed = true;
+  });
+  partyReceivedFiles.forEach((localKey, remoteKey) => {
+    if (activeRemoteKeys.has(remoteKey)) return;
+    partyReceivedFiles.delete(remoteKey);
+    removeP2PFileIfUnused(localKey);
+  });
+
+  if (changed) saveQueuedSkins();
 };
 
 const updatePartyMemberSkins = (peerId, skins = []) => {
@@ -914,6 +1598,84 @@ const setPartyTransferStatus = (key, patch = {}) => {
   renderParty();
 };
 
+const rejectPartyAckWaitersForConnection = (peerId, error) => {
+  partyChunkAckWaiters.forEach((waiter, key) => {
+    if (waiter.peerId !== peerId) return;
+    partyChunkAckWaiters.delete(key);
+    waiter.reject(error);
+  });
+};
+
+const rejectPartyAckWaitersForTransfer = (peerId, transferId, error) => {
+  const prefix = `${peerId}:${transferId}:`;
+  partyChunkAckWaiters.forEach((waiter, key) => {
+    if (!key.startsWith(prefix)) return;
+    partyChunkAckWaiters.delete(key);
+    waiter.reject(error);
+  });
+};
+
+const getPartyTransferControl = (transferId) => {
+  if (!transferId) return null;
+  if (!partyTransferControls.has(transferId)) {
+    partyTransferControls.set(transferId, { paused: false, canceled: false });
+  }
+  return partyTransferControls.get(transferId);
+};
+
+const waitForPartyTransferResume = async (transferId) => {
+  const control = getPartyTransferControl(transferId);
+  while (control?.paused && !control.canceled) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  if (control?.canceled) throw new Error("Transferencia cancelada.");
+};
+
+const sendPartyTransferControlMessage = (transfer = {}, type) => {
+  if (!transfer?.peerId || !transfer?.transferId) return false;
+  const connection = partyConnections.get(transfer.peerId) ||
+    [...partyConnections.values()].find((candidate) => candidate.open);
+  if (!connection?.open) return false;
+  connection.send({
+    type,
+    id: transfer.transferId,
+    skin: transfer.skin || findPartyFileByKey(transfer.key) || {},
+    relayPeerId: transfer.relayPeerId || ""
+  });
+  return true;
+};
+
+const pausePartyTransfer = (key) => {
+  const transfer = partyTransferStatus.get(key);
+  if (!transfer?.transferId) return;
+  const control = getPartyTransferControl(transfer.transferId);
+  control.paused = true;
+  sendPartyTransferControlMessage(transfer, "file-pause");
+  setPartyTransferStatus(key, { status: "pausado", error: "Pausado" });
+};
+
+const resumePartyTransfer = (key) => {
+  const transfer = partyTransferStatus.get(key);
+  if (!transfer?.transferId) return;
+  const control = getPartyTransferControl(transfer.transferId);
+  control.paused = false;
+  sendPartyTransferControlMessage(transfer, "file-resume");
+  setPartyTransferStatus(key, { status: transfer.direction === "upload" ? "enviando" : "recibiendo", error: "" });
+};
+
+const cancelPartyTransfer = (key) => {
+  const transfer = partyTransferStatus.get(key);
+  if (!transfer?.transferId) return;
+  const control = getPartyTransferControl(transfer.transferId);
+  control.canceled = true;
+  control.paused = false;
+  sendPartyTransferControlMessage(transfer, "file-cancel");
+  rejectPartyAckWaitersForTransfer(transfer.peerId, transfer.transferId, new Error("Transferencia cancelada."));
+  partyIncomingTransfers.delete(transfer.transferId);
+  if (transfer.hash) partyRequestedHashes.delete(transfer.hash);
+  setPartyTransferStatus(key, { status: "cancelado", error: "Cancelado", progress: 0 });
+};
+
 const getAllPartyFiles = () =>
   getAllPartyMembers().flatMap((member) =>
     (member.activeSkins || []).map((file) => ({ ...file, ownerId: member.id, ownerName: member.name || "Jugador" }))
@@ -922,8 +1684,20 @@ const getAllPartyFiles = () =>
 const findPartyFileByKey = (key = "") =>
   getAllPartyFiles().find((file) => getPartyTransferKey(file) === key || file.key === key || file.fileName === key);
 
-const sendPartyFile = async (connection, transferId, skin = {}) => {
+const relayPartyFileMessage = (targetPeerId, sourcePeerId, message = {}) => {
+  if (!partyIsHost || !targetPeerId || targetPeerId === partyPeer?.id) return false;
+  const targetConnection = partyConnections.get(targetPeerId);
+  if (!targetConnection?.open) return false;
+  const { targetPeerId: _targetPeerId, ...forwarded } = message;
+  targetConnection.send({ ...forwarded, relayPeerId: sourcePeerId });
+  return true;
+};
+
+const sendPartyFile = async (connection, transferId, skin = {}, relayPeerId = "") => {
   const transferKey = getPartyTransferKey(skin, transferId);
+  const control = getPartyTransferControl(transferId);
+  control.canceled = false;
+  control.paused = false;
   try {
     const localSkin = getLocalPartyFile(skin) || skin;
     const localPath = localSkin.path || localSkin.localPath || skin.localPath;
@@ -936,65 +1710,123 @@ const sendPartyFile = async (connection, transferId, skin = {}) => {
       champion: skin.champion || "",
       owner: getPartyDisplayName(),
       status: "enviando",
-      progress: 0
+      progress: 0,
+      transferId,
+      peerId: connection.peer,
+      relayPeerId,
+      direction: "upload",
+      skin
     });
-    connection.send({ type: "file-accept", id: transferId, metadata: info, skin });
+    connection.send({ type: "file-accept", id: transferId, metadata: info, skin, relayPeerId });
     const totalChunks = Math.ceil(info.size / PARTY_CHUNK_SIZE);
     for (let sequence = 0; sequence < totalChunks; sequence += 1) {
+      await waitForPartyTransferResume(transferId);
       const data = await window.riftAtlas.readPartyFileChunk({
         filePath: localPath,
         offset: sequence * PARTY_CHUNK_SIZE,
         length: PARTY_CHUNK_SIZE
       });
-      connection.send({ type: "file-chunk", id: transferId, sequence, totalChunks, data });
-      setPartyTransferStatus(transferKey, {
-        status: "enviando",
-        progress: Math.round(((sequence + 1) / Math.max(totalChunks, 1)) * 100)
-      });
-      await waitForPartyChunkAck(transferId, sequence);
+      for (let attempt = 1; attempt <= PARTY_CHUNK_MAX_ATTEMPTS; attempt += 1) {
+        await waitForPartyTransferResume(transferId);
+        const ackPromise = waitForPartyChunkAck(connection.peer, transferId, sequence);
+        connection.send({ type: "file-chunk", id: transferId, sequence, totalChunks, data, relayPeerId });
+        setPartyTransferStatus(transferKey, {
+          status: "enviando",
+          progress: Math.round(((sequence + 1) / Math.max(totalChunks, 1)) * 100),
+          error: attempt > 1 ? `Reintentando chunk ${sequence + 1}/${totalChunks}` : ""
+        });
+        try {
+          await ackPromise;
+          break;
+        } catch (ackError) {
+          if (attempt >= PARTY_CHUNK_MAX_ATTEMPTS) throw ackError;
+          await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+        }
+      }
     }
-    connection.send({ type: "file-complete", id: transferId });
+    connection.send({ type: "file-complete", id: transferId, relayPeerId });
     setPartyTransferStatus(transferKey, { status: "enviado", progress: 100 });
   } catch (error) {
-    connection.send({ type: "file-error", id: transferId, error: error.message, skin });
-    setPartyTransferStatus(transferKey, { status: "error", error: error.message });
+    const canceled = getPartyTransferControl(transferId)?.canceled;
+    connection.send({ type: canceled ? "file-cancel" : "file-error", id: transferId, error: error.message, skin, relayPeerId });
+    setPartyTransferStatus(transferKey, { status: canceled ? "cancelado" : "error", error: error.message });
+  } finally {
+    partyTransferControls.delete(transferId);
   }
 };
 
-const requestPartyFile = (peerId, skin = {}) => {
-  if (!skin.hash || hasLocalPartyFile(skin)) return;
+const requestPartyFile = async (peerId, skin = {}) => {
+  if (await ensurePartySkinSelectedLocally(skin)) return;
   const transferKey = getPartyTransferKey(skin);
+  if (hasLocalPartyFile(skin)) {
+    setPartyTransferStatus(transferKey, {
+      fileName: skin.fileName || skin.name,
+      champion: skin.champion || "",
+      owner: skin.ownerName || peerId,
+      status: "local",
+      progress: 100
+    });
+    return;
+  }
+  if (!skin.hash) {
+    setPartyTransferStatus(transferKey, {
+      fileName: skin.fileName || skin.name,
+      champion: skin.champion || "",
+      owner: skin.ownerName || peerId,
+      status: "error",
+      error: "El archivo remoto no publico hash; no se puede pedir."
+    });
+    return;
+  }
   const current = partyTransferStatus.get(transferKey);
   if (["solicitando", "recibiendo", "descargando"].includes(current?.status)) return;
   const connection = partyConnections.get(peerId) ||
     [...partyConnections.values()].find((candidate) => candidate.open);
-  if (!connection?.open) return;
+  if (!connection?.open) {
+    setPartyTransferStatus(transferKey, {
+      fileName: skin.fileName || skin.name,
+      champion: skin.champion || "",
+      owner: skin.ownerName || peerId,
+      status: "error",
+      error: `No hay conexion abierta con ${skin.ownerName || peerId || "el duenio"}.`
+    });
+    return;
+  }
   partyRequestedHashes.add(skin.hash);
+  const targetPeerId = connection.peer === peerId ? "" : peerId;
+  const transferId = `transfer-${Date.now()}-${partyTransferSeq += 1}`;
   connection.send({
     type: "file-request",
-    id: `transfer-${Date.now()}-${partyTransferSeq += 1}`,
-    skin
+    id: transferId,
+    skin,
+    targetPeerId
   });
   setPartyTransferStatus(transferKey, {
     fileName: skin.fileName || skin.name,
     champion: skin.champion || "",
     owner: skin.ownerName || peerId,
     status: "solicitando",
-    progress: 0
+    progress: 0,
+    transferId,
+    peerId: connection.peer,
+    direction: "download",
+    hash: skin.hash,
+    skin
   });
   if (els.partyConnectionLabel) {
     els.partyConnectionLabel.textContent = `conectado, descargando P2P: ${skin.fileName || skin.name}`;
   }
 };
 
-const waitForPartyChunkAck = (transferId, sequence) => {
-  const key = `${transferId}:${sequence}`;
+const waitForPartyChunkAck = (peerId, transferId, sequence) => {
+  const key = `${peerId}:${transferId}:${sequence}`;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       partyChunkAckWaiters.delete(key);
       reject(new Error(`Timeout esperando ACK del chunk ${sequence + 1}`));
     }, PARTY_CHUNK_ACK_TIMEOUT_MS);
     partyChunkAckWaiters.set(key, {
+      peerId,
       resolve: () => {
         clearTimeout(timer);
         resolve();
@@ -1008,7 +1840,25 @@ const waitForPartyChunkAck = (transferId, sequence) => {
 };
 
 const requestMissingPartyFiles = (peerId, skins = []) => {
-  skins.forEach((skin) => requestPartyFile(peerId, skin));
+  skins.forEach((skin, index) => {
+    const transferKey = getPartyTransferKey(skin);
+    const current = partyTransferStatus.get(transferKey);
+    if (["pendiente", "solicitando", "recibiendo", "descargando", "local", "pausado", "cancelado", "error"].includes(current?.status)) return;
+    setPartyTransferStatus(transferKey, {
+      fileName: skin.fileName || skin.name,
+      champion: skin.champion || "",
+      owner: skin.ownerName || peerId,
+      status: "pendiente",
+      progress: 0
+    });
+    setTimeout(() => {
+      const latest = partyTransferStatus.get(transferKey);
+      if (latest?.status && latest.status !== "pendiente") return;
+      requestPartyFile(peerId, skin).catch((error) => {
+        setPartyTransferStatus(transferKey, { status: "error", error: error.message });
+      });
+    }, index * PARTY_AUTO_REQUEST_DELAY_MS);
+  });
 };
 
 const requestMissingRoomFiles = () => {
@@ -1021,8 +1871,30 @@ const requestMissingRoomFiles = () => {
 const handlePartyFileMessage = async (peerId, message = {}) => {
   const connection = partyConnections.get(peerId);
   if (!connection) return true;
+  if (message.relayPeerId && partyIsHost) {
+    if (relayPartyFileMessage(message.relayPeerId, peerId, message)) return true;
+    connection.send({
+      type: "file-error",
+      id: message.id,
+      error: "No pude reenviar el archivo P2P: el otro miembro no esta conectado.",
+      skin: message.skin
+    });
+    return true;
+  }
   if (message.type === "file-request") {
-    await sendPartyFile(connection, message.id, message.skin);
+    if (message.targetPeerId && relayPartyFileMessage(message.targetPeerId, peerId, message)) {
+      return true;
+    }
+    if (message.targetPeerId && message.targetPeerId !== partyPeer?.id) {
+      connection.send({
+        type: "file-error",
+        id: message.id,
+        error: "No pude conectar con el dueno de esa skin en la party.",
+        skin: message.skin
+      });
+      return true;
+    }
+    await sendPartyFile(connection, message.id, message.skin, message.relayPeerId || "");
     return true;
   }
   if (message.type === "file-accept") {
@@ -1031,6 +1903,8 @@ const handlePartyFileMessage = async (peerId, message = {}) => {
       metadata: message.metadata,
       skin: message.skin,
       key: transferKey,
+      peerId,
+      relayPeerId: message.relayPeerId || "",
       chunks: new Map(),
       totalChunks: Math.ceil((message.metadata?.size || 0) / PARTY_CHUNK_SIZE)
     });
@@ -1039,7 +1913,13 @@ const handlePartyFileMessage = async (peerId, message = {}) => {
       champion: message.skin?.champion || "",
       owner: message.skin?.ownerName || peerId,
       status: "recibiendo",
-      progress: 0
+      progress: 0,
+      transferId: message.id,
+      peerId,
+      relayPeerId: message.relayPeerId || "",
+      direction: "download",
+      hash: message.metadata?.hash || message.skin?.hash || "",
+      skin: message.skin
     });
     return true;
   }
@@ -1047,7 +1927,7 @@ const handlePartyFileMessage = async (peerId, message = {}) => {
     const transfer = partyIncomingTransfers.get(message.id);
     if (!transfer) return true;
     transfer.chunks.set(message.sequence, message.data);
-    connection.send({ type: "file-ack", id: message.id, sequence: message.sequence });
+    connection.send({ type: "file-ack", id: message.id, sequence: message.sequence, relayPeerId: message.relayPeerId || "" });
     setPartyTransferStatus(transfer.key, {
       status: "recibiendo",
       progress: Math.round((transfer.chunks.size / Math.max(message.totalChunks || transfer.totalChunks, 1)) * 100)
@@ -1058,11 +1938,33 @@ const handlePartyFileMessage = async (peerId, message = {}) => {
     return true;
   }
   if (message.type === "file-ack") {
-    const waiterKey = `${message.id}:${message.sequence}`;
+    const waiterKey = `${peerId}:${message.id}:${message.sequence}`;
     const waiter = partyChunkAckWaiters.get(waiterKey);
     if (waiter) {
       partyChunkAckWaiters.delete(waiterKey);
       waiter.resolve();
+    }
+    return true;
+  }
+  if (message.type === "file-pause" || message.type === "file-resume" || message.type === "file-cancel") {
+    const control = getPartyTransferControl(message.id);
+    const transfer = partyIncomingTransfers.get(message.id);
+    const transferKey = transfer?.key || getPartyTransferKey(message.skin, message.id);
+    const current = partyTransferStatus.get(transferKey) || {};
+    if (message.type === "file-pause") {
+      control.paused = true;
+      setPartyTransferStatus(transferKey, { status: "pausado", error: "Pausado", transferId: message.id, peerId, direction: current.direction || "download" });
+    } else if (message.type === "file-resume") {
+      control.paused = false;
+      setPartyTransferStatus(transferKey, { status: current.direction === "upload" ? "enviando" : "recibiendo", error: "", transferId: message.id, peerId, direction: current.direction || "download" });
+    } else {
+      control.canceled = true;
+      control.paused = false;
+      rejectPartyAckWaitersForTransfer(peerId, message.id, new Error("Transferencia cancelada."));
+      if (transfer?.metadata?.hash) partyRequestedHashes.delete(transfer.metadata.hash);
+      if (message.skin?.hash) partyRequestedHashes.delete(message.skin.hash);
+      partyIncomingTransfers.delete(message.id);
+      setPartyTransferStatus(transferKey, { status: "cancelado", error: "Cancelado", progress: 0, transferId: message.id, peerId, direction: current.direction || "download" });
     }
     return true;
   }
@@ -1085,7 +1987,8 @@ const handlePartyFileMessage = async (peerId, message = {}) => {
       });
       mod.partyHash = transfer.metadata.hash;
       addCustomMods([mod]);
-      state.queuedSkins.add(mod.path);
+      trackPartySyncedQueue(transfer.skin, mod.path);
+      partyReceivedFiles.set(transfer.key, mod.path);
       enforcePartyP2PSelection();
       saveQueuedSkins();
       partyIncomingTransfers.delete(message.id);
@@ -1113,7 +2016,9 @@ const handlePartyFileMessage = async (peerId, message = {}) => {
   if (message.type === "file-error") {
     if (els.partyConnectionLabel) els.partyConnectionLabel.textContent = `Error P2P: ${message.error}`;
     const transfer = partyIncomingTransfers.get(message.id);
-    setPartyTransferStatus(transfer?.key || message.id, { status: "error", error: message.error });
+    rejectPartyAckWaitersForTransfer(peerId, message.id, new Error(message.error || "Error P2P."));
+    const transferKey = transfer?.key || getPartyTransferKey(message.skin, message.id);
+    setPartyTransferStatus(transferKey, { status: "error", error: message.error });
     if (transfer?.metadata?.hash) partyRequestedHashes.delete(transfer.metadata.hash);
     if (message.skin?.hash) partyRequestedHashes.delete(message.skin.hash);
     partyIncomingTransfers.delete(message.id);
@@ -1127,15 +2032,15 @@ const getPartyReadiness = () => {
   const members = getAllPartyMembers();
   const localReady = getLocalPartyReadyState();
   const readyMembers = members.filter((member) => member.ready).length;
-  const allReady = connected && members.length > 0 && readyMembers === members.length && localReady.ready;
+  const allReady = connected && !state.overlayRunning && members.length > 0 && readyMembers === members.length && localReady.ready;
   return { connected, members, localReady, readyMembers, allReady };
 };
 
 const maybeAutoApplyParty = () => {
   const readiness = getPartyReadiness();
-  if (!state.partyAutoApply || partyAutoApplyTriggered || !readiness.allReady || state.importingQueue || state.queuedSkins.size === 0) return;
+  if (!state.partyAutoApply || partyAutoApplyTriggered || !readiness.allReady || state.importingQueue || getPartyApplyKeys().length === 0) return;
   partyAutoApplyTriggered = true;
-  applyQueuedSkins();
+  applyPartyQueue();
 };
 
 const renderPartyFileProfile = () => {
@@ -1153,9 +2058,13 @@ const renderPartyFileProfile = () => {
   const localFile = getLocalPartyFile(selected);
   const transfer = partyTransferStatus.get(getPartyTransferKey(selected));
   const status = localFile ? "Disponible local" : transfer?.status || "Pendiente";
-  const selectableKey = localFile?.path || selected.key || "";
-  const canSelect = Boolean(localFile || selected.ownerId === partyPeer?.id);
+  const isOwnPartyFile = selected.ownerId === partyPeer?.id;
+  const selectableKey = isOwnPartyFile ? (localFile?.path || selected.key || "") : "";
+  const canSelect = Boolean(isOwnPartyFile && selectableKey);
   const isSelected = Boolean(selectableKey && state.queuedSkins.has(selectableKey));
+  const toggleLabel = isOwnPartyFile
+    ? (isSelected ? "Quitar de seleccion" : "Seleccionar")
+    : (localFile ? "Incluido en party" : "Esperando");
   els.partyFileProfile.innerHTML = `
     <div class="party-profile-cover">
       ${selected.preview || selected.image ? `<img src="${escapeHtml(selected.preview || selected.image)}" alt="${escapeHtml(selected.name || selected.fileName)}" />` : `<span>${escapeHtml((selected.extension || selected.fileName || "P2P").replace(".", "").toUpperCase())}</span>`}
@@ -1170,16 +2079,16 @@ const renderPartyFileProfile = () => {
       <div><dt>Tamano</dt><dd>${formatBytes(selected.size || 0)}</dd></div>
       <div><dt>Hash</dt><dd>${escapeHtml(selected.hash ? selected.hash.slice(0, 16) : "sin hash")}</dd></div>
     </dl>
-    <button class="docs-link party-profile-toggle" type="button" data-key="${escapeHtml(selectableKey)}" ${canSelect && selectableKey ? "" : "disabled"}>${isSelected ? "Quitar de seleccion" : "Seleccionar"}</button>
+    <button class="docs-link party-profile-toggle" type="button" data-key="${escapeHtml(selectableKey)}" ${canSelect && selectableKey ? "" : "disabled"}>${escapeHtml(toggleLabel)}</button>
     <button class="secondary-button party-profile-open" type="button" ${localFile?.path ? "" : "disabled"}>Abrir archivo</button>
   `;
   els.partyFileProfile.querySelector(".party-profile-toggle")?.addEventListener("click", () => {
     const key = selectableKey;
     if (!key) return;
     if (state.queuedSkins.has(key)) {
-      state.queuedSkins.delete(key);
+      removeQueuedSkinKey(key);
     } else {
-      state.queuedSkins.add(key);
+      queueSkinKey(key);
     }
     saveQueuedSkins();
     renderParty();
@@ -1204,7 +2113,7 @@ const renderSkinsP2PSection = () => {
   }
   if (els.skinsP2PApplyButton) {
     const readiness = getPartyReadiness();
-    els.skinsP2PApplyButton.disabled = !readiness.allReady || state.importingQueue || state.queuedSkins.size === 0;
+    els.skinsP2PApplyButton.disabled = !readiness.allReady || state.importingQueue || getPartyApplyKeys().length === 0;
   }
 
   if (!uniqueFiles.length) {
@@ -1216,6 +2125,24 @@ const renderSkinsP2PSection = () => {
     `;
     return;
   }
+
+  const renderTransferControlButtons = (key, transfer = null, localFile = null) => {
+    const status = transfer?.status || "";
+    if (localFile) return "";
+    if (["recibiendo", "enviando", "solicitando", "pendiente"].includes(status)) {
+      return `
+        <button class="secondary-button skins-p2p-pause" type="button" data-key="${escapeHtml(key)}" ${transfer?.transferId ? "" : "disabled"}>Pausar</button>
+        <button class="secondary-button skins-p2p-cancel" type="button" data-key="${escapeHtml(key)}" ${transfer?.transferId ? "" : "disabled"}>Cancelar</button>
+      `;
+    }
+    if (status === "pausado") {
+      return `
+        <button class="docs-link skins-p2p-resume" type="button" data-key="${escapeHtml(key)}">Reanudar</button>
+        <button class="secondary-button skins-p2p-cancel" type="button" data-key="${escapeHtml(key)}">Cancelar</button>
+      `;
+    }
+    return `<button class="secondary-button skins-p2p-request" type="button" data-key="${escapeHtml(key)}">Pedir</button>`;
+  };
 
   els.skinsP2PList.innerHTML = uniqueFiles
     .map((file) => {
@@ -1235,7 +2162,7 @@ const renderSkinsP2PSection = () => {
             <span>${formatBytes(file.size || localFile?.size || 0)}</span>
             <span>${escapeHtml(file.hash ? file.hash.slice(0, 10) : "sin hash")}</span>
           </div>
-          <button class="secondary-button skins-p2p-request" type="button" data-key="${escapeHtml(key)}" ${localFile ? "disabled" : ""}>Pedir</button>
+          ${renderTransferControlButtons(key, transfer, localFile)}
           <button class="docs-link skins-p2p-select" type="button" data-path="${escapeHtml(selectableKey)}" disabled>${localFile ? "Seleccionado" : "Esperando"}</button>
         </article>
       `;
@@ -1243,17 +2170,39 @@ const renderSkinsP2PSection = () => {
     .join("");
 
   els.skinsP2PList.querySelectorAll(".skins-p2p-request").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       const file = findPartyFileByKey(button.dataset.key);
       if (!file) return;
-      requestPartyFile(file.ownerId, file);
-      renderParty();
+      button.disabled = true;
+      try {
+        await requestPartyFile(file.ownerId, file);
+      } catch (error) {
+        setPartyTransferStatus(getPartyTransferKey(file), {
+          fileName: file.fileName || file.name,
+          champion: file.champion || "",
+          owner: file.ownerName || file.ownerId || "",
+          status: "error",
+          error: error.message
+        });
+      } finally {
+        renderParty();
+      }
     });
+  });
+  els.skinsP2PList.querySelectorAll(".skins-p2p-pause").forEach((button) => {
+    button.addEventListener("click", () => pausePartyTransfer(button.dataset.key));
+  });
+  els.skinsP2PList.querySelectorAll(".skins-p2p-resume").forEach((button) => {
+    button.addEventListener("click", () => resumePartyTransfer(button.dataset.key));
+  });
+  els.skinsP2PList.querySelectorAll(".skins-p2p-cancel").forEach((button) => {
+    button.addEventListener("click", () => cancelPartyTransfer(button.dataset.key));
   });
 };
 
 const renderParty = () => {
   if (!els.partyStatusPill) return;
+  renderPenguBridgeStatus();
   const { connected, members, localReady, readyMembers, allReady } = getPartyReadiness();
   const files = getAllPartyFiles();
   els.partyStatusPill.textContent = connected ? (allReady ? "Todos listos" : "Sincronizando") : "Desconectado";
@@ -1267,11 +2216,17 @@ const renderParty = () => {
     els.partyFilesLabel.textContent = `archivos p2p: ${files.length ? files.map((file) => file.fileName || file.name).join(", ") : "ninguno"}`;
   }
   if (els.partyReadySummary) {
-    els.partyReadySummary.textContent = connected ? (allReady ? "Todos listos" : localReady.label) : "Desconectado";
+    els.partyReadySummary.textContent = connected
+      ? state.overlayRunning
+        ? "Overlay activo"
+        : (allReady ? "Todos listos" : localReady.label)
+      : "Desconectado";
   }
   if (els.partyReadyDetails) {
     els.partyReadyDetails.textContent = connected
-      ? `${readyMembers}/${members.length} miembro(s) listos. ${state.partyAutoApply ? "Auto-ejecutar esta activado." : "Auto-ejecutar apagado."}`
+      ? state.overlayRunning
+        ? "Deten el overlay activo antes de usar Aplicar party."
+        : `${readyMembers}/${members.length} miembro(s) listos. ${state.partyAutoApply ? "Auto-ejecutar esta activado." : "Auto-ejecutar apagado."}`
       : "Crea o entra a una party para sincronizar archivos.";
   }
   if (els.partyShareLinkLabel) {
@@ -1281,7 +2236,7 @@ const renderParty = () => {
   if (els.joinPartyButton) els.joinPartyButton.disabled = connected;
   if (els.leavePartyButton) els.leavePartyButton.disabled = !connected;
   if (els.copyPartyLinkButton) els.copyPartyLinkButton.disabled = !state.partyLink;
-  if (els.applyPartyButton) els.applyPartyButton.disabled = !allReady || state.importingQueue || state.queuedSkins.size === 0;
+  if (els.applyPartyButton) els.applyPartyButton.disabled = !allReady || state.importingQueue || getPartyApplyKeys().length === 0;
   if (els.partyAutoApplyCheckbox) els.partyAutoApplyCheckbox.checked = state.partyAutoApply;
   if (els.partyTransferList) {
     const transfers = [...partyTransferStatus.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 5);
@@ -1293,9 +2248,20 @@ const renderParty = () => {
               <small>${escapeHtml(item.status || "pendiente")}${item.error ? ` - ${escapeHtml(item.error)}` : ""}</small>
             </div>
             <span>${Math.round(item.progress || 0)}%</span>
+            ${["recibiendo", "enviando", "solicitando", "pendiente"].includes(item.status) ? `<button class="secondary-button party-transfer-pause" type="button" data-key="${escapeHtml(item.key)}" ${item.transferId ? "" : "disabled"}>Pausar</button><button class="secondary-button party-transfer-cancel" type="button" data-key="${escapeHtml(item.key)}" ${item.transferId ? "" : "disabled"}>Cancelar</button>` : ""}
+            ${item.status === "pausado" ? `<button class="docs-link party-transfer-resume" type="button" data-key="${escapeHtml(item.key)}">Reanudar</button><button class="secondary-button party-transfer-cancel" type="button" data-key="${escapeHtml(item.key)}">Cancelar</button>` : ""}
           </div>
         `).join("")
       : "";
+    els.partyTransferList.querySelectorAll(".party-transfer-pause").forEach((button) => {
+      button.addEventListener("click", () => pausePartyTransfer(button.dataset.key));
+    });
+    els.partyTransferList.querySelectorAll(".party-transfer-resume").forEach((button) => {
+      button.addEventListener("click", () => resumePartyTransfer(button.dataset.key));
+    });
+    els.partyTransferList.querySelectorAll(".party-transfer-cancel").forEach((button) => {
+      button.addEventListener("click", () => cancelPartyTransfer(button.dataset.key));
+    });
   }
   renderPartyFileProfile();
   renderSkinsP2PSection();
@@ -1314,14 +2280,14 @@ const renderParty = () => {
     .map((member) => {
       const filesHtml = (member.activeSkins || []).length
         ? member.activeSkins
-            .map((file) => {
-              const transferKey = getPartyTransferKey(file);
-              const localFile = getLocalPartyFile(file);
-              const transfer = partyTransferStatus.get(transferKey);
-              const status = localFile ? "local" : transfer?.status || "pendiente";
-              return `<button class="party-file-chip ${state.selectedPartyFile?.key === transferKey ? "active" : ""}" type="button" data-key="${escapeHtml(transferKey)}">${escapeHtml(file.fileName || file.name)}<small>${escapeHtml(file.champion || "")} - ${escapeHtml(status)}</small></button>`;
-            })
-            .join("")
+          .map((file) => {
+            const transferKey = getPartyTransferKey(file);
+            const localFile = getLocalPartyFile(file);
+            const transfer = partyTransferStatus.get(transferKey);
+            const status = localFile ? "local" : transfer?.status || "pendiente";
+            return `<button class="party-file-chip ${state.selectedPartyFile?.key === transferKey ? "active" : ""}" type="button" data-key="${escapeHtml(transferKey)}">${escapeHtml(file.fileName || file.name)}<small>${escapeHtml(file.champion || "")} - ${escapeHtml(status)}</small></button>`;
+          })
+          .join("")
         : '<span class="muted-text">Sin archivos seleccionados</span>';
       return `
         <article class="party-member-card">
@@ -1355,10 +2321,11 @@ const handlePartyMessage = (peerId, message = {}) => {
       ...state.partyRoom,
       members: exists
         ? state.partyRoom.members.map((member) =>
-            member.id === peerId ? { ...member, ...message.data, id: peerId, isHost: false, connected: true } : member
-          )
+          member.id === peerId ? { ...member, ...message.data, id: peerId, isHost: false, connected: true } : member
+        )
         : [...state.partyRoom.members, { ...message.data, id: peerId, isHost: false, connected: true }]
     };
+    prunePartySyncedQueue();
     requestMissingPartyFiles(peerId, message.data?.activeSkins || []);
     broadcastPartyRoom();
     renderParty();
@@ -1373,6 +2340,7 @@ const handlePartyMessage = (peerId, message = {}) => {
   if (message.type === "room-info" || message.type === "room-update") {
     state.partyRoom = message.data;
     state.partyStatus = "connected";
+    prunePartySyncedQueue();
     requestMissingRoomFiles();
     sendPartyReadyUpdate();
     renderParty();
@@ -1381,6 +2349,7 @@ const handlePartyMessage = (peerId, message = {}) => {
   if (message.type === "skins-update") {
     partyAutoApplyTriggered = false;
     updatePartyMemberSkins(peerId, message.data || []);
+    prunePartySyncedQueue();
     requestMissingPartyFiles(peerId, message.data || []);
     sendPartyReadyUpdate();
     if (partyIsHost) broadcastPartyRoom();
@@ -1392,18 +2361,23 @@ const attachPartyConnection = (connection) => {
   partyConnections.set(connection.peer, connection);
   connection.on("data", (message) => handlePartyMessage(connection.peer, message));
   connection.on("close", () => {
+    rejectPartyAckWaitersForConnection(connection.peer, new Error("Conexion P2P cerrada."));
     partyConnections.delete(connection.peer);
     if (partyIsHost && state.partyRoom) {
       state.partyRoom = {
         ...state.partyRoom,
         members: state.partyRoom.members.filter((member) => member.id !== connection.peer)
       };
+      prunePartySyncedQueue();
       broadcastPartyRoom();
     }
     sendPartyReadyUpdate();
     renderParty();
   });
-  connection.on("error", () => renderParty());
+  connection.on("error", (error) => {
+    rejectPartyAckWaitersForConnection(connection.peer, error instanceof Error ? error : new Error("Error en conexion P2P."));
+    renderParty();
+  });
 };
 
 const syncPartySkins = async () => {
@@ -1457,6 +2431,9 @@ const leaveParty = async () => {
   state.partyStatus = "disconnected";
   state.selectedPartyFile = null;
   partyTransferStatus.clear();
+  prunePartySyncedQueue({ removeAll: true });
+  partySyncedQueuedSkins.clear();
+  partyReceivedFiles.clear();
   partyIncomingTransfers.clear();
   partyRequestedHashes.clear();
   partyChunkAckWaiters.forEach((waiter) => waiter.reject(new Error("Party cerrada.")));
@@ -1466,13 +2443,18 @@ const leaveParty = async () => {
   renderParty();
 };
 
-const createParty = async () => {
+const createParty = async (options = {}) => {
   if (!window.Peer) {
     throw new Error("PeerJS no esta cargado.");
   }
+  if (!options.roomId) {
+    state.penguAutoPartyRoom = "";
+    penguLastAutoConnectKey = "";
+  }
   await leaveParty();
-  const roomId = generatePartyRoomId();
-  const displayName = getPartyDisplayName();
+  const roomId = normalizePartyCode(options.roomId || generatePartyRoomId());
+  const displayName = options.displayName || getPartyDisplayName();
+  if (els.partyNameInput && options.displayName) els.partyNameInput.value = options.displayName;
   localStorage.setItem("riftAtlas:partyName", displayName);
   partyIsHost = true;
   state.partyStatus = "connecting";
@@ -1517,14 +2499,20 @@ const createParty = async () => {
   });
 };
 
-const joinParty = async () => {
+const joinParty = async (options = {}) => {
   if (!window.Peer) {
     throw new Error("PeerJS no esta cargado.");
   }
-  const roomId = normalizePartyCode(els.partyLinkInput?.value);
+  if (!options.roomId) {
+    state.penguAutoPartyRoom = "";
+    penguLastAutoConnectKey = "";
+  }
+  const roomId = normalizePartyCode(options.roomId || els.partyLinkInput?.value);
   if (!roomId) throw new Error("Pega un link o codigo de party.");
   await leaveParty();
-  const displayName = getPartyDisplayName();
+  const displayName = options.displayName || getPartyDisplayName();
+  if (els.partyNameInput && options.displayName) els.partyNameInput.value = options.displayName;
+  if (els.partyLinkInput && options.roomId) els.partyLinkInput.value = `rift-atlas-party:${roomId}`;
   localStorage.setItem("riftAtlas:partyName", displayName);
   partyIsHost = false;
   state.partyStatus = "connecting";
@@ -1554,6 +2542,61 @@ const joinParty = async () => {
     if (els.partyConnectionLabel) els.partyConnectionLabel.textContent = `Error party: ${error.message || error}`;
     renderParty();
   });
+};
+
+const handlePenguAutoParty = async () => {
+  if (!state.penguAutoParty || penguAutoConnectInFlight) return;
+  const plan = getPenguPartyPlan();
+  if (!plan) {
+    if (state.penguAutoPartyRoom && state.partyStatus === "connected" && state.partyRoom?.id === state.penguAutoPartyRoom) {
+      state.penguAutoPartyRoom = "";
+      await leaveParty();
+    }
+    renderPenguBridgeStatus();
+    return;
+  }
+
+  if (state.partyStatus === "connected") {
+    if (state.partyRoom?.id === plan.roomId) {
+      state.penguAutoPartyRoom = plan.roomId;
+      renderPenguBridgeStatus();
+      return;
+    }
+    if (state.penguAutoPartyRoom && state.partyRoom?.id !== state.penguAutoPartyRoom) {
+      state.penguAutoPartyRoom = "";
+    }
+    if (!state.penguAutoPartyRoom) {
+      if (els.penguLobbyLabel) {
+        els.penguLobbyLabel.textContent = `Lobby detectado: ${plan.roomId}. Ya hay una party manual activa.`;
+      }
+      return;
+    }
+  }
+
+  const connectKey = `${plan.roomId}:${plan.isHost ? "host" : "member"}`;
+  if (penguLastAutoConnectKey === connectKey && ["connecting", "connected"].includes(state.partyStatus)) return;
+  penguLastAutoConnectKey = connectKey;
+  penguAutoConnectInFlight = true;
+  try {
+    if (plan.isHost) {
+      await createParty({ roomId: plan.roomId, displayName: plan.displayName });
+    } else {
+      await joinParty({ roomId: plan.roomId, displayName: plan.displayName });
+    }
+    state.penguAutoPartyRoom = plan.roomId;
+    if (els.penguLobbyLabel) {
+      els.penguLobbyLabel.textContent = `Auto-party Pengu activa: ${plan.roomId}.`;
+    }
+  } catch (error) {
+    penguLastAutoConnectKey = "";
+    if (els.penguLobbyLabel) {
+      els.penguLobbyLabel.textContent = `No pude conectar la auto-party Pengu: ${error.message}`;
+    }
+    schedulePenguAutoParty(2000);
+  } finally {
+    penguAutoConnectInFlight = false;
+    renderPenguBridgeStatus();
+  }
 };
 
 const addOverlayHistoryEntry = (items = []) => {
@@ -1595,7 +2638,7 @@ const renderOverlayHistory = () => {
     button.addEventListener("click", () => {
       const entry = state.overlayHistory.find((item) => item.id === button.dataset.id);
       if (!entry) return;
-      state.queuedSkins = new Set(entry.skinKeys);
+      state.queuedSkins = new Set(normalizeQueuedSkinKeys(entry.skinKeys));
       saveQueuedSkins();
       els.importStatusLabel.textContent = `Historial "${entry.name}" cargado.`;
     });
@@ -1605,18 +2648,22 @@ const renderOverlayHistory = () => {
 const renderCompactLauncher = () => {
   if (!els.compactPresetSelect) return;
   const selectedCount = state.queuedSkins.size;
+  const partyConnected = isPartyConnected();
   els.compactPresetSelect.innerHTML =
     '<option value="">Cola actual</option>' +
     state.presets.map((preset) => `<option value="${escapeHtml(preset.id)}">${escapeHtml(preset.name)} (${preset.skinKeys.length})</option>`).join("");
   if (els.compactStatusLabel) {
-    els.compactStatusLabel.textContent = `${selectedCount} mod(s) en cola${state.activePresetId ? " - preset activo disponible" : ""}.`;
+    els.compactStatusLabel.textContent = partyConnected
+      ? "Party activa: usa Aplicar party para ejecutar la combinacion sincronizada."
+      : `${selectedCount} mod(s) en cola${state.activePresetId ? " - preset activo disponible" : ""}.`;
   }
   if (els.compactOverlayPill) {
     els.compactOverlayPill.textContent = state.overlayRunning ? "Overlay activo" : "Sin overlay";
     els.compactOverlayPill.classList.toggle("active", state.overlayRunning);
   }
   if (els.compactRunButton) {
-    els.compactRunButton.disabled = selectedCount === 0 || state.importingQueue || state.overlayRunning;
+    els.compactRunButton.disabled = partyConnected || selectedCount === 0 || state.importingQueue || state.overlayRunning;
+    els.compactRunButton.title = partyConnected ? "Party activa: usa Aplicar party." : "";
   }
 };
 
@@ -1625,22 +2672,25 @@ const renderSelectionTray = () => {
   const queuedKeys = [...state.queuedSkins];
   const selected = queuedKeys.map(getSkinByKey).filter(Boolean);
   const selectedCount = queuedKeys.length;
+  const partyConnected = isPartyConnected();
   const activeP2PCount = queuedKeys.filter(isActivePartyP2PPath).length;
   const hasMissingSkins = selectedCount > selected.length;
   const hasAnythingToClear = selectedCount > 0 || state.managedSkins.size > 0;
-  els.selectionTraySummary.textContent = selectedCount
-    ? `${selectedCount} skin(s) listas para aplicar.`
-    : "No hay skins seleccionadas.";
+  els.selectionTraySummary.textContent = partyConnected
+    ? "Party activa: la seleccion se sincroniza con tu grupo."
+    : selectedCount
+      ? `${selectedCount} skin(s) listas para aparecer en LoL via Pengu.`
+      : "No hay skins seleccionadas.";
   document.querySelectorAll(".selection-action-bar").forEach((bar) => {
     bar.classList.toggle("has-selection", selectedCount > 0);
     bar.querySelector(".selection-selected-count").textContent = `${selectedCount} skin${selectedCount === 1 ? "" : "s"} seleccionada${selectedCount === 1 ? "" : "s"}`;
     bar.querySelector(".selection-selected-hint").textContent = selectedCount
       ? hasMissingSkins
-        ? "Algunas skins no se cargaron en la biblioteca."
+          ? "Algunas skins no se cargaron en la biblioteca."
         : activeP2PCount
           ? "Las skins P2P locales se pueden quitar de la cola manualmente."
-          : "Toca una miniatura para quitarla de la cola."
-      : "No hay skins en cola. Agregalas desde Skins o Party.";
+          : "Aparecen en champ select cuando Pengu detecta el campeon."
+      : "No hay skins en cola. Agregalas desde Mods propios o Descargas.";
 
     const applyButton = bar.querySelector(".selection-apply-button");
     const clearButton = bar.querySelector(".selection-clear-button");
@@ -1648,17 +2698,23 @@ const renderSelectionTray = () => {
     const stopButton = bar.querySelector(".selection-stop-button");
     const miniList = bar.querySelector(".selection-mini-list");
 
-    applyButton.textContent = selectedCount
-      ? state.overlayRunning
-        ? "Overlay activo"
-        : `Ejecutar ${selectedCount}`
-      : "Sin skins";
-    applyButton.disabled = selectedCount === 0 || state.importingQueue || state.overlayRunning;
-    applyButton.title = state.overlayRunning ? "Deten el overlay antes de ejecutar otra vez." : "";
+    applyButton.textContent = partyConnected
+      ? "Usa Apply Party"
+      : selectedCount
+        ? state.overlayRunning
+          ? "Overlay activo"
+          : `Ejecutar ${selectedCount}`
+        : "Sin skins";
+    applyButton.disabled = partyConnected || selectedCount === 0 || state.importingQueue || state.overlayRunning;
+    applyButton.title = partyConnected
+      ? "Party activa: usa Aplicar party para aplicar la cola sincronizada."
+      : state.overlayRunning
+        ? "Deten el overlay antes de ejecutar otra vez."
+        : "";
     clearButton.textContent = activeP2PCount ? "Limpiar no P2P" : "Limpiar todo";
     clearButton.disabled = !hasAnythingToClear || state.importingQueue;
     saveButton.disabled = selectedCount === 0 || state.importingQueue;
-    stopButton.disabled = state.importingQueue;
+    stopButton.disabled = !state.importingQueue && !state.overlayRunning;
 
     const queuedItems = queuedKeys.map((key) => getSkinByKey(key) || {
       path: key,
@@ -1670,7 +2726,7 @@ const renderSelectionTray = () => {
     miniList.innerHTML = queuedItems.map(renderSelectedMiniCard).join("");
     miniList.querySelectorAll(".selected-mini-card").forEach((button) => {
       button.addEventListener("click", () => {
-        state.queuedSkins.delete(button.dataset.path);
+        removeQueuedSkinKey(button.dataset.path);
         saveQueuedSkins();
       });
     });
@@ -1699,7 +2755,7 @@ const renderSelectionTray = () => {
 
   els.selectionTrayList.querySelectorAll(".selection-chip").forEach((button) => {
     button.addEventListener("click", () => {
-      state.queuedSkins.delete(button.dataset.path);
+      removeQueuedSkinKey(button.dataset.path);
       saveQueuedSkins();
     });
   });
@@ -1827,6 +2883,7 @@ const setDownloadButtonsState = () => {
   const busy = Boolean(state.activeDownloadType);
   const engineBusy = state.activeDownloadType === "engine";
   const leagueSkinsBusy = state.activeDownloadType === "league-skins";
+  const penguBusy = state.activeDownloadType === "pengu-loader";
 
   if (els.downloadCslolButton) {
     els.downloadCslolButton.disabled = busy;
@@ -1834,7 +2891,7 @@ const setDownloadButtonsState = () => {
   }
   if (els.downloadEngineButton) {
     els.downloadEngineButton.disabled = busy;
-    els.downloadEngineButton.textContent = engineBusy ? "Descargando..." : "Descargar engine + DLL";
+    els.downloadEngineButton.textContent = engineBusy ? "Descargando..." : "Descargar engine";
   }
   if (els.downloadLeagueSkinsButton) {
     els.downloadLeagueSkinsButton.disabled = busy;
@@ -1844,25 +2901,24 @@ const setDownloadButtonsState = () => {
     els.downloadLeagueSkinsButtonDownload.disabled = busy;
     els.downloadLeagueSkinsButtonDownload.textContent = leagueSkinsBusy ? "Descargando..." : "Descargar LeagueSkins";
   }
-  if (els.dllSourceSelect) els.dllSourceSelect.disabled = busy;
-  if (els.settingsDllSourceSelect) els.settingsDllSourceSelect.disabled = busy;
-};
-
-const normalizeDllDownloadSource = (source) => {
-  if (source === "bundled" || source === "ltk") return source;
-  return "cslol";
-};
-
-const setDllDownloadSource = (source) => {
-  state.dllDownloadSource = normalizeDllDownloadSource(source);
-  localStorage.setItem("riftAtlas:dllDownloadSource", state.dllDownloadSource);
-  if (els.dllSourceSelect) els.dllSourceSelect.value = state.dllDownloadSource;
-  if (els.settingsDllSourceSelect) els.settingsDllSourceSelect.value = state.dllDownloadSource;
+  if (els.downloadPenguLoaderButton) {
+    els.downloadPenguLoaderButton.disabled = busy;
+    els.downloadPenguLoaderButton.textContent = penguBusy ? "Descargando..." : "Instalar Pengu Loader";
+  }
+  if (els.launchPenguLoaderButton) {
+    els.launchPenguLoaderButton.disabled = busy;
+    els.launchPenguLoaderButton.textContent = "Activar Pengu Loader";
+  }
 };
 
 const beginDownload = (type) => {
   if (state.activeDownloadType) {
-    const label = state.activeDownloadType === "engine" ? "engine" : "LeagueSkins";
+    const labels = {
+      engine: "engine",
+      "league-skins": "LeagueSkins",
+      "pengu-loader": "Pengu Loader"
+    };
+    const label = labels[state.activeDownloadType] || state.activeDownloadType;
     const message = `Ya hay una descarga activa (${label}). Espera a que termine.`;
     if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
     setConfigStatus(message);
@@ -1880,7 +2936,11 @@ const finishDownload = () => {
 };
 
 const loadAppDataPath = async () => {
-  if (!els.appDataPathLabel || !window.riftAtlas.getUserDataPath) return;
+  if (!els.appDataPathLabel) return;
+  if (!window.riftAtlas.getUserDataPath) {
+    els.appDataPathLabel.textContent = "No disponible";
+    return;
+  }
   try {
     els.appDataPathLabel.textContent = await window.riftAtlas.getUserDataPath();
   } catch (error) {
@@ -1888,19 +2948,135 @@ const loadAppDataPath = async () => {
   }
 };
 
-const hideFirstDllModal = ({ remember = true } = {}) => {
+const loadAppVersion = async () => {
+  if (!els.updateStatusLabel || !els.updateDetailsLabel) return;
+  try {
+    const version = await window.riftAtlas.getAppVersion?.();
+    if (!version) return;
+    els.updateStatusLabel.textContent = `Version actual ${version}`;
+    els.updateDetailsLabel.textContent = "Usa Buscar para comprobar si hay una version nueva.";
+  } catch {
+    els.updateStatusLabel.textContent = "Version actual";
+    els.updateDetailsLabel.textContent = "Usa Buscar para comprobar actualizaciones.";
+  }
+};
+
+const loadPenguLoaderStatus = async () => {
+  if (!els.downloadPenguLoaderLabel || !window.riftAtlas.getPenguLoaderStatus) return;
+  try {
+    const status = await window.riftAtlas.getPenguLoaderStatus();
+    const setPenguText = (text) => {
+      if (els.downloadPenguLoaderLabel) els.downloadPenguLoaderLabel.textContent = text;
+      if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${text}`;
+    };
+    if (els.overlayLaunchPenguButton) {
+      els.overlayLaunchPenguButton.disabled = false;
+      els.overlayLaunchPenguButton.textContent = status.active ? "Reaplicar Pengu" : "Activar Pengu";
+    }
+    if (els.overlayDeactivatePenguButton) els.overlayDeactivatePenguButton.disabled = !status.active && !status.proxyInstalled;
+    if (status.active) {
+      const pathText = status.leagueClientPath || status.executablePath;
+      setPenguText(pathText
+        ? `Activo silencioso: ${pathText}`
+        : "Activo silencioso");
+      return;
+    }
+    if (status.disabled && status.proxyInstalled) {
+      setPenguText(status.executablePath
+        ? `Desactivado: ${status.executablePath}`
+        : "Desactivado");
+      return;
+    }
+    if (status.running) {
+      setPenguText(status.executablePath
+        ? `Ejecutandose: ${status.executablePath}`
+        : "Ejecutandose");
+      return;
+    }
+    setPenguText(status.executablePath
+      ? `Instalado: ${status.executablePath}`
+      : "No instalado en Rift Atlas. Usa Instalar Pengu Loader.");
+  } catch (error) {
+    const message = error.message || "No pude comprobar Pengu Loader.";
+    els.downloadPenguLoaderLabel.textContent = message;
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
+  }
+};
+
+const activatePenguFromUi = async () => {
+  try {
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = "Activando Pengu Loader...";
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = "Pengu Loader: activando...";
+    if (els.overlayLaunchPenguButton) els.overlayLaunchPenguButton.disabled = true;
+    await window.riftAtlas.installRiftAtlasPenguPlugin?.().catch(() => null);
+    const result = await window.riftAtlas.launchPenguLoader?.();
+    await window.riftAtlas.closePenguLoaderUi?.().catch(() => null);
+    await loadPenguLoaderStatus();
+    const message = result?.error
+      ? `No pude activar Pengu Loader: ${result.error}`
+      : result?.waitingForLeague
+        ? (result.message || "Abri League Client; Rift Atlas activara Pengu cuando detecte el lockfile.")
+      : result?.proxyInstalled === false
+        ? `Pengu Loader no quedo activo: ${result.proxyError || "falta d3d9.dll en League."}`
+        : result?.restartedClient
+          ? "Pengu Loader activado. League Client se reinicio para cargar Rift Atlas."
+          : result?.needsClientRestart
+            ? "Pengu Loader activado. Cierra y abre League Client si no aparece RA."
+            : "Pengu Loader activado. Abre League Client para ver RA.";
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
+  } catch (error) {
+    const message = error.message || "No pude activar Pengu Loader.";
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
+  } finally {
+    await loadPenguLoaderStatus();
+  }
+};
+
+const deactivatePenguFromUi = async () => {
+  try {
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = "Apagando Pengu Loader...";
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = "Pengu Loader: apagando...";
+    if (els.overlayDeactivatePenguButton) els.overlayDeactivatePenguButton.disabled = true;
+    const result = await window.riftAtlas.deactivatePenguLoader?.();
+    await window.riftAtlas.closePenguLoaderUi?.().catch(() => null);
+    await loadPenguLoaderStatus();
+    const message = result?.error
+      ? `No pude apagar Pengu Loader: ${result.error}`
+      : result?.proxyRemoved === false
+        ? `Pengu desactivado por config, pero no borre el proxy: ${result.proxyError || "revisa d3d9.dll."}`
+        : result?.restartedClient
+          ? "Pengu Loader apagado. League Client se reinicio sin plugin."
+          : result?.needsClientRestart
+            ? "Pengu Loader apagado. Cierra y abre League Client para descargarlo de esta sesion."
+            : "Pengu Loader apagado.";
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
+  } catch (error) {
+    const message = error.message || "No pude apagar Pengu Loader.";
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
+  } finally {
+    await loadPenguLoaderStatus();
+  }
+};
+
+const hideFirstDllModal = ({ remember = false } = {}) => {
   if (els.firstDllModal) els.firstDllModal.hidden = true;
   if (remember) localStorage.setItem("riftAtlas:firstDllNoticeShown", "1");
+  window.riftAtlasTutorial?.resumeAfterModal?.();
+  setTimeout(() => scheduleTutorialAutostart(), 250);
 };
 
 const showFirstDllModal = async (status = null) => {
   if (!els.firstDllModal) return;
+  window.riftAtlasTutorial?.pauseForModal?.();
   const dllStatus = status || await window.riftAtlas.getEngineDllStatus?.().catch(() => null);
   if (els.firstDllPathLabel) {
     els.firstDllPathLabel.textContent = dllStatus?.dllPath || "AppData\\Roaming\\Rift Atlas\\engine\\cslol-dll.dll";
   }
   els.firstDllModal.hidden = false;
-  await window.riftAtlas.openEngineFolder?.().catch(() => null);
 };
 
 const checkFirstDllNotice = async () => {
@@ -1931,7 +3107,7 @@ const renderUpdateStatus = (result = null, { hiddenByUser = false } = {}) => {
 
   if (result.hasUpdate && !hiddenByUser) {
     els.updateStatusLabel.textContent = `Nueva version ${result.latestVersion}`;
-    els.updateDetailsLabel.textContent = `Actual: ${result.currentVersion}. ${result.assetName ? `Descarga: ${result.assetName}.` : "Abre el release para descargar."}`;
+    els.updateDetailsLabel.textContent = `Actual: ${result.currentVersion}. ${result.assetName ? `Lista para descargar: ${result.assetName}.` : "El release no tiene instalador automatico."}`;
     setUpdatePanelVisible({ hasUpdate: true });
     if (els.updateHideCheckbox) els.updateHideCheckbox.checked = false;
     return;
@@ -1947,8 +3123,10 @@ const renderUpdateStatus = (result = null, { hiddenByUser = false } = {}) => {
 const checkForUpdates = async ({ manual = false } = {}) => {
   if (!window.riftAtlas.checkUpdates || !els.updateStatusLabel) return null;
   if (manual && els.updateHideCheckbox) els.updateHideCheckbox.checked = false;
-  els.updateStatusLabel.textContent = "Buscando actualizaciones...";
-  els.updateDetailsLabel.textContent = "Consultando GitHub Releases...";
+  if (manual) {
+    els.updateStatusLabel.textContent = "Buscando actualizaciones...";
+    els.updateDetailsLabel.textContent = "Consultando GitHub Releases...";
+  }
   if (els.checkUpdatesButton) els.checkUpdatesButton.disabled = true;
   try {
     const result = await window.riftAtlas.checkUpdates();
@@ -1963,6 +3141,40 @@ const checkForUpdates = async ({ manual = false } = {}) => {
     setUpdatePanelVisible({ hasUpdate: false });
     return null;
   } finally {
+    if (els.checkUpdatesButton) els.checkUpdatesButton.disabled = false;
+  }
+};
+
+const downloadAvailableUpdate = async () => {
+  const update = state.availableUpdate;
+  if (!update?.downloadUrl || !window.riftAtlas.downloadUpdate) {
+    if (update?.releaseUrl) await window.riftAtlas.openExternal(update.releaseUrl);
+    return;
+  }
+  if (els.updateDownloadButton) {
+    els.updateDownloadButton.disabled = true;
+    els.updateDownloadButton.textContent = "Descargando...";
+  }
+  if (els.updateDismissButton) els.updateDismissButton.disabled = true;
+  if (els.checkUpdatesButton) els.checkUpdatesButton.disabled = true;
+  if (els.updateStatusLabel) els.updateStatusLabel.textContent = `Descargando version ${update.latestVersion}...`;
+  if (els.updateDetailsLabel) els.updateDetailsLabel.textContent = "Rift Atlas va a reiniciarse para instalar sin abrir el instalador.";
+
+  try {
+    const result = await window.riftAtlas.downloadUpdate(update);
+    if (els.updateStatusLabel) els.updateStatusLabel.textContent = "Instalando actualizacion";
+    if (els.updateDetailsLabel) {
+      els.updateDetailsLabel.textContent = `Se descargo ${result.assetName || "la actualizacion"}. La app se va a cerrar y volver actualizada.`;
+    }
+    if (els.updateDownloadButton) els.updateDownloadButton.textContent = "Instalando...";
+  } catch (error) {
+    if (els.updateStatusLabel) els.updateStatusLabel.textContent = "Error descargando actualizacion";
+    if (els.updateDetailsLabel) els.updateDetailsLabel.textContent = error.message || "No se pudo instalar la actualizacion.";
+    if (els.updateDownloadButton) {
+      els.updateDownloadButton.disabled = false;
+      els.updateDownloadButton.textContent = "Actualizar";
+    }
+    if (els.updateDismissButton) els.updateDismissButton.disabled = false;
     if (els.checkUpdatesButton) els.checkUpdatesButton.disabled = false;
   }
 };
@@ -2007,27 +3219,29 @@ const autoConfigureOverlay = async ({ silent = false } = {}) => {
 
 const downloadCslolTools = async () => {
   if (!beginDownload("engine")) return;
-  const dllSource = normalizeDllDownloadSource(state.dllDownloadSource);
   if (els.downloadProgressLabel) {
-    const sourceLabel = dllSource === "bundled" ? "DLL incluido" : (dllSource === "ltk" ? "ltk-manager" : "cslol-manager");
-    els.downloadProgressLabel.textContent = `Iniciando descarga del engine con DLL desde ${sourceLabel}...`;
+    els.downloadProgressLabel.textContent = "Iniciando descarga del engine...";
   }
   if (els.importStatusLabel) {
     setConfigStatus("Descargando engine...");
   }
 
   try {
-    const result = await window.riftAtlas.downloadCslolTools({ dllSource });
+    const result = await window.riftAtlas.downloadCslolTools();
     if (result.enginePath) setLtkOverlaySidecarPath(result.enginePath);
     if (result.dllPath) setLtkOverlayDllPath(result.dllPath);
     if (els.downloadProgressLabel) {
-      els.downloadProgressLabel.textContent = result.dllPath
-        ? `Engine ${result.version} descargado. ${result.dllInstallMessage || "DLL lista."}`
-        : `Engine ${result.version} descargado y configurado. La DLL se extraera al ejecutar.`;
+      els.downloadProgressLabel.textContent = result.dllInstallMessage
+        ? `Engine ${result.version} descargado. ${result.dllInstallMessage}`
+        : `Engine ${result.version} descargado.`;
     }
     setConfigStatus(result.dllPath
       ? (result.dllInstallMessage || `Engine ${result.version} listo.`)
-      : `Engine ${result.version} listo. La DLL se extraera desde LTK al ejecutar si hace falta.`);
+      : `Engine ${result.version} listo. Selecciona cslol-dll.dll para copiarlo a la carpeta engine.`);
+    if (!result.dllPath) {
+      const dllStatus = await window.riftAtlas.getEngineDllStatus?.().catch(() => null);
+      await showFirstDllModal(dllStatus || { exists: false });
+    }
     await autoConfigureOverlay({ silent: true });
   } catch (error) {
     setConfigStatus(`Error descargando engine: ${error.message}`);
@@ -2055,6 +3269,29 @@ const loadDownloadedLeagueSkins = async () => {
     els.skinLibraryLabel.textContent = `Error descargando LeagueSkins: ${error.message}`;
     if (els.downloadProgressLabel) {
       els.downloadProgressLabel.textContent = `Error descargando LeagueSkins: ${error.message}`;
+    }
+  } finally {
+    finishDownload();
+  }
+};
+
+const downloadPenguLoader = async () => {
+  if (!beginDownload("pengu-loader")) return;
+  if (els.downloadProgressLabel) {
+    els.downloadProgressLabel.textContent = "Buscando Pengu Loader silencioso...";
+  }
+
+  try {
+    const result = await window.riftAtlas.downloadPenguLoader?.();
+    if (result?.executablePath && els.downloadPenguLoaderLabel) {
+      els.downloadPenguLoaderLabel.textContent = result.executablePath;
+    }
+    if (els.downloadProgressLabel) {
+      els.downloadProgressLabel.textContent = `Pengu Loader silencioso instalado${result?.version ? ` (${result.version})` : ""}. Plugin Rift Atlas instalado. Usa Activar antes de abrir League.`;
+    }
+  } catch (error) {
+    if (els.downloadProgressLabel) {
+      els.downloadProgressLabel.textContent = `Error instalando Pengu Loader: ${error.message}`;
     }
   } finally {
     finishDownload();
@@ -2278,8 +3515,8 @@ const renderDetail = (champion) => {
           </div>
         </article>
         ${spells
-          .map(
-            (spell) => `
+      .map(
+        (spell) => `
               <article class="spell-card">
                 <img src="${CDN}/cdn/${state.version}/img/spell/${spell.image.full}" alt="${spell.name}" />
                 <div>
@@ -2288,8 +3525,8 @@ const renderDetail = (champion) => {
                 </div>
               </article>
             `
-          )
-          .join("")}
+      )
+      .join("")}
       </div>
     </div>
   `;
@@ -2315,9 +3552,6 @@ const setView = (view) => {
     panel.classList.toggle("active", panel.id === `${view}View`);
   });
   els.championToolbar.hidden = view !== "champions";
-  if (view === "mods" && !state.skinLibrary.length) {
-    loadDownloadedLeagueSkinsFromDisk({ silent: true });
-  }
 };
 
 const closeIntroSidebar = () => {
@@ -2651,9 +3885,9 @@ const bindSkinLibraryActions = () => {
       const path = button.dataset.path;
       if (!path) return;
       if (state.queuedSkins.has(path)) {
-        state.queuedSkins.delete(path);
+        removeQueuedSkinKey(path);
       } else {
-        state.queuedSkins.add(path);
+        queueSkinKey(path);
       }
       saveQueuedSkins();
     });
@@ -2757,13 +3991,23 @@ const renderSkinLibrary = () => {
 
 const loadPresetToQueue = (preset = getActivePreset()) => {
   if (!preset) return;
-  state.queuedSkins = new Set(preset.skinKeys);
+  state.queuedSkins = new Set(normalizeQueuedSkinKeys(preset.skinKeys));
   saveQueuedSkins();
   if (els.presetStatusLabel) els.presetStatusLabel.textContent = `Preset "${preset.name}" cargado a la cola.`;
 };
 
-const applyQueuedSkins = async () => {
+const applyQueuedSkins = async (skinKeysOverride = null) => {
   if (state.importingQueue) return;
+  const isPartyApply = Array.isArray(skinKeysOverride);
+  if (isPartyConnected() && !isPartyApply) {
+    setOverlayPanelStatus({
+      label: "Party activa",
+      message: "Usa Aplicar party para ejecutar la seleccion sincronizada."
+    });
+    renderSelectionTray();
+    renderCompactLauncher();
+    return;
+  }
   if (state.overlayRunning) {
     setOverlayPanelStatus({
       label: "Overlay activo",
@@ -2772,11 +4016,12 @@ const applyQueuedSkins = async () => {
     });
     return;
   }
-  if (state.queuedSkins.size === 0) return;
+  const skinKeys = isPartyApply ? skinKeysOverride : [...state.queuedSkins];
+  if (skinKeys.length === 0) return;
   state.importingQueue = true;
   renderSkinLibrary();
 
-  const queued = [...state.queuedSkins].map(getSkinByKey).filter(Boolean);
+  const queued = skinKeys.map(getSkinByKey).filter(Boolean);
   const skinPaths = queued.map((s) => s.path).filter(Boolean);
 
   if (!skinPaths.length) {
@@ -2828,18 +4073,38 @@ const applyQueuedSkins = async () => {
   renderSkinLibrary();
 };
 
+const applyPartyQueue = async () => {
+  const readiness = getPartyReadiness();
+  const partyKeys = getPartyApplyKeys();
+  if (!readiness.allReady || !partyKeys.length) {
+    renderParty();
+    return;
+  }
+  await applyQueuedSkins(partyKeys);
+};
+
 const stopOverlayFromUi = async () => {
   try {
     const result = await window.riftAtlas.stopOverlay();
+    state.importingQueue = false;
+    state.overlayRunning = false;
     setOverlayPanelStatus({
       label: "Sin overlay",
       message: result.stopped ? "Overlay detenido." : "No habia overlay activo."
     });
     setConfigStatus(result.stopped ? "Overlay detenido." : "No habia overlay activo.");
+    renderSkinLibrary();
+    renderSelectionTray();
+    renderCompactLauncher();
+    renderParty();
     await refreshOverlayStatus();
   } catch (error) {
+    state.importingQueue = false;
     setOverlayPanelStatus({ label: "Error", message: error.message, error: true });
     setConfigStatus(error.message);
+    renderSkinLibrary();
+    renderSelectionTray();
+    renderCompactLauncher();
   }
 };
 
@@ -2871,6 +4136,7 @@ const refreshOverlayStatus = async () => {
     }
     if (wasRunning !== state.overlayRunning) {
       renderSelectionTray();
+      renderParty();
     }
     renderCompactLauncher();
   } catch {
@@ -2904,6 +4170,54 @@ const runDiagnostics = async () => {
   } catch (error) {
     if (els.diagnosticSummary) els.diagnosticSummary.textContent = "Error";
     els.diagnosticsList.innerHTML = `<div class="tier-empty">${escapeHtml(error.message)}</div>`;
+  }
+};
+
+const renderLeagueIssueRows = (items = [], label, mapper) => items
+  .map((item) => `
+    <article class="diagnostic-row bad">
+      <span>!</span>
+      <div>
+        <strong>${escapeHtml(label)}</strong>
+        <small>${escapeHtml(mapper(item))}</small>
+      </div>
+    </article>
+  `)
+  .join("");
+
+const runLeagueInstallCheck = async () => {
+  if (!els.leagueCheckList) return;
+  if (els.leagueCheckSummary) els.leagueCheckSummary.textContent = "Chequeando...";
+  if (els.leagueCheckDetails) els.leagueCheckDetails.textContent = state.leagueGamePath || "League no configurado";
+  els.leagueCheckList.innerHTML = '<div class="tier-empty">Revisando Data/FINAL...</div>';
+  try {
+    const result = await window.riftAtlas.checkLeagueInstall({
+      leagueGamePath: state.leagueGamePath
+    });
+    if (els.leagueCheckSummary) {
+      els.leagueCheckSummary.textContent = result.ok ? "League coincide" : "League con diferencias";
+    }
+    if (els.leagueCheckDetails) {
+      els.leagueCheckDetails.textContent = `${result.actualCount}/${result.expectedCount} archivos. Faltan ${result.missingCount}, distintos ${result.mismatchCount}, extras ${result.extraCount}.`;
+    }
+    const rows = [
+      renderLeagueIssueRows(result.missing || [], "Falta archivo", (item) => item.relativePath),
+      renderLeagueIssueRows(result.sizeMismatch || [], "Tamano distinto", (item) => `${item.relativePath} esperado ${formatBytes(item.expectedSize)} / actual ${formatBytes(item.actualSize)}`),
+      renderLeagueIssueRows(result.extra || [], "Archivo extra", (item) => item.relativePath)
+    ].join("");
+    els.leagueCheckList.innerHTML = rows || `
+      <article class="diagnostic-row ok">
+        <span>OK</span>
+        <div>
+          <strong>Data/FINAL</strong>
+          <small>${escapeHtml(result.finalDir)}</small>
+        </div>
+      </article>
+    `;
+  } catch (error) {
+    if (els.leagueCheckSummary) els.leagueCheckSummary.textContent = "Error";
+    if (els.leagueCheckDetails) els.leagueCheckDetails.textContent = error.message;
+    els.leagueCheckList.innerHTML = `<div class="tier-empty">${escapeHtml(error.message)}</div>`;
   }
 };
 
@@ -2997,6 +4311,12 @@ const bindEvents = () => {
 
   document.querySelectorAll(".nav-item").forEach((button) => {
     button.addEventListener("click", () => {
+      if (button.dataset.view === "help") {
+        tutorialAutoStarted = false;
+        forceStartTutorial({ reason: "help" });
+        closeIntroSidebar();
+        return;
+      }
       setView(button.dataset.view);
       closeIntroSidebar();
     });
@@ -3117,17 +4437,76 @@ const bindEvents = () => {
   });
 
   els.runDiagnosticsButton?.addEventListener("click", runDiagnostics);
+  els.checkLeagueInstallButton?.addEventListener("click", runLeagueInstallCheck);
 
   if (window.riftAtlas.onDownloadProgress) {
     window.riftAtlas.onDownloadProgress((payload) => {
       if (!payload || !payload.type) return;
-      if (state.activeDownloadType && payload.type !== state.activeDownloadType) return;
+      if (state.activeDownloadType && payload.type !== state.activeDownloadType && payload.type !== "app-update") return;
       const percentText = formatDownloadProgress(payload);
-      if (els.downloadProgressLabel && ["engine", "league-skins"].includes(payload.type)) {
+      if (els.downloadProgressLabel && ["engine", "league-skins", "pengu-loader"].includes(payload.type)) {
         els.downloadProgressLabel.textContent = `${payload.message || "Descargando..."}${percentText}`;
+      }
+      if (els.updateStatusLabel && payload.type === "app-update") {
+        els.updateStatusLabel.textContent = payload.message || "Descargando actualizacion...";
+        if (els.updateDetailsLabel) {
+          els.updateDetailsLabel.textContent = percentText
+            ? `Progreso:${percentText}`
+            : "Descargando instalador dentro de la app...";
+        }
       }
       if (els.configStatusLabel && payload.message) {
         els.configStatusLabel.textContent = payload.message;
+      }
+    });
+  }
+
+  if (window.riftAtlas.onPenguBridgeStatus) {
+    window.riftAtlas.onPenguBridgeStatus((payload = {}) => {
+      state.penguBridgeConnected = Boolean(payload.connected);
+      renderPenguBridgeStatus();
+      if (state.penguBridgeConnected) sendPenguSkinCatalog("bridge-connected");
+    });
+  }
+
+  if (window.riftAtlas.onPenguLobbyState) {
+    window.riftAtlas.onPenguLobbyState((payload = {}) => {
+      state.penguLobby = payload.hasLobby === false ? null : payload;
+      renderPenguBridgeStatus();
+      schedulePenguAutoParty();
+    });
+  }
+
+  if (window.riftAtlas.onPenguMessage) {
+    window.riftAtlas.onPenguMessage((payload = {}) => {
+      if (payload.source === "rift-atlas-app") return;
+      if (payload.type === "skin-catalog-request") {
+        sendPenguSkinCatalog("client-request");
+      }
+      if (payload.type === "phase-change") {
+        handlePenguPhaseChange(payload);
+      }
+      if (payload.type === "carousel-status") {
+        handlePenguCarouselStatus(payload);
+      }
+      if (payload.type === "skin-apply") {
+        handlePenguSkinApply(payload).catch((error) => {
+          window.riftAtlas.sendPenguMessage?.({
+            type: "skin-apply-result",
+            ok: false,
+            key: payload.key || payload.path,
+            message: error.message
+          }).catch(() => null);
+        });
+      }
+      if (payload.type === "skin-sync" || payload.type === "chroma-selection" || (payload.skin && !payload.type)) {
+        handlePenguSkinSync(payload).catch((error) => {
+          window.riftAtlas.sendPenguMessage?.({
+            type: "skin-apply-result",
+            ok: false,
+            message: error.message
+          }).catch(() => null);
+        });
       }
     });
   }
@@ -3152,7 +4531,7 @@ const bindEvents = () => {
     leaveParty();
   });
 
-  els.applyPartyButton?.addEventListener("click", applyQueuedSkins);
+  els.applyPartyButton?.addEventListener("click", applyPartyQueue);
 
   els.partyAutoApplyCheckbox?.addEventListener("change", (event) => {
     state.partyAutoApply = event.target.checked;
@@ -3161,13 +4540,20 @@ const bindEvents = () => {
     renderParty();
   });
 
+  els.penguAutoPartyCheckbox?.addEventListener("change", (event) => {
+    state.penguAutoParty = event.target.checked;
+    localStorage.setItem("riftAtlas:penguAutoParty", state.penguAutoParty ? "1" : "0");
+    renderPenguBridgeStatus();
+    schedulePenguAutoParty(100);
+  });
+
   els.skinsP2PSyncButton?.addEventListener("click", () => {
     syncPartySkins();
     requestMissingRoomFiles();
     renderParty();
   });
 
-  els.skinsP2PApplyButton?.addEventListener("click", applyQueuedSkins);
+  els.skinsP2PApplyButton?.addEventListener("click", applyPartyQueue);
 
   els.copyPartyLinkButton?.addEventListener("click", async () => {
     if (!state.partyLink) return;
@@ -3188,9 +4574,7 @@ const bindEvents = () => {
   });
 
   els.updateDownloadButton?.addEventListener("click", async () => {
-    const update = state.availableUpdate;
-    if (!update?.downloadUrl && !update?.releaseUrl) return;
-    await window.riftAtlas.openExternal(update.downloadUrl || update.releaseUrl);
+    await downloadAvailableUpdate();
   });
 
   els.updateDismissButton?.addEventListener("click", () => {
@@ -3199,14 +4583,6 @@ const bindEvents = () => {
       localStorage.setItem("riftAtlas:ignoredUpdateVersion", update.latestVersion);
     }
     renderUpdateStatus(update, { hiddenByUser: Boolean(update?.latestVersion && els.updateHideCheckbox?.checked) });
-  });
-
-  els.dllSourceSelect?.addEventListener("change", (event) => {
-    setDllDownloadSource(event.target.value);
-  });
-
-  els.settingsDllSourceSelect?.addEventListener("change", (event) => {
-    setDllDownloadSource(event.target.value);
   });
 
   els.downloadCslolButton?.addEventListener("click", () => {
@@ -3225,6 +4601,14 @@ const bindEvents = () => {
     loadDownloadedLeagueSkins();
   });
 
+  els.downloadPenguLoaderButton?.addEventListener("click", () => {
+    downloadPenguLoader();
+  });
+
+  els.launchPenguLoaderButton?.addEventListener("click", activatePenguFromUi);
+  els.overlayLaunchPenguButton?.addEventListener("click", activatePenguFromUi);
+  els.overlayDeactivatePenguButton?.addEventListener("click", deactivatePenguFromUi);
+
   els.openEngineFolderButton?.addEventListener("click", async () => {
     await window.riftAtlas.openEngineFolder?.();
   });
@@ -3234,21 +4618,20 @@ const bindEvents = () => {
   });
 
   els.firstDllDoneButton?.addEventListener("click", async () => {
-    const status = await window.riftAtlas.getEngineDllStatus?.().catch(() => null);
-    if (status?.exists) {
-      setLtkOverlayDllPath(status.dllPath);
+    try {
+      const installedPath = await window.riftAtlas.selectBocchiDll?.();
+      if (!installedPath) return;
+      setLtkOverlayDllPath(installedPath);
       hideFirstDllModal();
-      setConfigStatus("DLL detectada correctamente.");
-      return;
+      setConfigStatus("DLL instalada por Rift Atlas.");
+      await autoConfigureOverlay({ silent: true });
+    } catch (error) {
+      setConfigStatus(error.message || "No pude instalar el DLL.");
     }
-    if (els.firstDllPathLabel) {
-      els.firstDllPathLabel.textContent = status?.dllPath || "Todavia no encontre cslol-dll.dll.";
-    }
-    setConfigStatus("Todavia no encontre cslol-dll.dll en la carpeta engine.");
   });
 
   els.firstDllLaterButton?.addEventListener("click", () => {
-    hideFirstDllModal();
+    hideFirstDllModal({ remember: true });
   });
 
   els.openDllFolderButton?.addEventListener("click", async () => {
@@ -3259,6 +4642,16 @@ const bindEvents = () => {
     await revealPath(state.skinLibraryPath);
   });
 
+  els.openPenguLoaderFolderButton?.addEventListener("click", async () => {
+    try {
+      const folderPath = await window.riftAtlas.openPenguLoaderFolder?.();
+      if (els.downloadPenguLoaderLabel) els.downloadPenguLoaderLabel.textContent = folderPath;
+      if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = "Carpeta de Pengu Loader abierta.";
+    } catch (error) {
+      if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = error.message || "No pude abrir la carpeta de Pengu.";
+    }
+  });
+
   els.openAppDataFolderButton?.addEventListener("click", async () => {
     try {
       const folderPath = await window.riftAtlas.openUserDataPath();
@@ -3266,6 +4659,20 @@ const bindEvents = () => {
       setConfigStatus("Directorio de la app abierto.");
     } catch (error) {
       setConfigStatus(error.message || "No se pudo abrir el directorio de la app.");
+    }
+  });
+
+  els.factoryResetButton?.addEventListener("click", async () => {
+    const confirmed = window.confirm("Esto va a borrar configuracion, skins descargadas, engine, DLL, P2P, presets y cache de Rift Atlas. La app se cerrara y volvera a abrir limpia. Queres continuar?");
+    if (!confirmed) return;
+    try {
+      els.factoryResetButton.disabled = true;
+      setConfigStatus("Restableciendo Rift Atlas...");
+      localStorage.clear();
+      await window.riftAtlas.factoryReset?.();
+    } catch (error) {
+      els.factoryResetButton.disabled = false;
+      setConfigStatus(error.message || "No pude restablecer Rift Atlas.");
     }
   });
 
@@ -3475,6 +4882,9 @@ const loadChampions = async () => {
   renderBuildChampionOptions();
   updateBuildView();
   loadTierLane();
+  renderCustomMods();
+  renderSelectionTray();
+  sendPenguSkinCatalog("champions-loaded");
 
   if (state.champions.length > 0) {
     selectChampion(state.champions[0].id).catch(showError);
@@ -3503,8 +4913,96 @@ const showError = (error) => {
   `;
 };
 
+let tutorialAutoStarted = false;
+let tutorialAutoStartScheduled = false;
+const hasLocalTutorialSeen = () =>
+  localStorage.getItem("riftAtlas:tutorialIntroSeen:v2") === "1" ||
+  localStorage.getItem("riftAtlas:tutorialIntroDisabled") === "1";
+
+const logTutorial = (payload = {}) => {
+  const entry = {
+    at: new Date().toISOString(),
+    ...payload
+  };
+  window.__riftAtlasTutorialLastLog = entry;
+};
+
+const setTutorialDebug = (patch = {}) => {
+  window.__riftAtlasTutorialDebug = {
+    ...(window.__riftAtlasTutorialDebug || {}),
+    updatedAt: new Date().toISOString(),
+    ...patch
+  };
+  logTutorial(window.__riftAtlasTutorialDebug);
+};
+
+const forceStartTutorial = ({ attempt = 0, reason = "auto" } = {}) => {
+  setTutorialDebug({ attempt, reason, hasStarter: Boolean(window.startRiftAtlasTutorial) });
+  if (tutorialAutoStarted) return true;
+  if (!window.startRiftAtlasTutorial) {
+    if (attempt < 12) setTimeout(() => forceStartTutorial({ attempt: attempt + 1, reason }), 500);
+    return false;
+  }
+  if (els.firstDllModal && !els.firstDllModal.hidden) {
+    setTutorialDebug({ attempt, reason, waitingFor: "first-dll-modal" });
+    if (attempt < 12) setTimeout(() => forceStartTutorial({ attempt: attempt + 1, reason }), 700);
+    return false;
+  }
+  const started = window.startRiftAtlasTutorial(setView, {
+    force: true,
+    showIntroControls: true
+  });
+  setTutorialDebug({ attempt, reason, started });
+  if (started) {
+    tutorialAutoStarted = true;
+    window.riftAtlas.markFirstRunComplete?.().catch(() => null);
+    return true;
+  }
+  if (attempt < 12) setTimeout(() => forceStartTutorial({ attempt: attempt + 1, reason }), 700);
+  return false;
+};
+
+const getTutorialAutostartReason = async () => {
+  const flags = await window.riftAtlas.getStartupFlags?.().catch(() => null);
+  setTutorialDebug({ flags, localSeen: hasLocalTutorialSeen() });
+  if (flags?.showTutorial) return "post-reset";
+  if (flags?.firstRun) return "first-run-main";
+  if (!hasLocalTutorialSeen()) return "first-run-local";
+  return "";
+};
+
+const scheduleTutorialAutostart = async () => {
+  logTutorial({ message: "schedule requested", tutorialAutoStartScheduled, tutorialAutoStarted });
+  if (tutorialAutoStartScheduled || tutorialAutoStarted) return;
+  tutorialAutoStartScheduled = true;
+  const reason = await getTutorialAutostartReason();
+  if (!reason) {
+    setTutorialDebug({ skipped: "already-seen" });
+    tutorialAutoStartScheduled = false;
+    return;
+  }
+  localStorage.removeItem("riftAtlas:tutorialIntroSeen");
+  localStorage.removeItem("riftAtlas:tutorialIntroSeen:v2");
+  localStorage.removeItem("riftAtlas:tutorialIntroDisabled");
+  [400, 1200, 2400, 4200, 6500].forEach((delay, index) => {
+    setTimeout(() => forceStartTutorial({ attempt: index, reason }), delay);
+  });
+};
+
+const startTutorialFromMainEvent = (flags = {}) => {
+  setTutorialDebug({ event: "app:start-tutorial", flags });
+  tutorialAutoStartScheduled = false;
+  localStorage.removeItem("riftAtlas:tutorialIntroSeen");
+  localStorage.removeItem("riftAtlas:tutorialIntroSeen:v2");
+  localStorage.removeItem("riftAtlas:tutorialIntroDisabled");
+  [200, 700, 1400, 2600, 4200, 6500].forEach((delay, index) => {
+    setTimeout(() => forceStartTutorial({ attempt: index, reason: flags.showTutorial ? "post-reset-main-event" : "first-run-main-event" }), delay);
+  });
+};
+
+window.riftAtlas.onStartTutorial?.(startTutorialFromMainEvent);
+
 bindEvents();
-setDllDownloadSource("bundled");
 loadLtkOverlayPaths();
 setLeagueGamePath(state.leagueGamePath);
 autoConfigureOverlay({ silent: true });
@@ -3516,11 +5014,16 @@ renderParty();
 loadApiKeyStatus();
 loadAppVersion();
 loadAppDataPath();
+loadPenguLoaderStatus();
 setTimeout(() => {
-  checkFirstDllNotice();
-}, 700);
-setTimeout(() => {
+  loadPenguLoaderStatus();
   checkForUpdates({ manual: false });
+}, 1200);
+window.addEventListener("load", () => {
+  scheduleTutorialAutostart();
+});
+setTimeout(() => {
+  scheduleTutorialAutostart();
 }, 1200);
 refreshOverlayStatus();
 loadChampions().catch(showError);

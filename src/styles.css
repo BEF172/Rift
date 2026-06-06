@@ -1604,6 +1604,31 @@ body {
   white-space: nowrap;
 }
 
+.manager-panel small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.danger-panel {
+  border-color: rgba(216, 97, 85, 0.55);
+  background: rgba(216, 97, 85, 0.08);
+}
+
+.danger-panel strong {
+  color: #ffb0a8;
+}
+
+.danger-button {
+  border-color: rgba(216, 97, 85, 0.8);
+  color: #ffd2cd;
+}
+
+.danger-button:hover {
+  border-color: var(--danger);
+  background: rgba(216, 97, 85, 0.16);
+}
+
 .manager-panel select {
   min-width: 220px;
   height: 38px;
@@ -2936,6 +2961,103 @@ body {
 
 .diagnostic-row.bad > span {
   color: #ff9187;
+}
+
+.driver-popover {
+  max-width: min(360px, calc(100vw - 32px));
+  border: 1px solid var(--line);
+  background: #101a22;
+  color: var(--text);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+
+.driver-popover-title {
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.driver-popover-description {
+  color: #bfd5df;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.driver-popover-close-btn {
+  color: var(--muted);
+}
+
+.driver-popover-arrow-side-left.driver-popover-arrow,
+.driver-popover-arrow-side-right.driver-popover-arrow,
+.driver-popover-arrow-side-top.driver-popover-arrow,
+.driver-popover-arrow-side-bottom.driver-popover-arrow {
+  border-color: #101a22;
+}
+
+.driver-popover-footer {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.driver-popover-progress-text {
+  min-width: 48px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.driver-popover-navigation-btns {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.driver-popover-prev-btn,
+.driver-popover-next-btn,
+.tutorial-skip-button {
+  min-height: 32px;
+  border: 1px solid var(--line) !important;
+  background: #0b141d !important;
+  color: var(--text) !important;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.driver-popover-next-btn {
+  border-color: rgba(240, 200, 104, 0.65) !important;
+  background: var(--accent) !important;
+  color: #061018 !important;
+}
+
+.tutorial-intro-controls {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.tutorial-intro-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tutorial-intro-check input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 @media (max-width: 1180px) {

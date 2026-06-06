@@ -1,6 +1,6 @@
 {
   "name": "lol-companion-electron",
-  "version": "1.0.0",
+  "version": "1.1.3",
   "description": "Aplicacion Electron de League of Legends basada en Data Dragon.",
   "main": "main.js",
   "scripts": {
@@ -23,28 +23,42 @@
     "directories": {
       "output": "dist"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "BEF172",
+        "repo": "Rift"
+      }
+    ],
     "files": [
       "main.js",
       "preload.js",
+      "tutorial.js",
       "assets/**/*",
+      "pengu/**/*",
       "src/**/*",
       "package.json"
     ],
     "asarUnpack": [
       "node_modules/7z-wasm/**/*",
-      "assets/cslol-dll.dll"
+      "assets/cslol-dll.dll",
+      "pengu/**/*"
     ],
     "win": {
       "icon": "assets/icon.ico",
+      "requestedExecutionLevel": "requireAdministrator",
       "target": [
         "nsis"
       ]
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": true,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "include": "build/installer.nsh"
     }
   },
   "devDependencies": {
@@ -53,8 +67,11 @@
   },
   "dependencies": {
     "7z-wasm": "^1.2.0",
+    "driver.js": "^1.4.0",
+    "electron-updater": "^6.8.3",
     "extract-zip": "^2.0.1",
     "peerjs": "^1.5.5",
+    "ws": "^8.21.0",
     "yauzl": "^3.3.2"
   }
 }

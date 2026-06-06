@@ -1,124 +1,55 @@
-# Rift Atlas
+# Rift Atlas - Instalación y Uso Básico
 
-Aplicacion de escritorio para League of Legends hecha con Electron. Rift Atlas permite descargar herramientas, indexar LeagueSkins, seleccionar skins/mods, aplicar el overlay y sincronizar archivos entre amigos con Party P2P.
+## 1. Instalar
 
-## Funciones principales
+Descargá e instalá Rift Atlas.
 
-- Descarga de engine y DLL desde la pantalla Descargas.
-- Soporte para DLL incluido con la app en `assets/cslol-dll.dll`.
-- Configuracion de `League of Legends.exe`.
-- Indexado local de LeagueSkins.
-- Carga de mods propios `.fantome`, `.zip`, `.rse`, `.wad` y `.wad.client`.
-- Generacion local de `.fantome` para paquetes LeagueSkins con WAD mini.
-- Overlay con `ltk-manager.exe`, `mkoverlay` y patcher.
-- Cache de overlay para acelerar ejecuciones repetidas.
-- Diagnostico de instalacion, engine, DLL, League y prueba basica de DLL.
-- Party P2P para compartir mods entre miembros de una sala.
-- Carpeta temporal P2P en `AppData\Roaming\Rift Atlas\p2p`, limpiada al salir de party.
+## 2. Descargar archivos
 
-## Uso basico
+En **Descargas** bajá:
 
-1. Abri Rift Atlas.
-2. Entra a **Descargas**.
-3. Selecciona la fuente del DLL. Por defecto se usa **Incluido con Rift Atlas**.
-4. Descarga **engine + DLL**.
-5. Descarga **LeagueSkins** si queres usar la biblioteca automatica.
-6. En **Configuracion**, usa **Detectar** o configura manualmente la ruta de League.
-7. La ruta correcta debe apuntar a:
+✅ Engine + DLL
+✅ Skins de LeagueSkins
 
-```text
-C:\Riot Games\League of Legends\Game\League of Legends.exe
-```
+## 3. Detectar League
+
+Andá a:
+
+**Configuración → Configuración → Detectar**
+
+La ruta debe apuntar a:
+
+`C:\Riot Games\League of Legends\Game\League of Legends.exe`
 
 No uses `LeagueClient.exe`.
 
-8. En **Skins**, selecciona skins/mods.
-9. Toca **Aplicar**.
-10. Deja Rift Atlas abierto y entra a partida.
+## 4. Seleccionar skins
 
-## DLL incluido
+Entrá a **Skins** y elegí las skins/mods que quieras usar.
 
-Si queres que la app venga con un DLL interno, coloca el archivo en:
+## 5. Ejecutar
 
-```text
-assets\cslol-dll.dll
-```
+Presioná **Ejecutar**.
 
-Ese archivo no esta incluido por defecto en el repositorio. Al compilar, Electron Builder lo deja fuera del `asar` mediante:
+## 6. Esperar
 
-```json
-"asarUnpack": [
-  "node_modules/7z-wasm/**/*",
-  "assets/cslol-dll.dll"
-]
-```
+Estado en la parte superior:
 
-Cuando el usuario descarga el engine usando la fuente **Incluido con Rift Atlas**, la app copia ese DLL hacia:
+🟡 **Cargando** → Esperá.
+🟢 **Overlay Activo** → Entrá a partida.
 
-```text
-AppData\Roaming\Rift Atlas\engine\cslol-dll.dll
-```
+## 7. Jugar
 
-## Party P2P
+Dejá Rift Atlas abierto mientras jugás.
 
-Party permite crear una sala o entrar con un codigo para compartir mods seleccionados.
+## Descripción
 
-- Los archivos recibidos se guardan en `AppData\Roaming\Rift Atlas\p2p`.
-- Al salir de party se borran los archivos P2P locales.
-- Mientras estas en party, los P2P activos quedan seleccionados automaticamente para el overlay.
-- La seccion **Skins > P2P** aparece solo cuando estas conectado.
-- El boton **Limpiar no P2P** limpia la seleccion normal, pero conserva los P2P activos.
+Rift Atlas es una aplicación de escritorio para League of Legends que ayuda a gestionar engine, DLL, LeagueSkins y mods desde una interfaz local.
 
-## Desarrollo
-
-Instalar dependencias:
-
-```bash
-npm install
-```
-
-Ejecutar en desarrollo:
-
-```bash
-npm start
-```
-
-Validar sintaxis:
-
-```bash
-npm run check
-```
-
-Compilar instalador Windows:
-
-```bash
-npm run dist
-```
-
-El instalador queda en:
-
-```text
-dist\Rift Atlas Setup 1.0.0.exe
-```
-
-## Git
-
-El repositorio ignora:
-
-```text
-node_modules/
-dist/
-package-lock.json
-```
-
-Para publicar una build, subi el instalador a un host externo o a GitHub Releases. No subas `dist` ni `node_modules` al repositorio.
-
-## Fuentes externas
-
-- Hitori Bocchi engine: https://github.com/hitori-rebocchi/hitori-bocchi
-- LeagueToolkit cslol-manager: https://github.com/LeagueToolkit/cslol-manager
-- LeagueToolkit ltk-manager: https://github.com/LeagueToolkit/ltk-manager
-- LeagueSkins: https://github.com/Alban1911/LeagueSkins
+- Configura League y la DLL.
+- Indexa LeagueSkins locales.
+- Aplica skins y mods a cslol.
+- Ejecuta el overlay desde la app.
 
 ## Aviso
 

@@ -1,697 +1,751 @@
 <!doctype html>
 <html lang="es">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://ddragon.leagueoflegends.com https://0.peerjs.com wss://0.peerjs.com; img-src 'self' https://ddragon.leagueoflegends.com data:; style-src 'self'; script-src 'self';" />
-    <title>Rift Atlas</title>
-    <link rel="icon" href="../assets/icon.png" />
-    <link rel="stylesheet" href="./styles.css" />
-  </head>
-  <body>
-    <div class="app-shell">
-      <aside class="sidebar is-open">
-        <div class="brand">
-          <img class="brand-mark" src="../assets/icon.png" alt="Rift Atlas" />
-          <div>
-            <h1>Rift Atlas</h1>
-            <p>Companion de campeones</p>
-          </div>
-        </div>
 
-        <nav class="nav-list" aria-label="Secciones">
-          <button class="nav-item active" type="button" data-view="champions">Campeones</button>
-          <button class="nav-item" type="button" data-view="build">Build</button>
-          <button class="nav-item" type="button" data-view="mods">Skins</button>
-          <button class="nav-item" type="button" data-view="party">Party</button>
-          <button class="nav-item" type="button" data-view="overlay">Overlay</button>
-          <button class="nav-item" type="button" data-view="downloads">Descargas</button>
-          <button class="nav-item" type="button" data-view="settings">Configuracion</button>
-        </nav>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; connect-src 'self' https://ddragon.leagueoflegends.com https://0.peerjs.com wss://0.peerjs.com; img-src 'self' https://ddragon.leagueoflegends.com data:; style-src 'self'; script-src 'self';" />
+  <title>Rift Atlas</title>
+  <link rel="icon" href="../assets/icon.png" />
+  <link rel="stylesheet" href="../node_modules/driver.js/dist/driver.css" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
 
-        <section class="status-panel">
-          <span>Parche</span>
-          <strong id="patchLabel">Cargando...</strong>
-          <p>Datos oficiales de Data Dragon.</p>
-        </section>
-
-        <p class="legal">
-          Rift Atlas is not endorsed by Riot Games and does not reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games and all associated properties are trademarks or registered trademarks of Riot Games, Inc.
-        </p>
-      </aside>
-
-      <main class="main-content">
-        <section id="championToolbar" class="toolbar" aria-label="Filtros de campeones">
-          <div class="search-wrap">
-            <label for="searchInput">Buscar</label>
-            <input id="searchInput" type="search" placeholder="Nombre, titulo o rol" autocomplete="off" />
-          </div>
-
-          <div class="filter-group" role="group" aria-label="Rol">
-            <button type="button" class="filter-pill active" data-role="all">Todos</button>
-            <button type="button" class="filter-pill" data-role="Fighter">Fighters</button>
-            <button type="button" class="filter-pill" data-role="Mage">Mages</button>
-            <button type="button" class="filter-pill" data-role="Marksman">Marksmen</button>
-            <button type="button" class="filter-pill" data-role="Assassin">Assassins</button>
-            <button type="button" class="filter-pill" data-role="Tank">Tanks</button>
-            <button type="button" class="filter-pill" data-role="Support">Supports</button>
-          </div>
-        </section>
-
-        <section id="championsView" class="content-view active">
-          <section class="tier-panel">
-            <div class="panel-heading">
-              <div>
-                <h2>Tier list por linea</h2>
-                <p id="tierMeta">Stats comunitarias, cargando datos...</p>
-              </div>
-              <button id="refreshTiersButton" class="secondary-button" type="button">Actualizar</button>
-            </div>
-            <div class="lane-tabs" role="group" aria-label="Lineas">
-              <button class="lane-tab active" type="button" data-lane="top">Top</button>
-              <button class="lane-tab" type="button" data-lane="jungle">Jungla</button>
-              <button class="lane-tab" type="button" data-lane="middle">Mid</button>
-              <button class="lane-tab" type="button" data-lane="bottom">ADC</button>
-              <button class="lane-tab" type="button" data-lane="support">Support</button>
-            </div>
-            <div class="tier-head">
-              <span>#</span>
-              <span>Campeon</span>
-              <span>Tier</span>
-              <span>WR</span>
-              <span>PR</span>
-              <span>BR</span>
-              <span>Games</span>
-            </div>
-            <div id="tierGrid" class="tier-grid" aria-live="polite"></div>
-          </section>
-          <div class="grid-layout">
-            <section class="champion-list-panel">
-              <div class="panel-heading">
-                <h2>Campeones</h2>
-                <span id="countLabel">0</span>
-              </div>
-              <div id="championGrid" class="champion-grid" aria-live="polite"></div>
-            </section>
-
-            <section id="championDetail" class="detail-panel" aria-live="polite">
-              <div class="empty-state">
-                <h2>Selecciona un campeon</h2>
-                <p>Explora habilidades, estadisticas y roles con datos publicos de Riot Data Dragon.</p>
-              </div>
-            </section>
-          </div>
-        </section>
-
-        <section id="buildView" class="content-view">
-          <div class="builds-layout">
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Build</h2>
-                  <p id="buildStatusLabel">Busca un campeon y elegi donde ver runas, items y orden de habilidades.</p>
-                </div>
-                <button id="openBuildExternalButton" class="secondary-button" type="button">Abrir build</button>
-              </div>
-              <form id="buildSearchForm" class="build-search-form">
-                <div class="search-wrap wide">
-                  <label for="buildChampionInput">Campeon</label>
-                  <input id="buildChampionInput" list="buildChampionList" type="search" placeholder="Aatrox, Ahri, Neeko..." autocomplete="off" />
-                  <datalist id="buildChampionList"></datalist>
-                </div>
-                <div class="search-wrap narrow">
-                  <label for="buildSourceSelect">Fuente</label>
-                  <select id="buildSourceSelect">
-                    <option value="metasrc">MetaSRC</option>
-                    <option value="opgg">OP.GG</option>
-                  </select>
-                </div>
-                <div class="search-wrap narrow">
-                  <label for="buildRegionSelect">Region</label>
-                  <select id="buildRegionSelect">
-                    <option value="">Global</option>
-                    <option value="las">LAS</option>
-                    <option value="lan">LAN</option>
-                    <option value="na">NA</option>
-                    <option value="br">BR</option>
-                    <option value="euw">EUW</option>
-                    <option value="eune">EUNE</option>
-                    <option value="kr">KR</option>
-                  </select>
-                </div>
-                <button class="docs-link form-button" type="submit">Buscar build</button>
-              </form>
-            </section>
-
-            <section class="page-panel build-preview-panel">
-              <div class="build-preview-card">
-                <span id="buildSelectedSource" class="build-preview-kicker">MetaSRC</span>
-                <h3 id="buildSelectedTitle">Build lista para abrir</h3>
-                <p id="buildSelectedDescription">Rift Atlas prepara el enlace correcto y lo abre en tu navegador para evitar bloqueos dentro de Electron.</p>
-                <code id="buildSelectedUrl" class="build-url">https://www.metasrc.com/lol/build</code>
-                <button id="openBuildExternalButtonInline" class="docs-link" type="button">Abrir build</button>
-              </div>
-            </section>
-          </div>
-        </section>
-
-        <section id="modsView" class="content-view">
-          <div class="mods-layout">
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Skins</h2>
-                  <p>Elige skins, filtra paquetes y revisa detalles antes de enviarlos al overlay.</p>
-                </div>
-                <button class="secondary-button nav-shortcut" type="button" data-view-target="overlay">Abrir overlay</button>
-              </div>
-              <div class="overlay-status-card skins-overlay-status">
-                <span class="overlay-kicker">Estado actual</span>
-                <div class="overlay-status-line">
-                  <strong id="skinsOverlayStatusLabel">Sin overlay</strong>
-                  <span id="skinsOverlayStatusIndicator" class="overlay-dot"></span>
-                </div>
-                <p id="skinsOverlayStatusMessage">Listo para seleccionar skins.</p>
-                <small>Cuando ejecutes, deja abierto Rift Atlas y entra a partida para ver las skins.</small>
-              </div>
-            </section>
-
-            <section class="page-panel utility-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Inventario local</h2>
-                  <p id="modsFolderLabel">Selecciona una carpeta para listar paquetes .fantome, .zip o .rse.</p>
-                </div>
-                <button id="selectModsFolderButton" class="docs-link" type="button">Seleccionar carpeta</button>
-              </div>
-              <div id="modsPackageList" class="mods-package-list">
-                <div class="empty-state compact">
-                  <h2>Sin carpeta seleccionada</h2>
-                  <p>La app solo lista archivos locales; no instala ni ejecuta mods.</p>
-                </div>
-              </div>
-            </section>
-
-            <section id="skinsP2PSection" class="page-panel skins-p2p-section" hidden>
-              <div class="panel-heading">
-                <div>
-                  <h2>P2P</h2>
-                  <p id="skinsP2PLabel">Sin party conectada.</p>
-                </div>
-                <div class="heading-actions">
-                  <button id="skinsP2PSyncButton" class="secondary-button" type="button">Sincronizar</button>
-                  <button id="skinsP2PApplyButton" class="docs-link" type="button">Aplicar party</button>
-                </div>
-              </div>
-              <div id="skinsP2PList" class="skins-p2p-list">
-                <div class="empty-state compact">
-                  <h2>Sin archivos P2P</h2>
-                  <p>Cuando estes en party, aca aparecen los archivos sincronizados.</p>
-                </div>
-              </div>
-            </section>
-
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Mods propios</h2>
-                  <p id="customModsLabel">Agrega .fantome, .zip, .rse, .wad o .wad.client tuyos. Sirve para skins, fonts, mapas y otros mods locales.</p>
-                </div>
-                <div class="heading-actions">
-                  <button id="addCustomModFilesButton" class="secondary-button" type="button">Agregar archivos</button>
-                  <button id="addCustomModFolderButton" class="docs-link" type="button">Agregar carpeta</button>
-                </div>
-              </div>
-              <div id="customModsList" class="custom-mods-list">
-                <div class="empty-state compact">
-                  <h2>Sin mods propios</h2>
-                  <p>Agrega paquetes locales que no formen parte de LeagueSkins.</p>
-                </div>
-              </div>
-            </section>
-
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>LeagueSkins local</h2>
-                  <p id="skinLibraryLabel">Selecciona una carpeta clonada/descargada de LeagueSkins para gestionar tu biblioteca.</p>
-                </div>
-                <div class="heading-actions">
-                  <button id="downloadLeagueSkinsButton" class="secondary-button" type="button">Descargar LeagueSkins</button>
-                  <button id="selectSkinLibraryButton" class="docs-link" type="button">Seleccionar LeagueSkins</button>
-                </div>
-              </div>
-              <div class="library-toolbar">
-                <div class="search-wrap">
-                  <label for="skinSearchInput">Filtrar skins</label>
-                  <input id="skinSearchInput" type="search" placeholder="Campeon o skin" autocomplete="off" />
-                </div>
-                <div class="search-wrap narrow">
-                  <label for="skinChampionSelect">Campeon</label>
-                  <select id="skinChampionSelect">
-                    <option value="all">Todos</option>
-                  </select>
-                </div>
-                <div class="search-wrap narrow">
-                  <label for="skinTypeSelect">Tipo</label>
-                  <select id="skinTypeSelect">
-                    <option value="all">Todos</option>
-                    <option value=".fantome">Fantome</option>
-                    <option value=".zip">Zip</option>
-                    <option value=".rse">RSE</option>
-                    <option value=".wad">WAD</option>
-                    <option value=".wad.client">WAD client</option>
-                  </select>
-                </div>
-                <div class="search-wrap narrow">
-                  <label for="skinStateSelect">Estado</label>
-                  <select id="skinStateSelect">
-                    <option value="all">Todos</option>
-                    <option value="queued">Seleccionadas</option>
-                    <option value="favorites">Favoritas</option>
-                    <option value="with-image">Con imagen</option>
-                    <option value="missing-image">Sin imagen</option>
-                  </select>
-                </div>
-                <div class="queue-actions">
-                  <span id="managedSkinsCount">0 gestionadas</span>
-                  <span id="queuedSkinsCount">0 seleccionadas</span>
-                  <button id="clearQueueButton" class="secondary-button" type="button">Limpiar todo</button>
-                </div>
-              </div>
-              <div class="skin-workspace">
-                <div class="skin-main-column">
-                  <div id="skinLibraryList" class="skin-library-list">
-                    <div class="empty-state compact">
-                      <h2>Sin biblioteca</h2>
-                      <p>Selecciona la carpeta LeagueSkins para indexar paquetes .fantome.</p>
-                    </div>
-                  </div>
-                </div>
-                <aside id="skinProfilePanel" class="skin-profile-panel">
-                  <div class="empty-state compact">
-                    <h2>Sin skin seleccionada</h2>
-                    <p>Toca una card para ver su perfil y acciones rapidas.</p>
-                  </div>
-                </aside>
-              </div>
-              <div class="selection-tray">
-                <div>
-                  <strong>Seleccion</strong>
-                  <span id="selectionTraySummary">No hay skins seleccionadas.</span>
-                </div>
-                <div id="selectionTrayList" class="selection-tray-list"></div>
-              </div>
-            </section>
-
-          </div>
-          <div id="skinsSelectionActionBar" class="selection-action-bar">
-            <div class="selection-action-top">
-              <div class="selection-action-count">
-                <strong class="selection-selected-count"></strong>
-                <span class="selection-selected-hint"></span>
-              </div>
-              <div class="selection-action-controls">
-                <button class="secondary-button selection-clear-button" type="button">Limpiar todo</button>
-                <button class="secondary-button selection-save-button" type="button">Guardar seleccion</button>
-                <button class="secondary-button selection-stop-button" type="button">Detener</button>
-                <button class="docs-link bottom-apply-button selection-apply-button" type="button">Aplicar</button>
-              </div>
-            </div>
-            <div class="bottom-selection-list selection-mini-list"></div>
-          </div>
-        </section>
-
-        <section id="overlayView" class="content-view">
-          <div class="overlay-layout">
-            <section class="page-panel overlay-hero-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Overlay</h2>
-                  <p>Ejecuta la seleccion actual y controla si el overlay esta activo.</p>
-                </div>
-                <button id="stopOverlayButton" class="secondary-button" type="button">Detener overlay</button>
-              </div>
-
-              <div class="overlay-command-grid">
-                <div class="overlay-status-card">
-                  <span class="overlay-kicker">Estado actual</span>
-                  <div class="overlay-status-line">
-                    <strong id="overlayStatusLabel">Sin overlay</strong>
-                    <span id="overlayStatusIndicator" class="overlay-dot"></span>
-                  </div>
-                  <p id="importStatusLabel">Listo para seleccionar skins.</p>
-                  <small>Cuando ejecutes, deja abierto Rift Atlas y entra a partida para ver las skins.</small>
-                </div>
-
-                <div id="selectionActionBar" class="selection-action-bar overlay-inline-actions">
-                  <div class="selection-action-top">
-                    <div class="selection-action-count">
-                      <strong id="bottomSelectedCount" class="selection-selected-count"></strong>
-                      <span id="bottomSelectedHint" class="selection-selected-hint"></span>
-                    </div>
-                    <div class="selection-action-controls">
-                      <button id="bottomClearButton" class="secondary-button selection-clear-button" type="button">Limpiar todo</button>
-                      <button id="bottomSavePresetButton" class="secondary-button selection-save-button" type="button">Guardar seleccion</button>
-                      <button id="bottomStopOverlayButton" class="secondary-button selection-stop-button" type="button">Detener</button>
-                      <button id="bottomApplyButton" class="docs-link bottom-apply-button selection-apply-button" type="button">Aplicar</button>
-                    </div>
-                  </div>
-                  <div id="bottomSelectionList" class="bottom-selection-list selection-mini-list"></div>
-                </div>
-              </div>
-            </section>
-
-            <section class="page-panel overlay-guide-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Flujo recomendado</h2>
-                  <p>Para no perderse: prepara, revisa y ejecuta.</p>
-                </div>
-              </div>
-              <div class="overlay-step-grid">
-                <article class="overlay-step-card">
-                  <span>1</span>
-                  <strong>Elegi skins</strong>
-                  <p>Selecciona LeagueSkins, mods propios o archivos recibidos por Party.</p>
-                  <button class="secondary-button nav-shortcut" type="button" data-view-target="mods">Ir a Skins</button>
-                </article>
-                <article class="overlay-step-card">
-                  <span>2</span>
-                  <strong>Revisa la config</strong>
-                  <p>Si algo falla, comproba engine, DLL y League desde Configuracion.</p>
-                  <button class="secondary-button nav-shortcut" type="button" data-view-target="settings">Comprobar</button>
-                </article>
-                <article class="overlay-step-card">
-                  <span>3</span>
-                  <strong>Ejecuta overlay</strong>
-                  <p>Usa Aplicar cuando tengas una seleccion. Detener apaga el overlay activo.</p>
-                </article>
-              </div>
-            </section>
-
-            <div class="overlay-tools-grid">
-              <section class="page-panel">
-                <div class="panel-heading">
-                  <div>
-                    <h2>Presets</h2>
-                    <p id="presetStatusLabel">Guarda grupos de skins para reutilizarlos rapido.</p>
-                  </div>
-                </div>
-                <div class="preset-builder">
-                  <div class="search-wrap">
-                    <label for="presetNameInput">Nuevo preset</label>
-                    <input id="presetNameInput" type="text" placeholder="Nombre del preset" autocomplete="off" />
-                  </div>
-                  <button id="createPresetButton" class="docs-link" type="button">Crear</button>
-                  <div class="search-wrap">
-                    <label for="presetSelect">Preset activo</label>
-                    <select id="presetSelect">
-                      <option value="">Sin presets</option>
-                    </select>
-                  </div>
-                </div>
-                <div class="automation-actions preset-actions">
-                  <button id="saveQueuePresetButton" class="secondary-button" type="button">Guardar cola</button>
-                  <button id="loadPresetQueueButton" class="secondary-button" type="button">Cargar cola</button>
-                  <button id="deletePresetButton" class="secondary-button" type="button">Eliminar</button>
-                </div>
-                <div id="presetList" class="preset-list">
-                  <div class="empty-state compact">
-                    <h2>Sin presets</h2>
-                    <p>Agrega skins a la cola desde la biblioteca y guarda esa cola como preset.</p>
-                  </div>
-                </div>
-              </section>
-
-              <section class="page-panel">
-                <div class="panel-heading">
-                  <div>
-                    <h2>Historial</h2>
-                    <p>Ultimas combinaciones ejecutadas.</p>
-                  </div>
-                  <button id="clearOverlayHistoryButton" class="secondary-button" type="button">Limpiar historial</button>
-                </div>
-                <div id="overlayHistoryList" class="overlay-history-list">
-                  <div class="empty-state compact">
-                    <h2>Sin historial</h2>
-                    <p>Ejecuta una seleccion para guardarla como acceso rapido.</p>
-                  </div>
-                </div>
-              </section>
-            </div>
-          </div>
-        </section>
-
-        <section id="partyView" class="content-view">
-          <div class="mods-layout">
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Party</h2>
-                  <p>Crea una sala P2P o entra con el link de un amigo para sincronizar la seleccion de skins.</p>
-                </div>
-                <span id="partyStatusPill" class="status-pill">Desconectado</span>
-              </div>
-              <div class="party-grid">
-                <div class="search-wrap">
-                  <label for="partyNameInput">Nombre</label>
-                  <input id="partyNameInput" type="text" placeholder="Tu nombre" autocomplete="off" />
-                </div>
-                <div class="search-wrap">
-                  <label for="partyLinkInput">Link o codigo</label>
-                  <input id="partyLinkInput" type="text" placeholder="rift-atlas-party:ABC123" autocomplete="off" />
-                </div>
-                <button id="createPartyButton" class="docs-link" type="button">Crear party</button>
-                <button id="joinPartyButton" class="secondary-button" type="button">Entrar</button>
-                <button id="leavePartyButton" class="secondary-button" type="button">Salir de party</button>
-              </div>
-              <div class="party-actions-row">
-                <div class="party-ready-card">
-                  <span>Estado P2P</span>
-                  <strong id="partyReadySummary">Desconectado</strong>
-                  <small id="partyReadyDetails">Crea o entra a una party para sincronizar archivos.</small>
-                </div>
-                <label class="party-auto-apply">
-                  <input id="partyAutoApplyCheckbox" type="checkbox" />
-                  <span>Auto-ejecutar al terminar sync</span>
-                </label>
-                <button id="applyPartyButton" class="docs-link" type="button">Aplicar party</button>
-              </div>
-              <div class="skin-status-panel party-status-panel">
-                <p id="partyConnectionLabel">Desconectado.</p>
-                <span id="partyFilesLabel">archivos p2p: ninguno</span>
-              </div>
-              <div id="partyTransferList" class="party-transfer-list"></div>
-              <div class="import-config-panel">
-                <p id="partyShareLinkLabel">Crea una party para generar un link.</p>
-                <button id="copyPartyLinkButton" class="secondary-button" type="button">Copiar link</button>
-              </div>
-            </section>
-
-            <section class="page-panel party-room-panel">
-              <div>
-                <div class="panel-heading">
-                  <div>
-                    <h2>Miembros</h2>
-                    <p>Skins anunciadas por cada cliente conectado.</p>
-                  </div>
-                </div>
-                <div id="partyMembersList" class="party-members-list">
-                  <div class="empty-state compact">
-                    <h2>Sin party</h2>
-                    <p>Crea una sala o entra con un codigo para ver archivos P2P.</p>
-                  </div>
-                </div>
-              </div>
-              <aside id="partyFileProfile" class="party-file-profile">
-                <div class="empty-state compact">
-                  <h2>Sin archivo P2P</h2>
-                  <p>Toca un archivo anunciado para ver su perfil.</p>
-                </div>
-              </aside>
-            </section>
-          </div>
-        </section>
-
-        <section id="downloadsView" class="content-view">
-          <div class="settings-layout">
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Descargas</h2>
-                  <p>Descarga engine + DLL, LeagueSkins y configura la ruta de League.</p>
-                </div>
-              </div>
-              <div class="manager-panel">
-                <div>
-                  <span>Engine + DLL</span>
-                  <strong id="downloadEnginePathLabel">No configurado</strong>
-                </div>
-                <div>
-                  <span>League</span>
-                  <strong id="downloadLeaguePathLabel">No configurado</strong>
-                </div>
-                <div>
-                  <span>LeagueSkins</span>
-                  <strong id="downloadSkinLibraryLabel">No configurado</strong>
-                </div>
-              </div>
-              <div class="manager-panel">
-                <div>
-                  <span>Fuente del DLL</span>
-                  <select id="dllSourceSelect">
-                    <option value="bundled">Incluido con Rift Atlas</option>
-                    <option value="cslol">cslol-manager recomendado</option>
-                    <option value="ltk">ltk-manager</option>
-                  </select>
-                </div>
-                <button id="downloadEngineButton" class="docs-link" type="button">Descargar engine + DLL</button>
-                <button id="downloadLeagueSkinsButtonDownload" class="docs-link" type="button">Descargar LeagueSkins</button>
-              </div>
-              <div class="manager-panel">
-                <button id="openEngineFolderButton" class="secondary-button" type="button">Abrir carpeta engine</button>
-                <button id="openDllFolderButton" class="secondary-button" type="button">Abrir carpeta DLL</button>
-                <button id="openLeagueSkinsFolderButton" class="secondary-button" type="button">Abrir carpeta LeagueSkins</button>
-              </div>
-              <div class="manager-panel">
-                <strong id="downloadProgressLabel">Listo para descargar.</strong>
-              </div>
-            </section>
-          </div>
-        </section>
-
-        <section id="settingsView" class="content-view">
-          <div class="settings-layout">
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Configuracion</h2>
-                  <p>Rutas del overlay, DLL, ejecutable de League y herramientas externas.</p>
-                </div>
-              </div>
-              <div class="manager-panel">
-                <div>
-                  <span>Diagnostico</span>
-                  <strong id="diagnosticSummary">Sin comprobar</strong>
-                </div>
-                <button id="runDiagnosticsButton" class="docs-link" type="button">Comprobar instalacion</button>
-              </div>
-              <div id="diagnosticsList" class="diagnostics-list"></div>
-              <div id="updatePanel" class="manager-panel update-panel">
-                <div>
-                  <span>Actualizaciones</span>
-                  <strong id="updateStatusLabel">Buscando actualizaciones...</strong>
-                  <small id="updateDetailsLabel">Rift Atlas revisa GitHub Releases al iniciar.</small>
-                </div>
-                <label id="updateHideLabel" class="update-hide-option" hidden>
-                  <input id="updateHideCheckbox" type="checkbox" />
-                  No volver a mostrar esta version
-                </label>
-                <button id="updateDownloadButton" class="docs-link" type="button" hidden>Actualizar</button>
-                <button id="updateDismissButton" class="secondary-button" type="button" hidden>Ahora no</button>
-                <button id="checkUpdatesButton" class="secondary-button" type="button">Buscar</button>
-              </div>
-              <div class="manager-panel">
-                <div>
-                  <span>Configuracion</span>
-                  <strong>Engine propio + DLL + League</strong>
-                </div>
-                <div>
-                  <span>Fuente del DLL</span>
-                  <select id="settingsDllSourceSelect">
-                    <option value="bundled">Incluido con Rift Atlas</option>
-                    <option value="cslol">cslol-manager recomendado</option>
-                    <option value="ltk">ltk-manager</option>
-                  </select>
-                </div>
-                <button id="downloadCslolButton" class="docs-link" type="button">Descargar engine</button>
-                <button id="autoConfigureButton" class="secondary-button" type="button">Detectar</button>
-              </div>
-              <div id="ltkOverlaySection" class="manager-panel">
-                <div>
-                  <span>Engine</span>
-                  <strong id="ltkOverlaySidecarLabel">No configurado</strong>
-                </div>
-                <div>
-                  <span>DLL</span>
-                  <strong id="ltkOverlayDllLabel">No encontrada</strong>
-                </div>
-                <div>
-                  <span>League</span>
-                  <strong id="leagueGamePathLabel">No configurado</strong>
-                </div>
-              </div>
-              <div class="manager-panel">
-                <div>
-                  <span>Directorio de la app</span>
-                  <strong id="appDataPathLabel">Cargando...</strong>
-                </div>
-                <button id="openAppDataFolderButton" class="secondary-button" type="button">Abrir carpeta</button>
-              </div>
-              <div class="import-config-panel">
-                <p id="configStatusLabel">Configuracion lista para revisar.</p>
-                <details>
-                  <summary>Configurar manualmente</summary>
-                  <div class="automation-actions">
-                    <button id="selectLtkOverlaySidecarButton" class="secondary-button" type="button">Engine</button>
-                    <button id="selectLtkOverlayDllButton" class="secondary-button" type="button">DLL propio</button>
-                    <button id="selectLeagueGameButton" class="secondary-button" type="button">League</button>
-                  </div>
-                </details>
-              </div>
-            </section>
-
-            <section class="page-panel">
-              <div class="panel-heading">
-                <div>
-                  <h2>Herramientas</h2>
-                  <p>Repositorios y descargas usados por el overlay y la biblioteca local.</p>
-                </div>
-              </div>
-              <div class="tool-grid settings-tools">
-                <article class="tool-card">
-                  <h3>Engine propio</h3>
-                  <p>Sidecar local para crear el overlay y ejecutar el patcher.</p>
-                </article>
-                <article class="tool-card">
-                  <h3>LeagueSkins</h3>
-                  <p>Repositorio archivado con assets de skins organizados por campeon y skin.</p>
-                  <button class="secondary-button external-link" type="button" data-url="https://github.com/Alban1911/LeagueSkins">Repositorio</button>
-                </article>
-              </div>
-            </section>
-          </div>
-        </section>
-
-      </main>
-    </div>
-
-    <template id="championCardTemplate">
-      <button class="champion-card" type="button">
-        <img alt="" />
-        <span class="champion-name"></span>
-        <small></small>
-      </button>
-    </template>
-
-    <div id="firstDllModal" class="modal-backdrop" hidden>
-      <section class="modal-panel">
+<body>
+  <div class="app-shell">
+    <aside class="sidebar is-open">
+      <div class="brand">
+        <img class="brand-mark" src="../assets/icon.png" alt="Rift Atlas" />
         <div>
-          <span class="modal-kicker">Configuracion requerida</span>
-          <h2>Falta cslol-dll.dll</h2>
-          <p>Rift Atlas no incluye el DLL. Pegalo manualmente en la carpeta del engine para poder usar el overlay.</p>
-          <code id="firstDllPathLabel">Cargando ruta...</code>
+          <h1>Rift Atlas</h1>
+          <p>Companion de campeones</p>
         </div>
-        <div class="modal-actions">
-          <button id="firstDllOpenFolderButton" class="docs-link" type="button">Abrir carpeta</button>
-          <button id="firstDllDoneButton" class="secondary-button" type="button">Ya lo pegue</button>
-          <button id="firstDllLaterButton" class="secondary-button" type="button">Despues</button>
+      </div>
+
+      <nav class="nav-list" aria-label="Secciones">
+        <button class="nav-item active" type="button" data-view="champions">Campeones</button>
+        <button class="nav-item" type="button" data-view="build">Build</button>
+        <button class="nav-item" type="button" data-view="mods">Skins</button>
+        <button class="nav-item" type="button" data-view="party">Party</button>
+        <button class="nav-item" type="button" data-view="overlay">Overlay</button>
+        <button class="nav-item" type="button" data-view="downloads">Descargas</button>
+        <button class="nav-item" type="button" data-view="settings">Configuracion</button>
+        <button class="nav-item" type="button" data-view="help">Ayuda</button>
+      </nav>
+
+      <section class="status-panel">
+        <span>Parche</span>
+        <strong id="patchLabel">Cargando...</strong>
+        <p>Datos oficiales de Data Dragon.</p>
+      </section>
+
+      <p class="legal">
+        Rift Atlas is not endorsed by Riot Games and does not reflect the views or opinions of Riot Games or anyone
+        officially involved in producing or managing Riot Games properties. Riot Games and all associated properties are
+        trademarks or registered trademarks of Riot Games, Inc.
+      </p>
+    </aside>
+
+    <main class="main-content">
+      <section id="championToolbar" class="toolbar" aria-label="Filtros de campeones">
+        <div class="search-wrap">
+          <label for="searchInput">Buscar</label>
+          <input id="searchInput" type="search" placeholder="Nombre, titulo o rol" autocomplete="off" />
+        </div>
+
+        <div class="filter-group" role="group" aria-label="Rol">
+          <button type="button" class="filter-pill active" data-role="all">Todos</button>
+          <button type="button" class="filter-pill" data-role="Fighter">Fighters</button>
+          <button type="button" class="filter-pill" data-role="Mage">Mages</button>
+          <button type="button" class="filter-pill" data-role="Marksman">Marksmen</button>
+          <button type="button" class="filter-pill" data-role="Assassin">Assassins</button>
+          <button type="button" class="filter-pill" data-role="Tank">Tanks</button>
+          <button type="button" class="filter-pill" data-role="Support">Supports</button>
         </div>
       </section>
-    </div>
 
-    <script src="./vendor/peerjs.min.js"></script>
-    <script src="./renderer.js"></script>
-  </body>
+      <section id="championsView" class="content-view active">
+        <section class="tier-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Tier list por linea</h2>
+              <p id="tierMeta">Stats comunitarias, cargando datos...</p>
+            </div>
+            <button id="refreshTiersButton" class="secondary-button" type="button">Actualizar</button>
+          </div>
+          <div class="lane-tabs" role="group" aria-label="Lineas">
+            <button class="lane-tab active" type="button" data-lane="top">Top</button>
+            <button class="lane-tab" type="button" data-lane="jungle">Jungla</button>
+            <button class="lane-tab" type="button" data-lane="middle">Mid</button>
+            <button class="lane-tab" type="button" data-lane="bottom">ADC</button>
+            <button class="lane-tab" type="button" data-lane="support">Support</button>
+          </div>
+          <div class="tier-head">
+            <span>#</span>
+            <span>Campeon</span>
+            <span>Tier</span>
+            <span>WR</span>
+            <span>PR</span>
+            <span>BR</span>
+            <span>Games</span>
+          </div>
+          <div id="tierGrid" class="tier-grid" aria-live="polite"></div>
+        </section>
+        <div class="grid-layout">
+          <section class="champion-list-panel">
+            <div class="panel-heading">
+              <h2>Campeones</h2>
+              <span id="countLabel">0</span>
+            </div>
+            <div id="championGrid" class="champion-grid" aria-live="polite"></div>
+          </section>
+
+          <section id="championDetail" class="detail-panel" aria-live="polite">
+            <div class="empty-state">
+              <h2>Selecciona un campeon</h2>
+              <p>Explora habilidades, estadisticas y roles con datos publicos de Riot Data Dragon.</p>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="buildView" class="content-view">
+        <div class="builds-layout">
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Build</h2>
+                <p id="buildStatusLabel">Busca un campeon y elegi donde ver runas, items y orden de habilidades.</p>
+              </div>
+              <button id="openBuildExternalButton" class="secondary-button" type="button">Abrir build</button>
+            </div>
+            <form id="buildSearchForm" class="build-search-form">
+              <div class="search-wrap wide">
+                <label for="buildChampionInput">Campeon</label>
+                <input id="buildChampionInput" list="buildChampionList" type="search"
+                  placeholder="Aatrox, Ahri, Neeko..." autocomplete="off" />
+                <datalist id="buildChampionList"></datalist>
+              </div>
+              <div class="search-wrap narrow">
+                <label for="buildSourceSelect">Fuente</label>
+                <select id="buildSourceSelect">
+                  <option value="metasrc">MetaSRC</option>
+                  <option value="opgg">OP.GG</option>
+                </select>
+              </div>
+              <div class="search-wrap narrow">
+                <label for="buildRegionSelect">Region</label>
+                <select id="buildRegionSelect">
+                  <option value="">Global</option>
+                  <option value="las">LAS</option>
+                  <option value="lan">LAN</option>
+                  <option value="na">NA</option>
+                  <option value="br">BR</option>
+                  <option value="euw">EUW</option>
+                  <option value="eune">EUNE</option>
+                  <option value="kr">KR</option>
+                </select>
+              </div>
+              <button class="docs-link form-button" type="submit">Buscar build</button>
+            </form>
+          </section>
+
+          <section class="page-panel build-preview-panel">
+            <div class="build-preview-card">
+              <span id="buildSelectedSource" class="build-preview-kicker">MetaSRC</span>
+              <h3 id="buildSelectedTitle">Build lista para abrir</h3>
+              <p id="buildSelectedDescription">Rift Atlas prepara el enlace correcto y lo abre en tu navegador para
+                evitar bloqueos dentro de Electron.</p>
+              <code id="buildSelectedUrl" class="build-url">https://www.metasrc.com/lol/build</code>
+              <button id="openBuildExternalButtonInline" class="docs-link" type="button">Abrir build</button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="modsView" class="content-view">
+        <div class="mods-layout">
+          <section class="page-panel" hidden>
+            <div class="panel-heading">
+              <div>
+                <h2>Skins</h2>
+                <p>Elige skins, filtra paquetes y revisa detalles antes de enviarlos al overlay.</p>
+              </div>
+              <button class="secondary-button nav-shortcut" type="button" data-view-target="overlay">Abrir
+                overlay</button>
+            </div>
+            <div class="overlay-status-card skins-overlay-status">
+              <span class="overlay-kicker">Estado actual</span>
+              <div class="overlay-status-line">
+                <strong id="skinsOverlayStatusLabel">Sin overlay</strong>
+                <span id="skinsOverlayStatusIndicator" class="overlay-dot"></span>
+              </div>
+              <p id="skinsOverlayStatusMessage">Listo para seleccionar skins.</p>
+              <small>Cuando ejecutes, deja abierto Rift Atlas y entra a partida para ver las skins.</small>
+            </div>
+          </section>
+
+          <section class="page-panel utility-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Inventario local</h2>
+                <p id="modsFolderLabel">Selecciona una carpeta para listar paquetes .fantome, .zip o .rse.</p>
+              </div>
+              <button id="selectModsFolderButton" class="docs-link" type="button">Seleccionar carpeta</button>
+            </div>
+            <div id="modsPackageList" class="mods-package-list">
+              <div class="empty-state compact">
+                <h2>Sin carpeta seleccionada</h2>
+                <p>La app solo lista archivos locales; no instala ni ejecuta mods.</p>
+              </div>
+            </div>
+          </section>
+
+          <section id="skinsP2PSection" class="page-panel skins-p2p-section" hidden>
+            <div class="panel-heading">
+              <div>
+                <h2>P2P</h2>
+                <p id="skinsP2PLabel">Sin party conectada.</p>
+              </div>
+              <div class="heading-actions">
+                <button id="skinsP2PSyncButton" class="secondary-button" type="button">Sincronizar</button>
+                <button id="skinsP2PApplyButton" class="docs-link" type="button">Aplicar party</button>
+              </div>
+            </div>
+            <div id="skinsP2PList" class="skins-p2p-list">
+              <div class="empty-state compact">
+                <h2>Sin archivos P2P</h2>
+                <p>Cuando estes en party, aca aparecen los archivos sincronizados.</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Mods propios</h2>
+                <p id="customModsLabel">Agrega .fantome, .zip, .rse, .wad o .wad.client tuyos. Sirve para skins, fonts,
+                  mapas y otros mods locales.</p>
+              </div>
+              <div class="heading-actions">
+                <button id="addCustomModFilesButton" class="secondary-button" type="button">Agregar archivos</button>
+                <button id="addCustomModFolderButton" class="docs-link" type="button">Agregar carpeta</button>
+              </div>
+            </div>
+            <div id="customModsList" class="custom-mods-list">
+              <div class="empty-state compact">
+                <h2>Sin mods propios</h2>
+                <p>Agrega paquetes locales que no formen parte de LeagueSkins.</p>
+              </div>
+            </div>
+          </section>
+
+          <section id="leagueSkinsLocalPanel" class="page-panel" hidden>
+            <div class="panel-heading">
+              <div>
+                <h2>LeagueSkins local</h2>
+                <p id="skinLibraryLabel">Selecciona una carpeta clonada/descargada de LeagueSkins para gestionar tu
+                  biblioteca.</p>
+              </div>
+              <div class="heading-actions">
+                <button id="downloadLeagueSkinsButton" class="secondary-button" type="button">Descargar
+                  LeagueSkins</button>
+                <button id="selectSkinLibraryButton" class="docs-link" type="button">Seleccionar LeagueSkins</button>
+              </div>
+            </div>
+            <div class="library-toolbar">
+              <div class="search-wrap">
+                <label for="skinSearchInput">Filtrar skins</label>
+                <input id="skinSearchInput" type="search" placeholder="Campeon o skin" autocomplete="off" />
+              </div>
+              <div class="search-wrap narrow">
+                <label for="skinChampionSelect">Campeon</label>
+                <select id="skinChampionSelect">
+                  <option value="all">Todos</option>
+                </select>
+              </div>
+              <div class="search-wrap narrow">
+                <label for="skinTypeSelect">Tipo</label>
+                <select id="skinTypeSelect">
+                  <option value="all">Todos</option>
+                  <option value=".fantome">Fantome</option>
+                  <option value=".zip">Zip</option>
+                  <option value=".rse">RSE</option>
+                  <option value=".wad">WAD</option>
+                  <option value=".wad.client">WAD client</option>
+                </select>
+              </div>
+              <div class="search-wrap narrow">
+                <label for="skinStateSelect">Estado</label>
+                <select id="skinStateSelect">
+                  <option value="all">Todos</option>
+                  <option value="queued">Seleccionadas</option>
+                  <option value="favorites">Favoritas</option>
+                  <option value="with-image">Con imagen</option>
+                  <option value="missing-image">Sin imagen</option>
+                </select>
+              </div>
+              <div class="queue-actions">
+                <span id="managedSkinsCount">0 gestionadas</span>
+                <span id="queuedSkinsCount">0 seleccionadas</span>
+                <button id="clearQueueButton" class="secondary-button" type="button">Limpiar todo</button>
+              </div>
+            </div>
+            <div class="skin-workspace">
+              <div class="skin-main-column">
+                <div id="skinLibraryList" class="skin-library-list">
+                  <div class="empty-state compact">
+                    <h2>Sin biblioteca</h2>
+                    <p>Selecciona la carpeta LeagueSkins para indexar paquetes .fantome.</p>
+                  </div>
+                </div>
+              </div>
+              <aside id="skinProfilePanel" class="skin-profile-panel">
+                <div class="empty-state compact">
+                  <h2>Sin skin seleccionada</h2>
+                  <p>Toca una card para ver su perfil y acciones rapidas.</p>
+                </div>
+              </aside>
+            </div>
+            <div class="selection-tray">
+              <div>
+                <strong>Seleccion</strong>
+                <span id="selectionTraySummary">No hay skins seleccionadas.</span>
+              </div>
+              <div id="selectionTrayList" class="selection-tray-list"></div>
+            </div>
+          </section>
+
+        </div>
+        <div id="skinsSelectionActionBar" class="selection-action-bar">
+          <div class="selection-action-top">
+            <div class="selection-action-count">
+              <strong class="selection-selected-count"></strong>
+              <span class="selection-selected-hint"></span>
+            </div>
+            <div class="selection-action-controls">
+              <button class="secondary-button selection-clear-button" type="button">Limpiar todo</button>
+              <button class="secondary-button selection-save-button" type="button">Guardar seleccion</button>
+              <button class="secondary-button selection-stop-button" type="button">Detener</button>
+              <button class="docs-link bottom-apply-button selection-apply-button" type="button">Aplicar</button>
+            </div>
+          </div>
+          <div class="bottom-selection-list selection-mini-list"></div>
+        </div>
+      </section>
+
+      <section id="overlayView" class="content-view">
+        <div class="overlay-layout">
+          <section class="page-panel overlay-hero-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Overlay</h2>
+                <p>Controla Pengu y revisa la seleccion que aparece en champ select.</p>
+              </div>
+              <div class="selection-action-controls">
+                <button id="overlayLaunchPenguButton" class="secondary-button" type="button">Activar Pengu</button>
+                <button id="overlayDeactivatePenguButton" class="secondary-button" type="button">Apagar Pengu</button>
+                <button id="stopOverlayButton" class="secondary-button" type="button">Detener overlay</button>
+              </div>
+            </div>
+
+            <div class="overlay-command-grid">
+              <div class="overlay-status-card">
+                <span class="overlay-kicker">Estado actual</span>
+                <div class="overlay-status-line">
+                  <strong id="overlayStatusLabel">Sin overlay</strong>
+                  <span id="overlayStatusIndicator" class="overlay-dot"></span>
+                </div>
+                <p id="importStatusLabel">Listo para seleccionar skins.</p>
+                <small>Las skins seleccionadas aparecen en champ select cuando Pengu detecta el campeon.</small>
+                <small id="overlayPenguStatusLabel">Pengu Loader: comprobando estado.</small>
+              </div>
+
+              <div id="selectionActionBar" class="selection-action-bar overlay-inline-actions">
+                <div class="selection-action-top">
+                  <div class="selection-action-count">
+                    <strong id="bottomSelectedCount" class="selection-selected-count"></strong>
+                    <span id="bottomSelectedHint" class="selection-selected-hint"></span>
+                  </div>
+                  <div class="selection-action-controls">
+                    <button id="bottomClearButton" class="secondary-button selection-clear-button" type="button">Limpiar
+                      todo</button>
+                    <button id="bottomSavePresetButton" class="secondary-button selection-save-button"
+                      type="button">Guardar seleccion</button>
+                    <button id="bottomStopOverlayButton" class="secondary-button selection-stop-button"
+                      type="button">Detener</button>
+                    <button id="bottomApplyButton" class="docs-link bottom-apply-button selection-apply-button"
+                      type="button">Aplicar</button>
+                  </div>
+                </div>
+                <div id="bottomSelectionList" class="bottom-selection-list selection-mini-list"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="page-panel overlay-guide-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Flujo recomendado</h2>
+                <p>Para no perderse: prepara, revisa y ejecuta.</p>
+              </div>
+            </div>
+            <div class="overlay-step-grid">
+              <article class="overlay-step-card">
+                <span>1</span>
+                <strong>Elegi skins</strong>
+                <p>Selecciona LeagueSkins, mods propios o archivos recibidos por Party.</p>
+                <button class="secondary-button nav-shortcut" type="button" data-view-target="mods">Ir a Skins</button>
+              </article>
+              <article class="overlay-step-card">
+                <span>2</span>
+                <strong>Revisa la config</strong>
+                <p>Si algo falla, comproba engine, DLL y League desde Configuracion.</p>
+                <button class="secondary-button nav-shortcut" type="button"
+                  data-view-target="settings">Comprobar</button>
+              </article>
+              <article class="overlay-step-card">
+                <span>3</span>
+                <strong>Ejecuta overlay</strong>
+                <p>Usa Aplicar cuando tengas una seleccion. Detener apaga el overlay activo.</p>
+              </article>
+            </div>
+          </section>
+
+          <div class="overlay-tools-grid">
+            <section class="page-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>Presets</h2>
+                  <p id="presetStatusLabel">Guarda grupos de skins para reutilizarlos rapido.</p>
+                </div>
+              </div>
+              <div class="preset-builder">
+                <div class="search-wrap">
+                  <label for="presetNameInput">Nuevo preset</label>
+                  <input id="presetNameInput" type="text" placeholder="Nombre del preset" autocomplete="off" />
+                </div>
+                <button id="createPresetButton" class="docs-link" type="button">Crear</button>
+                <div class="search-wrap">
+                  <label for="presetSelect">Preset activo</label>
+                  <select id="presetSelect">
+                    <option value="">Sin presets</option>
+                  </select>
+                </div>
+              </div>
+              <div class="automation-actions preset-actions">
+                <button id="saveQueuePresetButton" class="secondary-button" type="button">Guardar cola</button>
+                <button id="loadPresetQueueButton" class="secondary-button" type="button">Cargar cola</button>
+                <button id="deletePresetButton" class="secondary-button" type="button">Eliminar</button>
+              </div>
+              <div id="presetList" class="preset-list">
+                <div class="empty-state compact">
+                  <h2>Sin presets</h2>
+                  <p>Agrega skins a la cola desde la biblioteca y guarda esa cola como preset.</p>
+                </div>
+              </div>
+            </section>
+
+            <section class="page-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>Historial</h2>
+                  <p>Ultimas combinaciones ejecutadas.</p>
+                </div>
+                <button id="clearOverlayHistoryButton" class="secondary-button" type="button">Limpiar historial</button>
+              </div>
+              <div id="overlayHistoryList" class="overlay-history-list">
+                <div class="empty-state compact">
+                  <h2>Sin historial</h2>
+                  <p>Ejecuta una seleccion para guardarla como acceso rapido.</p>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section id="partyView" class="content-view">
+        <div class="mods-layout">
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Party</h2>
+                <p>Crea una sala P2P o entra con el link de un amigo para sincronizar la seleccion de skins.</p>
+              </div>
+              <span id="partyStatusPill" class="status-pill">Desconectado</span>
+            </div>
+            <div class="party-grid">
+              <div class="search-wrap">
+                <label for="partyNameInput">Nombre</label>
+                <input id="partyNameInput" type="text" placeholder="Tu nombre" autocomplete="off" />
+              </div>
+              <div class="search-wrap">
+                <label for="partyLinkInput">Link o codigo</label>
+                <input id="partyLinkInput" type="text" placeholder="rift-atlas-party:ABC123" autocomplete="off" />
+              </div>
+              <button id="createPartyButton" class="docs-link" type="button">Crear party</button>
+              <button id="joinPartyButton" class="secondary-button" type="button">Entrar</button>
+              <button id="leavePartyButton" class="secondary-button" type="button">Salir de party</button>
+            </div>
+            <div class="party-actions-row">
+              <div class="party-ready-card">
+                <span>Estado P2P</span>
+                <strong id="partyReadySummary">Desconectado</strong>
+                <small id="partyReadyDetails">Crea o entra a una party para sincronizar archivos.</small>
+              </div>
+              <label class="party-auto-apply">
+                <input id="partyAutoApplyCheckbox" type="checkbox" />
+                <span>Auto-ejecutar al terminar sync</span>
+              </label>
+              <button id="applyPartyButton" class="docs-link" type="button">Aplicar party</button>
+            </div>
+            <div class="skin-status-panel party-status-panel">
+              <p id="partyConnectionLabel">Desconectado.</p>
+              <span id="partyFilesLabel">archivos p2p: ninguno</span>
+            </div>
+            <div class="skin-status-panel party-status-panel">
+              <p id="penguBridgeLabel">Pengu Loader: esperando plugin.</p>
+              <span id="penguLobbyLabel">Lobby de League no detectado.</span>
+              <label class="party-auto-apply">
+                <input id="penguAutoPartyCheckbox" type="checkbox" />
+                <span>Auto-party con lobby de League</span>
+              </label>
+            </div>
+            <div id="partyTransferList" class="party-transfer-list"></div>
+            <div class="import-config-panel">
+              <p id="partyShareLinkLabel">Crea una party para generar un link.</p>
+              <button id="copyPartyLinkButton" class="secondary-button" type="button">Copiar link</button>
+            </div>
+          </section>
+
+          <section class="page-panel party-room-panel">
+            <div>
+              <div class="panel-heading">
+                <div>
+                  <h2>Miembros</h2>
+                  <p>Skins anunciadas por cada cliente conectado.</p>
+                </div>
+              </div>
+              <div id="partyMembersList" class="party-members-list">
+                <div class="empty-state compact">
+                  <h2>Sin party</h2>
+                  <p>Crea una sala o entra con un codigo para ver archivos P2P.</p>
+                </div>
+              </div>
+            </div>
+            <aside id="partyFileProfile" class="party-file-profile">
+              <div class="empty-state compact">
+                <h2>Sin archivo P2P</h2>
+                <p>Toca un archivo anunciado para ver su perfil.</p>
+              </div>
+            </aside>
+          </section>
+        </div>
+      </section>
+
+      <section id="downloadsView" class="content-view">
+        <div class="settings-layout">
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Descargas</h2>
+                <p>Descarga engine + DLL, LeagueSkins y configura la ruta de League.</p>
+              </div>
+            </div>
+            <div class="manager-panel">
+              <div>
+                <span>Engine</span>
+                <strong id="downloadEnginePathLabel">No configurado</strong>
+              </div>
+              <div>
+                <span>League</span>
+                <strong id="downloadLeaguePathLabel">No configurado</strong>
+              </div>
+              <div>
+                <span>LeagueSkins</span>
+                <strong id="downloadSkinLibraryLabel">No configurado</strong>
+              </div>
+              <div>
+                <span>Pengu Loader</span>
+                <strong id="downloadPenguLoaderLabel">No instalado</strong>
+              </div>
+            </div>
+            <div class="manager-panel">
+              <button id="downloadEngineButton" class="docs-link" type="button">Descargar engine</button>
+              <button id="downloadLeagueSkinsButtonDownload" class="docs-link" type="button">Descargar
+                LeagueSkins</button>
+              <button id="downloadPenguLoaderButton" class="docs-link" type="button">Instalar Pengu Loader</button>
+              <button id="launchPenguLoaderButton" class="secondary-button" type="button">Activar Pengu Loader</button>
+            </div>
+            <div class="manager-panel">
+              <button id="openEngineFolderButton" class="secondary-button" type="button">Abrir carpeta engine</button>
+              <button id="openDllFolderButton" class="secondary-button" type="button">Abrir carpeta DLL</button>
+              <button id="openLeagueSkinsFolderButton" class="secondary-button" type="button">Abrir carpeta
+                LeagueSkins</button>
+              <button id="openPenguLoaderFolderButton" class="secondary-button" type="button">Abrir carpeta Pengu</button>
+            </div>
+            <div class="manager-panel">
+              <strong id="downloadProgressLabel">Listo para descargar.</strong>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="settingsView" class="content-view">
+        <div class="settings-layout">
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Configuracion</h2>
+                <p>Rutas del overlay, DLL, ejecutable de League y herramientas externas.</p>
+              </div>
+            </div>
+            <div class="manager-panel">
+              <div>
+                <span>Diagnostico</span>
+                <strong id="diagnosticSummary">Sin comprobar</strong>
+              </div>
+              <button id="runDiagnosticsButton" class="docs-link" type="button">Comprobar instalacion</button>
+            </div>
+            <div id="diagnosticsList" class="diagnostics-list"></div>
+            <div id="updatePanel" class="manager-panel update-panel">
+              <div>
+                <span>Actualizaciones</span>
+                <strong id="updateStatusLabel">Version actual</strong>
+                <small id="updateDetailsLabel">Usa Buscar para comprobar si hay una version nueva.</small>
+              </div>
+              <label id="updateHideLabel" class="update-hide-option" hidden>
+                <input id="updateHideCheckbox" type="checkbox" />
+                No volver a mostrar esta version
+              </label>
+              <button id="updateDownloadButton" class="docs-link" type="button" hidden>Actualizar</button>
+              <button id="updateDismissButton" class="secondary-button" type="button" hidden>Ahora no</button>
+              <button id="checkUpdatesButton" class="secondary-button" type="button">Buscar</button>
+            </div>
+            <div class="manager-panel">
+              <div>
+                <span>Configuracion</span>
+                <strong>Engine + DLL manual + League</strong>
+              </div>
+              <button id="downloadCslolButton" class="docs-link" type="button">Descargar engine</button>
+              <button id="autoConfigureButton" class="secondary-button" type="button">Detectar</button>
+            </div>
+            <div id="ltkOverlaySection" class="manager-panel">
+              <div>
+                <span>Engine</span>
+                <strong id="ltkOverlaySidecarLabel">No configurado</strong>
+              </div>
+              <div>
+                <span>DLL</span>
+                <strong id="ltkOverlayDllLabel">No encontrada</strong>
+              </div>
+              <div>
+                <span>League</span>
+                <strong id="leagueGamePathLabel">No configurado</strong>
+              </div>
+            </div>
+            <div class="manager-panel">
+              <div>
+                <span>League</span>
+                <strong id="leagueCheckSummary">Sin chequear</strong>
+                <small id="leagueCheckDetails">Compara Data/FINAL contra el manifiesto local.</small>
+              </div>
+              <button id="checkLeagueInstallButton" class="secondary-button" type="button">Chequear League</button>
+            </div>
+            <div id="leagueCheckList" class="diagnostics-list"></div>
+            <div class="manager-panel">
+              <div>
+                <span>Directorio de la app</span>
+                <strong id="appDataPathLabel">No disponible</strong>
+              </div>
+              <button id="openAppDataFolderButton" class="secondary-button" type="button">Abrir carpeta</button>
+            </div>
+            <div class="import-config-panel">
+              <p id="configStatusLabel">Configuracion lista para revisar.</p>
+              <details>
+                <summary>Configurar manualmente</summary>
+                <div class="automation-actions">
+                  <button id="selectLtkOverlaySidecarButton" class="secondary-button" type="button">Engine</button>
+                  <button id="selectLtkOverlayDllButton" class="secondary-button" type="button">DLL propio</button>
+                  <button id="selectLeagueGameButton" class="secondary-button" type="button">League</button>
+                </div>
+              </details>
+            </div>
+          </section>
+
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Herramientas</h2>
+                <p>Repositorios y descargas usados por el overlay y la biblioteca local.</p>
+              </div>
+            </div>
+            <div class="tool-grid settings-tools">
+              <article class="tool-card">
+                <h3>Engine propio</h3>
+                <p>Sidecar local para crear el overlay y ejecutar el patcher.</p>
+              </article>
+              <article class="tool-card">
+                <h3>LeagueSkins</h3>
+                <p>Repositorio archivado con assets de skins organizados por campeon y skin.</p>
+                <button class="secondary-button external-link" type="button"
+                  data-url="https://github.com/Alban1911/LeagueSkins">Repositorio</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Restablecer</h2>
+                <p>Borra datos locales y deja Rift Atlas como recien instalado.</p>
+              </div>
+            </div>
+            <div class="manager-panel danger-panel">
+              <div>
+                <span>Restablecer</span>
+                <strong>Restablecer de fabrica</strong>
+                <small>Borra configuracion, skins descargadas, engine, DLL, P2P, presets y cache de Rift Atlas.</small>
+              </div>
+              <button id="factoryResetButton" class="secondary-button danger-button" type="button">Restablecer</button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <template id="championCardTemplate">
+    <button class="champion-card" type="button">
+      <img alt="" />
+      <span class="champion-name"></span>
+      <small></small>
+    </button>
+  </template>
+
+  <div id="firstDllModal" class="modal-backdrop" hidden>
+    <section class="modal-panel">
+      <div>
+        <span class="modal-kicker">Configuracion requerida</span>
+        <h2>Falta cslol-dll.dll</h2>
+        <p>Inserte DLL de cslol para poder usar el overlay. Rift Atlas lo copiara automaticamente a la carpeta del engine.</p>
+        <code id="firstDllPathLabel">Cargando ruta...</code>
+      </div>
+      <div class="modal-actions">
+        <button id="firstDllOpenFolderButton" class="secondary-button" type="button">Abrir carpeta engine</button>
+        <button id="firstDllDoneButton" class="docs-link" type="button">Seleccionar DLL</button>
+        <button id="firstDllLaterButton" class="secondary-button" type="button">Despues</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="../node_modules/driver.js/dist/driver.js.iife.js"></script>
+  <script src="../tutorial.js"></script>
+  <script src="./vendor/peerjs.min.js"></script>
+  <script src="./renderer.js"></script>
+</body>
+
 </html>
