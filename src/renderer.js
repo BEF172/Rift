@@ -5906,6 +5906,25 @@ const setLeagueGamePath = (executablePath) => {
   if (els.downloadLeaguePathLabel) els.downloadLeaguePathLabel.textContent = state.leagueGamePath || "No configurado";
 };
 
+const detectLeaguePathFromSystem = async ({ silent = false } = {}) => {
+  if (!window.riftAtlas.detectLeaguePath) return null;
+  if (!silent) setConfigStatus("Detectando League...");
+
+  try {
+    const result = await window.riftAtlas.detectLeaguePath();
+    if (result?.detected && result.leagueGamePath) {
+      setLeagueGamePath(result.leagueGamePath);
+      if (!silent) setConfigStatus("League detectado y guardado.");
+    } else if (!silent) {
+      setConfigStatus("No se encontro League. Asegurate de que este instalado o selecciona la ruta manualmente.");
+    }
+    return result;
+  } catch (err) {
+    if (!silent) setConfigStatus("Error detectando League: " + (err.message || err));
+    return null;
+  }
+};
+
 const revealPath = async (filePath) => {
   if (!filePath) {
     setConfigStatus("Ruta no disponible.");
@@ -7678,15 +7697,7 @@ const bindEvents = () => {
     els.detectLeaguePathButton.disabled = true;
     els.detectLeaguePathButton.textContent = "Detectando...";
     try {
-      const result = await window.riftAtlas.detectLeaguePath();
-      if (result?.detected) {
-        setLeagueGamePath(result.leagueGamePath);
-        setConfigStatus("League detectado y guardado.");
-      } else {
-        setConfigStatus("No se encontro League. Asegurate de que este instalado o selecciona la ruta manualmente.");
-      }
-    } catch (err) {
-      setConfigStatus("Error detectando League: " + (err.message || err));
+      await detectLeaguePathFromSystem({ silent: false });
     } finally {
       els.detectLeaguePathButton.disabled = false;
       els.detectLeaguePathButton.textContent = "Detectar";
@@ -8763,7 +8774,8 @@ loadLibraryIndex().then(() => {
 loadLtkOverlayPaths();
 
 setLeagueGamePath(state.leagueGamePath);
-autoConfigureOverlay({ silent: true });
+detectLeaguePathFromSystem({ silent: true })
+  .finally(() => autoConfigureOverlay({ silent: true }));
 renderPresets();
 localStorage.removeItem("riftAtlas:customModFolders");
 restoreKnownLocalMods();
