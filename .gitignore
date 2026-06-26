@@ -58,6 +58,7 @@ status.txt
 
 # Local/generated reference material
 .codex-refs/
+scripts/
 webview-data/
 cache/
 downloaded-updates/

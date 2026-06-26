@@ -1,6 +1,6 @@
 {
   "name": "rift-atlas",
-  "version": "2.0.7",
+  "version": "2.0.9",
   "description": "Aplicacion desktop de League of Legends basada en Data Dragon.",
   "main": "main.js",
   "scripts": {
@@ -9,6 +9,7 @@
     "check": "node --check main.js && node --check preload.js && node --check src/renderer.js && node --check \"Pengu Loader/plugins/RiftAtlas-00-Core/index.js\" && node --check \"Pengu Loader/plugins/RiftAtlas-ChromaWheel/index.js\" && node --check \"Pengu Loader/plugins/RiftAtlas-FormsWheel/index.js\" && node --check \"Pengu Loader/plugins/RiftAtlas-HistoricMode/index.js\" && node --check \"Pengu Loader/plugins/RiftAtlas-Jade/index.js\" && node --check \"Pengu Loader/plugins/RiftAtlas-PartyMode/index.js\"",
     "dist": "tauri build",
     "release": "tauri build",
+    "version:bump": "node scripts/bump-version.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",

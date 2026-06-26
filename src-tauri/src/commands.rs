@@ -3,7 +3,7 @@ use crate::gameflow;
 use crate::overlay;
 use crate::AppState;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -127,30 +127,41 @@ fn hidden_command(program: &str) -> Command {
 pub fn init_pengu_plugin_resource_dir(app: &AppHandle) {
     match app.path().resource_dir() {
         Ok(dir) => {
-            let plugin_dir = dir.join("bundled-plugins").join("RiftAtlas-00-Core");
+            let plugins_dir = dir.join("bundled-plugins");
+            let plugin_dir = plugins_dir.join("RiftAtlas-00-Core");
             eprintln!("[PenguPlugin] resource_dir = {}", dir.display());
             eprintln!(
                 "[PenguPlugin] plugin_resource_dir = {}",
-                plugin_dir.display()
+                plugins_dir.display()
             );
             eprintln!(
                 "[PenguPlugin] RiftAtlas-00-Core/index.js exists = {}",
                 plugin_dir.join("index.js").exists()
             );
-            // Also check parent (plugins dir)
-            if let Some(parent) = plugin_dir.parent() {
-                eprintln!(
-                    "[PenguPlugin] plugins dir = {} exists = {}",
-                    parent.display(),
-                    parent.exists()
-                );
-            }
-            PENGU_PLUGIN_RESOURCE_DIR.set(plugin_dir).ok();
+            PENGU_PLUGIN_RESOURCE_DIR.set(plugins_dir).ok();
         }
         Err(e) => {
             eprintln!("[PenguPlugin] ERROR getting resource_dir: {}", e);
         }
     }
+}
+
+fn is_rift_atlas_pengu_plugins_dir(path: &Path) -> bool {
+    path.join("RiftAtlas-00-Core").join("index.js").is_file()
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if !paths.iter().any(|candidate| candidate == &path) {
+        paths.push(path);
+    }
+}
+
+fn display_user_path(path: &Path) -> String {
+    let display = path.display().to_string();
+    display.strip_prefix(r"\\?\").unwrap_or(&display).to_string()
 }
 
 // Basic app info
@@ -4672,52 +4683,64 @@ pub(crate) fn pengu_install_rift_plugin_inner(app_dir: &str) -> Result<serde_jso
     // Build candidate root paths
     let mut root_candidates: Vec<PathBuf> = Vec::new();
 
-    // 1. Relative to CARGO_MANIFEST_DIR (works in dev only)
-    let cargo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    root_candidates.push(cargo_root.join("..").join("Pengu Loader").join("plugins"));
-
-    // 2. Bundled resource dir (Tauri resource_dir)
+    // 1. Bundled resource dir (Tauri resource_dir)
     if let Some(dir) = PENGU_PLUGIN_RESOURCE_DIR.get() {
-        if let Some(parent) = dir.parent() {
-            root_candidates.push(parent.to_path_buf());
-        }
+        push_unique_path(&mut root_candidates, dir.clone());
     }
 
-    // 3. Relative to current_exe parent dir (production NSIS install)
+    // 2. Relative to current_exe parent dir (production NSIS install)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            root_candidates.push(parent.join("Pengu Loader").join("plugins"));
+            push_unique_path(&mut root_candidates, parent.join("bundled-plugins"));
+            push_unique_path(
+                &mut root_candidates,
+                parent.join("Pengu Loader").join("plugins"),
+            );
         }
     }
 
-    // 4. Relative to current_dir
-    root_candidates.push(
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join("Pengu Loader")
-            .join("plugins"),
-    );
-
-    // 5. Try relative to exe with ../ (Tauri NSIS may place resources one level up)
+    // 3. Try relative to exe with ../ (Tauri NSIS may place resources one level up)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             if let Some(grandparent) = parent.parent() {
-                root_candidates.push(grandparent.join("Pengu Loader").join("plugins"));
+                push_unique_path(&mut root_candidates, grandparent.join("bundled-plugins"));
+                push_unique_path(
+                    &mut root_candidates,
+                    grandparent.join("Pengu Loader").join("plugins"),
+                );
             }
         }
+    }
+
+    // 4. Dev-only fallbacks. Avoid leaking the CI compile path embedded by
+    // env!("CARGO_MANIFEST_DIR") into installed builds.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    push_unique_path(
+        &mut root_candidates,
+        cwd.join("Pengu Loader").join("plugins"),
+    );
+
+    #[cfg(debug_assertions)]
+    {
+        let cargo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        push_unique_path(
+            &mut root_candidates,
+            cargo_root.join("..").join("Pengu Loader").join("plugins"),
+        );
     }
 
     // Find the first root that contains at least one plugin directory
     let source_root = root_candidates
         .iter()
-        .find(|p| p.join("RiftAtlas-00-Core").join("index.js").exists());
+        .find(|p| is_rift_atlas_pengu_plugins_dir(p));
 
     let source_root = match source_root {
         Some(r) => r.clone(),
         None => {
             let tried: Vec<String> = root_candidates
                 .iter()
-                .map(|p| p.display().to_string())
+                .filter(|p| !p.display().to_string().contains(r"\a\Rift\Rift"))
+                .map(|p| display_user_path(p))
                 .collect();
             let msg = format!(
                 "Plugins de Rift Atlas no encontrados. Busque en: {}",
