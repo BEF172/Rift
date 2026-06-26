@@ -1,4 +1,3 @@
-Var RiftAtlasDeleteUserData
 Var RiftAtlasProcessCheckExit
 Var RiftAtlasProcessCheckOutput
 
@@ -58,6 +57,37 @@ Var RiftAtlasProcessCheckOutput
   DeleteRegValue HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\LeagueClientUx.exe" "Debugger"
 !macroend
 
+!macro RIFT_ATLAS_DELETE_LEGACY_INSTALL_DATA
+  RMDir /r "$INSTDIR\cache"
+  RMDir /r "$INSTDIR\crash-dumps"
+  RMDir /r "$INSTDIR\cslol-overlay-cache"
+  RMDir /r "$INSTDIR\cslol-profiles"
+  RMDir /r "$INSTDIR\downloaded-libraries"
+  RMDir /r "$INSTDIR\engine"
+  RMDir /r "$INSTDIR\hashtable"
+  RMDir /r "$INSTDIR\logs"
+  RMDir /r "$INSTDIR\ltk-manager"
+  RMDir /r "$INSTDIR\mod-files"
+  RMDir /r "$INSTDIR\mod-staging-cache"
+  RMDir /r "$INSTDIR\mods"
+  RMDir /r "$INSTDIR\overlay"
+  RMDir /r "$INSTDIR\overlays"
+  RMDir /r "$INSTDIR\p2p"
+  RMDir /r "$INSTDIR\Pengu Loader"
+  RMDir /r "$INSTDIR\pengu-loader"
+  RMDir /r "$INSTDIR\pengu-plugins-backup"
+  RMDir /r "$INSTDIR\pending"
+  RMDir /r "$INSTDIR\Rose"
+  RMDir /r "$INSTDIR\updates"
+  RMDir /r "$INSTDIR\webview-data"
+  Delete "$INSTDIR\.first-run-complete"
+  Delete "$INSTDIR\.pengu-active"
+  Delete "$INSTDIR\engine-version.txt"
+  Delete "$INSTDIR\last-overlay-log.txt"
+  Delete "$INSTDIR\last-overlay-log.previous.txt"
+  Delete "$INSTDIR\*.log"
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro RIFT_ATLAS_STOP_RUNTIME
 !macroend
@@ -67,36 +97,22 @@ Var RiftAtlasProcessCheckOutput
   !insertmacro RIFT_ATLAS_STOP_RUNTIME
   !insertmacro RIFT_ATLAS_REMOVE_LEAGUE_PROXY
 
-  MessageBox MB_YESNO|MB_ICONQUESTION "Rift Atlas guarda skins, engine, cache y configuracion en:$\r$\n$LOCALAPPDATA\Rift Atlas$\r$\n$\r$\nDeseas eliminar todos esos datos?" IDYES riftAtlasDeleteData IDNO riftAtlasSkipDelete
-
-  riftAtlasDeleteData:
-    StrCpy $RiftAtlasDeleteUserData "1"
-    ; Nuke directories NOW — BEFORE NSIS's default file-by-file loop runs.
-    ; This turns each subsequent NSIS Delete into a fast no-op (file already gone).
-    DetailPrint "Eliminando directorios rapidamente..."
+  ${If} $DeleteAppDataCheckboxState = 1
+  ${AndIf} $UpdateMode <> 1
+    DetailPrint "Eliminando datos de Rift Atlas..."
     RMDir /r "$LOCALAPPDATA\Rift Atlas"
-    RMDir /r "$INSTDIR"
-    Goto riftAtlasDone
-
-  riftAtlasSkipDelete:
-    StrCpy $RiftAtlasDeleteUserData "0"
+    RMDir /r "$APPDATA\Rift Atlas"
+    !insertmacro RIFT_ATLAS_DELETE_LEGACY_INSTALL_DATA
+  ${Else}
     DetailPrint "Se conservaran los datos de Rift Atlas."
-    ; Even if user says no, clean up engine/overlays/logs inside INSTDIR
-    ; but keep skins/downloads
-    RMDir /r "$INSTDIR\overlays"
-    RMDir /r "$INSTDIR\engine"
-    Delete "$INSTDIR\*.log"
-
-  riftAtlasDone:
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  ; Cleanup is already done in PREUNINSTALL via RMDir /r.
-  ; This hook is a safety net in case any残留 dirs remain.
-  ${If} $RiftAtlasDeleteUserData == "1"
+  ${If} $DeleteAppDataCheckboxState = 1
+  ${AndIf} $UpdateMode <> 1
     RMDir /r "$LOCALAPPDATA\Rift Atlas"
-    ${If} "$INSTDIR" != "$LOCALAPPDATA\Rift Atlas"
-      RMDir /r "$INSTDIR"
-    ${EndIf}
+    RMDir /r "$APPDATA\Rift Atlas"
+    RMDir /r "$INSTDIR"
   ${EndIf}
 !macroend
