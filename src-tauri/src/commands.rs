@@ -394,7 +394,18 @@ pub async fn select_league_game(app: AppHandle) -> Result<String, String> {
         .add_filter("League of Legends", &["exe"])
         .blocking_pick_file();
     match file {
-        Some(p) => overlay::resolve_league_game_executable(&p.to_string()),
+        Some(p) => {
+            let executable_path = overlay::resolve_league_game_executable(&p.to_string())?;
+            let game_dir = crate::config::infer_game_dir_from_league_path(&executable_path);
+            let client_dir = crate::config::infer_client_path_from_league_path(&executable_path);
+            match (game_dir, client_dir) {
+                (Some(game_dir), Some(client_dir)) => crate::config::save_paths(&game_dir, &client_dir),
+                (Some(game_dir), None) => crate::config::save_league_path(&game_dir),
+                (None, Some(client_dir)) => crate::config::save_client_path(&client_dir),
+                (None, None) => {}
+            }
+            Ok(executable_path)
+        }
         None => Ok(String::new()),
     }
 }
@@ -622,12 +633,19 @@ pub async fn check_league_install(
 pub async fn detect_league_path() -> Result<serde_json::Value, String> {
     // 1. Try existing config first
     if let Some(league) = crate::config::load_league_path() {
-        if let Some(client) = crate::config::load_client_path() {
+        if let Some(client) = crate::config::load_client_path()
+            .or_else(|| crate::config::infer_client_path_from_league_path(&league))
+        {
             let league_exe = overlay::resolve_league_game_executable(&league)
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(&league).join("League of Legends.exe"));
             let client_exe = PathBuf::from(&client).join("LeagueClient.exe");
             if league_exe.exists() && client_exe.exists() {
+                if let Some(game_dir) =
+                    crate::config::infer_game_dir_from_league_path(&league_exe.to_string_lossy())
+                {
+                    crate::config::save_paths(&game_dir, &client);
+                }
                 return Ok(serde_json::json!({
                     "detected": true,
                     "source": "config",

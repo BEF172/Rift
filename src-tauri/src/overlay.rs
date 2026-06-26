@@ -326,60 +326,24 @@ pub fn stop_early_monitor(active: &AtomicBool, pid_shared: &StdMutex<Option<u32>
     false
 }
 
-pub fn find_league_process(_game_path: &str) -> Option<u32> {
-    find_pid_by_process_name("League of Legends.exe")
+fn process_entry_name(entry: &[u16]) -> String {
+    let len = entry.iter().position(|&c| c == 0).unwrap_or(entry.len());
+    String::from_utf16_lossy(&entry[..len])
 }
 
-/// Find the full exe path of a running process by name (Rose-style: gets path
-/// from the process in memory, never searches disk).
-pub fn find_process_exe_path(target_name: &str) -> Option<String> {
+fn process_image_path(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return None;
-        }
-
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-        let target_wide: Vec<u16> = target_name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut result_pid: Option<u32> = None;
-
-        if Process32FirstW(snap, &mut entry) != 0 {
-            loop {
-                if entry.szExeFile[..target_wide.len()] == *target_wide {
-                    result_pid = Some(entry.th32ProcessID);
-                    break;
-                }
-                if Process32NextW(snap, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-
-        let pid = result_pid?;
-
-        // Open process to get its exe path (like psutil proc.info['exe'])
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
             return None;
         }
 
-        let mut buf_size: u32 = 260;
+        let mut buf_size: u32 = 1024;
         let mut buf: Vec<u16> = vec![0u16; buf_size as usize];
         let ret = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut buf_size);
         CloseHandle(handle);
@@ -388,14 +352,25 @@ pub fn find_process_exe_path(target_name: &str) -> Option<String> {
             return None;
         }
 
-        let path = String::from_utf16_lossy(&buf[..buf_size as usize]);
-        let path_buf = PathBuf::from(&path);
-        let dir = path_buf.parent()?;
-        Some(dir.to_string_lossy().to_string())
+        Some(String::from_utf16_lossy(&buf[..buf_size as usize]))
     }
 }
 
-pub fn find_pid_by_process_name(target_name: &str) -> Option<u32> {
+pub fn find_league_process(_game_path: &str) -> Option<u32> {
+    find_pid_by_process_name("League of Legends.exe")
+}
+
+/// Find the full exe path of a running process by name (Rose-style: gets path
+/// from the process in memory, never searches disk).
+pub fn find_process_exe_path(target_name: &str) -> Option<String> {
+    let (_, path) = find_processes_by_name(target_name).into_iter().next()?;
+    let path_buf = PathBuf::from(&path);
+    let dir = path_buf.parent()?;
+    Some(dir.to_string_lossy().to_string())
+}
+
+fn find_processes_by_name(target_name: &str) -> Vec<(u32, String)> {
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -404,34 +379,37 @@ pub fn find_pid_by_process_name(target_name: &str) -> Option<u32> {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return None;
+            return Vec::new();
         }
 
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
-        let target_wide: Vec<u16> = target_name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut result: Option<u32> = None;
+        let mut result = Vec::new();
 
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
-                if entry.szExeFile[..target_wide.len()] == *target_wide {
-                    result = Some(entry.th32ProcessID);
-                    break;
+                let exe_name = process_entry_name(&entry.szExeFile);
+                if exe_name.eq_ignore_ascii_case(target_name) {
+                    let pid = entry.th32ProcessID;
+                    let path = process_image_path(pid).unwrap_or_default();
+                    result.push((pid, path));
                 }
                 if Process32NextW(snap, &mut entry) == 0 {
                     break;
                 }
             }
         }
-
-        windows_sys::Win32::Foundation::CloseHandle(snap);
+        CloseHandle(snap);
         result
     }
+}
+
+pub fn find_pid_by_process_name(target_name: &str) -> Option<u32> {
+    find_processes_by_name(target_name)
+        .into_iter()
+        .next()
+        .map(|(pid, _)| pid)
 }
 
 pub fn suspend_process(pid: u32) -> Result<(), String> {
@@ -926,14 +904,22 @@ fn generate_resolved_fantonize_package(
     resolved: &ResolvedSkinEntry,
     app_data_dir: &str,
 ) -> Result<String, String> {
-    let game_folder = PathBuf::from(game_path)
+    let game_exe_parent = PathBuf::from(game_path)
         .parent()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| p.to_path_buf())
         .unwrap_or_default();
+    let game_folder = if game_exe_parent
+        .file_name()
+        .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Game"))
+        .unwrap_or(false)
+    {
+        game_exe_parent
+    } else {
+        game_exe_parent.join("Game")
+    };
 
     // Build champion WAD path: Game/DATA/FINAL/Champions/{championKey}.wad.client
-    let wad_path = PathBuf::from(&game_folder)
-        .join("Game")
+    let wad_path = game_folder
         .join("DATA")
         .join("FINAL")
         .join("Champions")

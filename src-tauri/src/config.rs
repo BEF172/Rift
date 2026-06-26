@@ -61,20 +61,84 @@ pub fn save_paths(league_path: &str, client_path: &str) {
 }
 
 pub fn infer_client_path_from_league_path(league_path: &str) -> Option<String> {
-    let league_dir = PathBuf::from(league_path.trim());
-    if league_dir
-        .file_name()?
-        .to_string_lossy()
-        .eq_ignore_ascii_case("Game")
+    let path = PathBuf::from(league_path.trim());
+    if path
+        .file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case("League of Legends.exe")
+        })
+        .unwrap_or(false)
     {
-        let client_dir = league_dir.parent()?;
+        let game_dir = path.parent()?;
+        let client_dir = game_dir.parent()?;
         if client_dir.join("LeagueClient.exe").exists() {
             return Some(client_dir.to_string_lossy().to_string());
         }
     }
-    let parent = league_dir.parent()?;
+
+    if path
+        .file_name()?
+        .to_string_lossy()
+        .eq_ignore_ascii_case("Game")
+    {
+        let client_dir = path.parent()?;
+        if client_dir.join("LeagueClient.exe").exists() {
+            return Some(client_dir.to_string_lossy().to_string());
+        }
+    }
+
+    if path.join("LeagueClient.exe").exists() {
+        return Some(path.to_string_lossy().to_string());
+    }
+
+    let parent = path.parent()?;
+    if parent
+        .file_name()
+        .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Game"))
+        .unwrap_or(false)
+    {
+        let client_dir = parent.parent()?;
+        if client_dir.join("LeagueClient.exe").exists() {
+            return Some(client_dir.to_string_lossy().to_string());
+        }
+    }
+
     if parent.join("LeagueClient.exe").exists() {
-        return Some(parent.to_string_lossy().to_string());
+        Some(parent.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+pub fn infer_game_dir_from_league_path(league_path: &str) -> Option<String> {
+    let path = PathBuf::from(league_path.trim());
+    if path
+        .file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case("League of Legends.exe")
+        })
+        .unwrap_or(false)
+    {
+        let game_dir = path.parent()?;
+        if game_dir.join("League of Legends.exe").exists() {
+            return Some(game_dir.to_string_lossy().to_string());
+        }
+    }
+
+    if path
+        .file_name()
+        .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Game"))
+        .unwrap_or(false)
+        && path.join("League of Legends.exe").exists()
+    {
+        return Some(path.to_string_lossy().to_string());
+    }
+
+    let game_dir = path.join("Game");
+    if game_dir.join("League of Legends.exe").exists() {
+        return Some(game_dir.to_string_lossy().to_string());
     }
     None
 }

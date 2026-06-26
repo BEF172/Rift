@@ -201,6 +201,35 @@ fn stage_mods(mods_dir: &Path, paths: &[String]) -> Result<Vec<String>, String> 
     Ok(names)
 }
 
+fn collect_overlay_wads(overlay_dir: &Path) -> Vec<String> {
+    let data_dir = overlay_dir.join("DATA").join("FINAL");
+    let mut pending = vec![data_dir.clone()];
+    let mut found = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let lower = path.to_string_lossy().to_lowercase();
+            if lower.ends_with(".wad") || lower.ends_with(".wad.client") {
+                let relative = path
+                    .strip_prefix(&data_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('/', "\\");
+                found.push(relative);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 fn start_runoverlay(
     mod_tools: &Path,
     game_dir: &Path,
@@ -346,6 +375,23 @@ fn build_overlay(
         return Err(format!(
             "mkoverlay no genero DATA en {}",
             overlay_dir.display()
+        ));
+    }
+    let overlay_wads = collect_overlay_wads(&overlay_dir);
+    if overlay_wads.is_empty() {
+        overlay::append_overlay_log(&format!(
+            "[Engine] mkoverlay genero DATA sin WADs detectables en {}.",
+            overlay_dir.display()
+        ));
+    } else {
+        overlay::append_overlay_log(&format!(
+            "[Engine] overlay WADs: {}",
+            overlay_wads
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
         ));
     }
     junction::clean_dir(&mods_dir);

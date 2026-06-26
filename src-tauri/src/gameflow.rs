@@ -454,6 +454,24 @@ fn phase_needs_cleanup(phase: &str, previous: &str) -> bool {
 
 async fn stop_overlay_for_phase(app: &AppHandle, phase: &str, previous: &str) {
     let state = app.state::<AppState>();
+
+    if matches!(phase, "None" | "Matchmaking" | "ReadyCheck") {
+        let has_runner = state.running_overlay_process.lock().await.is_some();
+        let building = *state.active_overlay_run.lock().await;
+        let early_active = state.early_monitor_active.load(Ordering::SeqCst);
+        if has_runner || building || early_active {
+            overlay::append_overlay_log(&format!(
+                "[Gameflow] {} -> {}: cleanup diferido; overlay activo/building={} early={} runner={}.",
+                previous,
+                phase,
+                building,
+                early_active,
+                has_runner
+            ));
+            return;
+        }
+    }
+
     state.overlay_cancel_epoch.fetch_add(1, Ordering::SeqCst);
     state.early_monitor_active.store(false, Ordering::SeqCst);
     let early_pid = match state.early_monitor_pid.lock() {
