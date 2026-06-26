@@ -3288,7 +3288,7 @@ dependencies = [
 
 [[package]]
 name = "rift-atlas"
-version = "2.0.9"
+version = "2.0.8"
 dependencies = [
  "base64 0.22.1",
  "chrono",
