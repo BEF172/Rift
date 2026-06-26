@@ -1,6 +1,6 @@
 {
   "name": "rift-atlas",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Aplicacion desktop de League of Legends basada en Data Dragon.",
   "main": "main.js",
   "scripts": {

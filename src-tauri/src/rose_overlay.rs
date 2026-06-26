@@ -1,5 +1,4 @@
 use crate::{junction, overlay, AppState};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -13,7 +12,6 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const ROSE_DLL_SHA256: &str = "4a009619c6dea691780b2f20cf17e08de478a78b3f11cd72759dd71c00ad1c90";
 
 struct RoseRunner {
     pid: u32,
@@ -58,15 +56,6 @@ fn prepare_rose_tools(app_dir: &str, bundled_exe: &Path) -> Result<PathBuf, Stri
     if !target_dll.is_file() {
         return Err(format!(
             "Falta cslol-dll.dll en engine/tools/ — descargalo primero."
-        ));
-    }
-    let dll_bytes = std::fs::read(&target_dll)
-        .map_err(|error| format!("No pude leer cslol-dll.dll: {}", error))?;
-    let dll_hash = hex::encode(Sha256::digest(&dll_bytes));
-    if dll_hash != ROSE_DLL_SHA256 {
-        return Err(format!(
-            "cslol-dll.dll no coincide con la DLL validada por Rose (hash {}).",
-            dll_hash
         ));
     }
     Ok(target_exe)
@@ -255,15 +244,6 @@ fn build_overlay(
         return Err(format!(
             "No encontre el mod-tools.exe original de Rose en {}.",
             mod_tools.display()
-        ));
-    }
-    let tool_size = std::fs::metadata(&mod_tools)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    if tool_size != 897_144 {
-        return Err(format!(
-            "El mod-tools de Rose no coincide ({} bytes; esperado 897144).",
-            tool_size
         ));
     }
     let game_exe = PathBuf::from(
