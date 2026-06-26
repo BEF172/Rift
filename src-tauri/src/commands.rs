@@ -819,6 +819,25 @@ fn list_league_final_files(final_dir: &PathBuf) -> Result<Vec<LeagueFileEntry>, 
 
 // Overlay commands
 
+fn is_preserved_rose_overlay_path(path: &str) -> bool {
+    let parts: Vec<String> = PathBuf::from(path)
+        .components()
+        .filter_map(|part| {
+            let text = part.as_os_str().to_string_lossy().to_ascii_lowercase();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        })
+        .collect();
+
+    parts.iter().any(|part| part == "rosev2")
+        || parts
+            .windows(3)
+            .any(|window| window == ["engine", "injection", "overlay"])
+}
+
 #[tauri::command]
 pub async fn overlay_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let has_pid = state.running_overlay_process.lock().await.is_some();
@@ -831,8 +850,9 @@ pub async fn overlay_status(state: State<'_, AppState>) -> Result<serde_json::Va
         .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
         .unwrap_or(false);
     let error = state.current_overlay_error.lock().await.clone();
-    let profile_path = state.current_overlay_path.lock().await.clone();
+    let mut profile_path = state.current_overlay_path.lock().await.clone();
     let has_error = !error.is_empty();
+    let mut preserved_rose_overlay = false;
 
     // If PID exists but process died, clean up state
     if has_pid && !alive {
@@ -840,11 +860,7 @@ pub async fn overlay_status(state: State<'_, AppState>) -> Result<serde_json::Va
         *state.running_overlay_process.lock().await = None;
         *state.running_overlay_alive.lock().await = None;
         *state.running_overlay_ready.lock().await = None;
-        let is_rose_v2 = PathBuf::from(&dead_overlay_path).components().any(|part| {
-            part.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("RoseV2")
-        });
+        let is_rose_v2 = is_preserved_rose_overlay_path(&dead_overlay_path);
         if is_rose_v2 {
             // Rose's DLL may continue reading the generated WADs after the short-lived
             // runoverlay parent exits. Keep both the path and files until gameflow
@@ -852,8 +868,11 @@ pub async fn overlay_status(state: State<'_, AppState>) -> Result<serde_json::Va
             overlay::append_overlay_log(
                 "[RoseV2] runoverlay termino; overlay conservado hasta el fin de partida.",
             );
+            preserved_rose_overlay = true;
+            profile_path = dead_overlay_path.clone();
         } else {
             *state.current_overlay_path.lock().await = String::new();
+            profile_path.clear();
         }
         // Non-Rose runners own the overlay for their full lifetime, so their
         // directory can be removed as soon as the runner dies.
@@ -861,11 +880,15 @@ pub async fn overlay_status(state: State<'_, AppState>) -> Result<serde_json::Va
             overlay::wipe_overlay_dir(&dead_overlay_path);
         }
     }
+    if !profile_path.is_empty() && is_preserved_rose_overlay_path(&profile_path) {
+        preserved_rose_overlay = true;
+    }
 
-    let running = alive && !has_error;
+    let running = (alive || preserved_rose_overlay) && !has_error;
     Ok(serde_json::json!({
         "running": running,
-        "ready": ready,
+        "ready": ready || preserved_rose_overlay,
+        "preserved": preserved_rose_overlay,
         "profilePath": profile_path,
         "error": if has_error { serde_json::Value::String(error) } else { serde_json::Value::Null },
     }))

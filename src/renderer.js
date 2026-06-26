@@ -7936,7 +7936,12 @@ const bindEvents = () => {
   }
 
   if (window.riftAtlas.onPatcherDied) {
-    window.riftAtlas.onPatcherDied(() => {
+    window.riftAtlas.onPatcherDied((payload = {}) => {
+      if (payload.reason === "rose-v2-exited") {
+        window.riftAtlas.appendOverlayLog("[Diagnostico] runoverlay Rose salio; se conserva estado hasta fin de partida.").catch(() => { });
+        refreshOverlayStatus();
+        return;
+      }
       window.riftAtlas.appendOverlayLog("[Diagnostico] patcher-died event recibido, limpiando estado inmediatamente.").catch(() => { });
       state.overlayRunning = false;
       setOverlayPanelStatus({ label: "Sin overlay", message: "Overlay terminado." });

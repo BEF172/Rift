@@ -459,14 +459,16 @@ async fn stop_overlay_for_phase(app: &AppHandle, phase: &str, previous: &str) {
         let has_runner = state.running_overlay_process.lock().await.is_some();
         let building = *state.active_overlay_run.lock().await;
         let early_active = state.early_monitor_active.load(Ordering::SeqCst);
-        if has_runner || building || early_active {
+        let has_preserved_overlay = !state.current_overlay_path.lock().await.is_empty();
+        if has_runner || building || early_active || has_preserved_overlay {
             overlay::append_overlay_log(&format!(
-                "[Gameflow] {} -> {}: cleanup diferido; overlay activo/building={} early={} runner={}.",
+                "[Gameflow] {} -> {}: cleanup diferido; overlay activo/building={} early={} runner={} preserved={}.",
                 previous,
                 phase,
                 building,
                 early_active,
-                has_runner
+                has_runner,
+                has_preserved_overlay
             ));
             return;
         }
