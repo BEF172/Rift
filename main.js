@@ -1,9 +1,11 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage, shell } = require("electron");
+const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } = require("electron");
 const { execFile, spawn } = require("node:child_process");
-const { createWriteStream, existsSync } = require("node:fs");
+const { createWriteStream, existsSync, mkdirSync } = require("node:fs");
 const fs = require("node:fs/promises");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const crypto = require("node:crypto");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
@@ -13,9 +15,20 @@ const SevenZipWasm = require("7z-wasm");
 const yauzl = require("yauzl");
 const { autoUpdater } = require("electron-updater");
 const { WebSocketServer } = require("ws");
+const { createSkinsIndexStore } = require("./src/main/skins-index-store");
 
-app.commandLine.appendSwitch("disk-cache-dir", path.join(os.tmpdir(), "rift-atlas-cache"));
+const getAppDataDir = () => (app.isPackaged ? path.dirname(app.getPath("exe")) : __dirname);
+const electronProfileDir = path.join(getAppDataDir(), "webview-data");
+for (const dir of [electronProfileDir, path.join(getAppDataDir(), "cache"), path.join(getAppDataDir(), "logs"), path.join(getAppDataDir(), "crash-dumps")]) {
+  mkdirSync(dir, { recursive: true });
+}
+app.commandLine.appendSwitch("disk-cache-dir", path.join(getAppDataDir(), "cache"));
 app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
+app.setPath("userData", electronProfileDir);
+app.setPath("sessionData", electronProfileDir);
+app.setPath("cache", path.join(getAppDataDir(), "cache"));
+app.setPath("logs", path.join(getAppDataDir(), "logs"));
+app.setPath("crashDumps", path.join(getAppDataDir(), "crash-dumps"));
 
 const APP_ID = "com.riftatlas.desktop";
 const APP_ICON = path.join(__dirname, "assets", "icon.ico");
@@ -24,29 +37,12 @@ const APP_ICON_PNG = path.join(__dirname, "assets", "icon.png");
 app.setAppUserModelId(APP_ID);
 app.setName("Rift Atlas");
 
-const PLATFORM_TO_REGION = {
-  br1: "americas",
-  la1: "americas",
-  la2: "americas",
-  na1: "americas",
-  oc1: "sea",
-  eun1: "europe",
-  euw1: "europe",
-  tr1: "europe",
-  ru: "europe",
-  jp1: "asia",
-  kr: "asia",
-  ph2: "sea",
-  sg2: "sea",
-  th2: "sea",
-  tw2: "sea",
-  vn2: "sea"
-};
-
-let sessionRiotApiKey = "";
 const tierLaneCache = new Map();
 let skinMetadataCache = null;
 let penguBridgeServer = null;
+let penguAssetServer = null;
+let appTray = null;
+let isQuitting = false;
 const penguBridgeClients = new Set();
 let penguAutoActivationTimer = null;
 let penguAutoActivationInFlight = false;
@@ -55,7 +51,8 @@ const startupFlags = {
   showTutorial: process.argv.includes("--rift-atlas-show-tutorial")
 };
 
-const getFirstRunSentinelPath = () => path.join(app.getPath("userData"), ".first-run-complete");
+const skinsIndexStore = createSkinsIndexStore({ fs, path, getAppDataDir });
+const getFirstRunSentinelPath = () => path.join(getAppDataDir(), ".first-run-complete");
 const isFirstRun = () => !existsSync(getFirstRunSentinelPath());
 
 const TIER_ROLES = ["top", "jungle", "middle", "bottom", "support"];
@@ -93,7 +90,16 @@ const LEAGUE_SKINS_REPO_API = "https://api.github.com/repos/Alban1911/LeagueSkin
 const RIFT_ATLAS_RELEASE_API = "https://api.github.com/repos/BEF172/Rift/releases/latest";
 const PENGU_DISTRO_RELEASE_API = "https://api.github.com/repos/PenguLoader/distro/releases/latest";
 const ROSE_PENGU_REPO_API = "https://api.github.com/repos/Tariolle/ROSE-Pengu";
-const SKIN_INDEX_CACHE_VERSION = 7;
+const SKIN_INDEX_CACHE_VERSION = 10;
+const OVERLAY_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024; // 5GB
+const OVERLAY_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 dias
+const OVERLAY_NO_CACHE_MARKER = ".rift-atlas-no-cache";
+const MOD_STAGING_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024; // 5GB
+const MOD_STAGING_SOURCE_MARKER = ".rift-atlas-stage-source.json";
+const GAME_SUSPEND_MONITOR_INTERVAL_MS = 100;
+const GAME_SUSPEND_AUTO_RESUME_MS = 15000;
+const PENGU_BRIDGE_PORT = 45731;
+const PENGU_ASSET_PORT = 45732;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -139,8 +145,117 @@ const getFilesTotalSize = async (filePaths = []) => {
   for (const filePath of filePaths) {
     const stat = await fs.stat(filePath).catch(() => null);
     if (stat?.isFile()) total += stat.size;
+    if (stat?.isDirectory()) total += await getDirectorySize(filePath);
   }
   return total;
+};
+
+const getDirectorySize = async (dirPath) => {
+  let total = 0;
+  try {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        total += await getDirectorySize(fullPath);
+      } else if (entry.isFile()) {
+        const stat = await fs.stat(fullPath);
+        total += stat.size;
+      }
+    }
+  } catch {}
+  return total;
+};
+
+const isNoCacheOverlay = async (overlayPath = "") => {
+  try {
+    await fs.access(path.join(overlayPath, OVERLAY_NO_CACHE_MARKER));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const markOverlayCachePolicy = async (overlayPath = "") => {
+  if (!overlayPath) return;
+  const size = await getDirectorySize(overlayPath).catch(() => 0);
+  if (size > OVERLAY_CACHE_MAX_BYTES) {
+    await fs.writeFile(path.join(overlayPath, OVERLAY_NO_CACHE_MARKER), JSON.stringify({
+      reason: "oversize",
+      size,
+      maxBytes: OVERLAY_CACHE_MAX_BYTES,
+      createdAt: new Date().toISOString()
+    })).catch(() => {});
+    await appendOverlayLog(`Overlay marcado como no-cache: ${formatBytes(size)} supera ${formatBytes(OVERLAY_CACHE_MAX_BYTES)}.`).catch(() => {});
+  }
+};
+
+const cleanupNoCacheOverlay = async (overlayPath = "") => {
+  if (!overlayPath || overlayPath === currentProfilePath) return false;
+  if (!await isNoCacheOverlay(overlayPath).catch(() => false)) return false;
+  await fs.rm(overlayPath, { recursive: true, force: true }).catch(() => {});
+  await appendOverlayLog(`Overlay no-cache eliminado: ${overlayPath}`).catch(() => {});
+  return true;
+};
+
+const pruneOverlayCache = async (options = {}) => {
+  const cacheDir = path.join(getAppDataDir(), "cslol-overlay-cache");
+  const protectedPaths = new Set([currentProfilePath, ...(options.protectedPaths || [])].filter(Boolean).map((p) => path.resolve(p).toLowerCase()));
+  try {
+    const entries = await fs.readdir(cacheDir, { withFileTypes: true });
+    const dirs = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(cacheDir, entry.name);
+      const stat = await fs.stat(fullPath).catch(() => null);
+      if (!stat) continue;
+      const size = await getDirectorySize(fullPath);
+      dirs.push({
+        name: entry.name,
+        path: fullPath,
+        mtimeMs: stat.mtimeMs,
+        size,
+        noCache: await isNoCacheOverlay(fullPath).catch(() => false),
+        protected: protectedPaths.has(path.resolve(fullPath).toLowerCase())
+      });
+    }
+
+    // Ordenar por mtime mas viejo primero
+    dirs.sort((a, b) => a.mtimeMs - b.mtimeMs);
+
+    let totalBytes = dirs.reduce((sum, d) => sum + d.size, 0);
+    let pruned = 0;
+    const remaining = [];
+
+    // Borrar entries viejos por edad
+    const now = Date.now();
+    for (const dir of dirs) {
+      if (!dir.protected && (dir.noCache || dir.size > OVERLAY_CACHE_MAX_BYTES || now - dir.mtimeMs > OVERLAY_CACHE_MAX_AGE_MS)) {
+        await fs.rm(dir.path, { recursive: true, force: true }).catch(() => {});
+        totalBytes -= dir.size;
+        pruned++;
+      } else {
+        remaining.push(dir);
+      }
+    }
+
+    // Si sigue sobre el limite, borrar los mas viejos hasta estar bajo el limite
+    if (totalBytes > OVERLAY_CACHE_MAX_BYTES) {
+      for (const dir of remaining) {
+        if (totalBytes <= OVERLAY_CACHE_MAX_BYTES) break;
+        if (dir.protected) continue;
+        await fs.rm(dir.path, { recursive: true, force: true }).catch(() => {});
+        totalBytes -= dir.size;
+        pruned++;
+      }
+    }
+
+    if (pruned > 0) {
+      await appendOverlayLog(`Cache overlay podado: ${pruned} entrada(s) eliminadas. Total aprox: ${formatBytes(totalBytes)} / ${formatBytes(OVERLAY_CACHE_MAX_BYTES)}.`).catch(() => {});
+    } else if (totalBytes > OVERLAY_CACHE_MAX_BYTES) {
+      await appendOverlayLog(`Cache overlay sigue sobre ${formatBytes(OVERLAY_CACHE_MAX_BYTES)} (${formatBytes(totalBytes)}) porque las entradas restantes estan protegidas por overlay activo.`).catch(() => {});
+    }
+  } catch {}
 };
 
 const getMkoverlayTimeoutMs = (bytes = 0) => {
@@ -181,7 +296,7 @@ const getPackageWadNames = (filePath) => new Promise((resolve) => {
 
 const getOverlayCacheKey = async ({ gamePath, skinPaths = [] }) => {
   const hash = crypto.createHash("sha256");
-  hash.update("rift-atlas-overlay-cache-v2");
+  hash.update("rift-atlas-overlay-cache-v3-fresh-state");
   const gameStat = await fs.stat(gamePath).catch(() => null);
   const gameFolder = path.dirname(gamePath);
   hash.update(path.normalize(gamePath).toLowerCase());
@@ -204,8 +319,9 @@ const getOverlayCacheKey = async ({ gamePath, skinPaths = [] }) => {
   return hash.digest("hex").slice(0, 24);
 };
 
-const isUsableOverlayPath = async (overlayPath) => {
+const isUsableOverlayPath = async (overlayPath, options = {}) => {
   try {
+    if (!options.allowNoCache && await isNoCacheOverlay(overlayPath).catch(() => false)) return false;
     const entries = await fs.readdir(overlayPath);
     return entries.includes("DATA");
   } catch {
@@ -457,29 +573,6 @@ const getSkinImageUrl = (championKey, imageSkinNum) =>
   championKey && imageSkinNum !== null && imageSkinNum !== undefined
     ? `https://ddragon.leagueoflegends.com/cdn/img/champion/loading/${championKey}_${imageSkinNum}.jpg`
     : "";
-
-const riotRequest = async (host, pathName) => {
-  const apiKey = sessionRiotApiKey || process.env.RIOT_API_KEY;
-  if (!apiKey) {
-    const error = new Error("Falta la API key de Riot. Pegala en la sesion antes de buscar jugadores.");
-    error.status = 401;
-    throw error;
-  }
-
-  const response = await fetch(`https://${host}${pathName}`, {
-    headers: {
-      "X-Riot-Token": apiKey
-    }
-  });
-
-  if (!response.ok) {
-    const error = new Error(`Riot API respondio ${response.status}.`);
-    error.status = response.status;
-    throw error;
-  }
-
-  return response.json();
-};
 
 const getTierForRank = (index) => {
   if (index < 5) return "S";
@@ -786,63 +879,6 @@ const getChampionTierLane = async (lane, version) => {
   return payload;
 };
 
-const mapParticipant = (participant) => ({
-  puuid: participant.puuid,
-  riotIdGameName: participant.riotIdGameName || participant.summonerName || "Jugador",
-  riotIdTagLine: participant.riotIdTagline || participant.riotIdTagLine || "",
-  summonerName: participant.summonerName,
-  teamId: participant.teamId,
-  teamPosition: participant.teamPosition || participant.individualPosition || "UTILITY",
-  championName: participant.championName,
-  championId: participant.championId,
-  kills: participant.kills ?? 0,
-  deaths: participant.deaths ?? 0,
-  assists: participant.assists ?? 0,
-  creepScore: (participant.totalMinionsKilled ?? 0) + (participant.neutralMinionsKilled ?? 0),
-  goldEarned: participant.goldEarned ?? 0,
-  totalMinionsKilled: participant.totalMinionsKilled ?? 0,
-  neutralMinionsKilled: participant.neutralMinionsKilled ?? 0,
-  visionScore: participant.visionScore ?? 0,
-  itemIds: [participant.item0, participant.item1, participant.item2, participant.item3, participant.item4, participant.item5, participant.item6].filter(Boolean),
-  win: Boolean(participant.win)
-});
-
-const getTimelineForParticipant = async (region, matchId, puuid) => {
-  try {
-    const timeline = await riotRequest(`${region}.api.riotgames.com`, `/lol/match/v5/matches/${encodeURIComponent(matchId)}/timeline`);
-    const participant = timeline.info.participants.find((item) => item.puuid === puuid);
-    if (!participant) {
-      return [];
-    }
-
-    return timeline.info.frames
-      .flatMap((frame) => frame.events)
-      .filter((event) => event.participantId === participant.participantId && ["ITEM_PURCHASED", "ITEM_SOLD", "ITEM_DESTROYED", "ITEM_UNDO"].includes(event.type))
-      .map((event) => ({
-        type: event.type,
-        itemId: event.itemId || event.beforeId || event.afterId,
-        beforeId: event.beforeId,
-        afterId: event.afterId,
-        timestamp: event.timestamp
-      }))
-      .filter((event) => event.itemId);
-  } catch {
-    return [];
-  }
-};
-
-const parseRiotId = (riotId) => {
-  const [gameName, tagLine] = String(riotId).split("#");
-  if (!gameName || !tagLine) {
-    throw new Error("Usa el formato Riot ID: Nombre#TAG.");
-  }
-
-  return {
-    gameName: encodeURIComponent(gameName.trim()),
-    tagLine: encodeURIComponent(tagLine.trim())
-  };
-};
-
 const listModPackages = async (folderPath) => {
   const packages = [];
 
@@ -881,6 +917,129 @@ const listModPackages = async (folderPath) => {
   return packages;
 };
 
+const pruneModStagingCache = async () => {
+  const cacheDir = path.join(getAppDataDir(), "mod-staging-cache");
+  try {
+    const entries = await fs.readdir(cacheDir, { withFileTypes: true });
+    const dirs = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(cacheDir, entry.name);
+      const stat = await fs.stat(fullPath).catch(() => null);
+      if (!stat) continue;
+      dirs.push({
+        path: fullPath,
+        mtimeMs: stat.mtimeMs,
+        size: await getDirectorySize(fullPath)
+      });
+    }
+    dirs.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    let totalBytes = dirs.reduce((sum, dir) => sum + dir.size, 0);
+    let pruned = 0;
+    for (const dir of dirs) {
+      if (totalBytes <= MOD_STAGING_CACHE_MAX_BYTES) break;
+      await fs.rm(dir.path, { recursive: true, force: true }).catch(() => {});
+      totalBytes -= dir.size;
+      pruned += 1;
+    }
+    if (pruned) {
+      await appendOverlayLog(`Cache staging mods podado: ${pruned} entrada(s) eliminadas.`).catch(() => {});
+    }
+  } catch {}
+};
+
+const getStagedModSourcePath = async (modPath = "") => {
+  try {
+    const payload = JSON.parse(await fs.readFile(path.join(modPath, MOD_STAGING_SOURCE_MARKER), "utf8"));
+    return payload?.sourcePath || "";
+  } catch {
+    return "";
+  }
+};
+
+const getOverlayModFallbackPaths = async (modPaths = []) => {
+  const fallbackPaths = [];
+  let changed = false;
+  for (const modPath of modPaths) {
+    const sourcePath = await getStagedModSourcePath(modPath);
+    if (sourcePath) {
+      fallbackPaths.push(sourcePath);
+      changed = true;
+    } else {
+      fallbackPaths.push(modPath);
+    }
+  }
+  return changed ? fallbackPaths : null;
+};
+
+const LOCAL_PREVIEW_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
+
+const getLeagueSkinIdCandidates = (championId, value) => {
+  const champion = String(Number(championId) || "");
+  const raw = String(Number(value) || "");
+  if (!raw) return [];
+
+  const ids = new Set([raw]);
+  if (champion && raw.startsWith(champion) && raw.length > champion.length) {
+    const shortId = String(Number(raw.slice(champion.length)) || "");
+    if (shortId) ids.add(shortId);
+  }
+  if (champion && Number(raw) < 1000) {
+    ids.add(String((Number(champion) * 1000) + Number(raw)));
+  }
+
+  return [...ids].filter(Boolean);
+};
+
+const getLocalPreviewUri = ({ championId, skinId, chromaId }) => {
+  const safeChampionId = String(Number(championId) || "");
+  const safeSkinId = String(Number(skinId) || "");
+  const safeChromaId = String(Number(chromaId) || "");
+  if (!safeChampionId || !safeSkinId || !safeChromaId) return "";
+  return `local-preview://${safeChampionId}/${safeSkinId}/${safeChromaId}/${safeChromaId}.png`;
+};
+
+const getLocalPreviewInfo = async (item, repoParts = null) => {
+  const parts = repoParts || String(item.relativePath || "").split(path.sep).filter(Boolean);
+  const fileBase = stripModExtension(item.name);
+  const previewNames = [...new Set([
+    fileBase,
+    parts.at(-2) || "",
+    parts[2] || "",
+    parts[1] || ""
+  ].filter(Boolean))];
+  const searchDirs = [...new Set([
+    path.dirname(item.path),
+    path.dirname(path.dirname(item.path))
+  ])];
+
+  for (const dir of searchDirs) {
+    for (const name of previewNames) {
+      for (const ext of LOCAL_PREVIEW_EXTENSIONS) {
+        const previewPath = path.join(dir, `${name}${ext}`);
+        if (await fileExists(previewPath)) {
+          const championId = parts[0] || "";
+          const skinId = parts[1] || "";
+          const previewId = parts.length > 3 ? (parts[2] || fileBase) : fileBase;
+          return {
+            localPreviewPath: previewPath,
+            localPreviewUrl: pathToFileURL(previewPath).href,
+            localPreviewUri: championId && skinId && previewId
+              ? `local-preview://${championId}/${skinId}/${previewId}/${path.basename(previewPath)}`
+              : ""
+          };
+        }
+      }
+    }
+  }
+
+  return {
+    localPreviewPath: "",
+    localPreviewUrl: "",
+    localPreviewUri: ""
+  };
+};
+
 const getModPackageExtension = (filePath) => {
   const lowercaseName = path.basename(String(filePath || "")).toLowerCase();
   return lowercaseName.endsWith(".wad.client") ? ".wad.client" : path.extname(lowercaseName);
@@ -893,18 +1052,42 @@ const getModPackageFromFile = async (filePath, rootPath = path.dirname(filePath)
   }
 
   const stat = await fs.stat(filePath);
+  const archiveInfo = await inspectArchivePackage(filePath).catch(() => ({}));
+  const relativePath = path.relative(rootPath, filePath) || path.basename(filePath);
+  const relativeParts = relativePath.split(path.sep).filter(Boolean);
+  const roseSkinId = relativeParts[0]?.toLowerCase() === "skins" && /^\d+$/.test(relativeParts[1] || "")
+    ? Number(relativeParts[1])
+    : 0;
+  const roseChampionId = roseSkinId ? Math.floor(roseSkinId / 1000) : 0;
+  const roseSkinNum = roseSkinId ? roseSkinId % 1000 : null;
   return {
     name: path.basename(filePath),
     extension,
     path: filePath,
-    relativePath: path.relative(rootPath, filePath) || path.basename(filePath),
+    relativePath,
     size: stat.size,
     mtimeMs: stat.mtimeMs,
+    archiveInfo,
+    targetWads: archiveInfo.targetWads || [],
+    targetSkinNums: archiveInfo.targetSkinNums || [],
+    rawChampion: roseChampionId ? String(roseChampionId) : "",
+    rawSkin: roseSkinId ? String(roseSkinId) : "",
+    rawVariant: stripModExtension(path.basename(filePath)),
+    champion: roseChampionId ? String(roseChampionId) : "",
+    championKey: roseChampionId ? String(roseChampionId) : "",
+    championId: roseChampionId ? String(roseChampionId) : "",
+    skin: roseSkinId ? String(roseSkinId) : "",
+    skinId: roseSkinId || undefined,
+    skinNum: roseSkinNum,
+    variant: stripModExtension(path.basename(filePath)),
+    source: roseSkinId ? "user-mods" : "local",
     custom: true
   };
 };
 
-const getSkinIndexCachePath = () => path.join(app.getPath("userData"), "cache", "skin-library-index.json");
+const getSkinIndexCachePath = () => path.join(getAppDataDir(), "cache", "skin-library-index.json");
+const getUnifiedLibraryIndexPath = () => skinsIndexStore.getIndexPath();
+const getPreviewCacheDir = () => skinsIndexStore.getPreviewCacheDir();
 
 const readSkinIndexCache = async (folderPath) => {
   try {
@@ -913,7 +1096,13 @@ const readSkinIndexCache = async (folderPath) => {
       return new Map();
     }
 
-    return new Map(payload.skins.map((skin) => [skin.path, skin]));
+    const existingSkins = [];
+    for (const skin of payload.skins) {
+      if (skin?.path && await fileExists(skin.path)) {
+        existingSkins.push(skin);
+      }
+    }
+    return new Map(existingSkins.map((skin) => [skin.path, skin]));
   } catch {
     return new Map();
   }
@@ -937,71 +1126,143 @@ const isCachedSkinFresh = (cached, item) =>
   Number(cached.mtimeMs || 0) === Number(item.mtimeMs || 0);
 
 const handleChromaDataRequest = async (message, socket) => {
-  try {
-    const championKey = String(message.championKey || message.championId || "");
-    if (!championKey) return;
-    const skinId = Number(message.skinId || 0);
-    if (!skinId) return;
+    try {
+        const skinId = Number(message.skinId || message.baseSkinId || 0);
+        const championKey = String(message.championKey || message.championId || "");
+        const requestedSkinName = normalizeChampionName(message.skinName || message.name || "");
+        const knownChromaIds = Array.isArray(message.knownChromaIds)
+            ? new Set(message.knownChromaIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))
+            : new Set();
 
-    const cachePath = getSkinIndexCachePath();
-    const content = await fs.readFile(cachePath, "utf8");
-    const payload = JSON.parse(content);
-    const allSkins = Array.isArray(payload.skins) ? payload.skins : [];
+        if (!skinId) return;
 
-    let entries = allSkins.filter((s) => String(s.championId || "") === championKey);
+        const sendResponse = (chromas, error, baseSkinId = 0) => {
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: "chroma-data", skinId, baseSkinId, championId: Number(championKey), championKey, chromas, error: error || null }));
+            }
+        };
 
-    if (entries.length === 0) {
-      entries = allSkins.filter((s) => String(s.championKey || "") === championKey);
-    }
+        const cachePath = getSkinIndexCachePath();
+        const content = await fs.readFile(cachePath, "utf8").catch(() => "{}");
+        const payload = JSON.parse(content);
+        const allSkins = Array.isArray(payload.skins) ? payload.skins : [];
 
-    if (entries.length === 0 && /^\d+$/.test(championKey)) {
-      try {
-        const metadata = await getSkinMetadata();
-        const champ = metadata?.championsByKey?.get(championKey);
-        if (champ?.id) {
-          entries = allSkins.filter((s) => String(s.championKey || "") === champ.id);
+        if (allSkins.length === 0) { sendResponse([], "cache-vacio"); return; }
+
+        const championEntries = allSkins.filter(s => String(s.championId || s.championKey) === championKey);
+        if (championEntries.length === 0) { sendResponse([], "sin-champion"); return; }
+
+        const targetSkinNum = skinId % 1000;
+        const championIdNum = Number(championKey) || 0;
+        const targetFullSkinId = championIdNum && targetSkinNum >= 0
+            ? (championIdNum * 1000) + targetSkinNum
+            : skinId;
+        const toFullId = (value) => {
+            const numeric = Number(value || 0);
+            if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+            if (!championIdNum || numeric >= 1000) return numeric;
+            return (championIdNum * 1000) + numeric;
+        };
+        const firstNumericId = (...values) => {
+            for (const value of values) {
+                const numeric = Number(value || 0);
+                if (Number.isFinite(numeric) && numeric > 0) return numeric;
+            }
+            return 0;
+        };
+        const getEntryBaseId = (entry) =>
+            toFullId(firstNumericId(entry?.rawSkin, entry?.baseSkinId, entry?.baseImageSkinNum, entry?.imageSkinNum, entry?.skinNum));
+        const getEntryVariantId = (entry) =>
+            toFullId(firstNumericId(entry?.rawVariant, entry?.fileBaseId, entry?.skinNum, entry?.imageSkinNum, entry?.rawSkin));
+        const isRealChromaEntry = (entry) => {
+            const baseId = getEntryBaseId(entry);
+            const variantId = getEntryVariantId(entry);
+            return baseId > 0 && variantId > 0 && variantId !== baseId;
+        };
+        const matchesRequestedBase = (entry, baseId = targetFullSkinId) => {
+            const entryBaseId = getEntryBaseId(entry);
+            const entryVariantId = getEntryVariantId(entry);
+            return entryBaseId === baseId || entryVariantId === baseId;
+        };
+        const requestedBaseSkinId =
+            getEntryBaseId(championEntries.find((entry) => getEntryVariantId(entry) === targetFullSkinId)) ||
+            targetFullSkinId;
+
+        let chromaCandidates = championEntries.filter(e =>
+            isRealChromaEntry(e) && matchesRequestedBase(e, requestedBaseSkinId)
+        );
+
+        if (knownChromaIds.size > 0) {
+            const byKnownIds = championEntries.filter(e => {
+                const rawVariantId = Number(e.rawVariant || 0);
+                const rawSkinId = Number(e.rawSkin || 0);
+                const skinNum = Number(e.skinNum || 0);
+                return knownChromaIds.has(rawVariantId) ||
+                    knownChromaIds.has(rawSkinId) ||
+                    knownChromaIds.has(skinNum) ||
+                    knownChromaIds.has(Number(`${championKey}${String(skinNum).padStart(3, "0")}`));
+            });
+            if (byKnownIds.length > 0) {
+                chromaCandidates = byKnownIds;
+            }
         }
-      } catch {}
+
+        if (chromaCandidates.length === 0 && requestedSkinName) {
+            const namedBase = championEntries.find(e => {
+                const names = [e.skin, e.variant, e.metaName, e.name].map((value) => normalizeChampionName(value || ""));
+                return names.some((name) => name && (name.includes(requestedSkinName) || requestedSkinName.includes(name)));
+            });
+            const namedBaseId = getEntryBaseId(namedBase);
+            if (namedBaseId > 0) {
+                chromaCandidates = championEntries.filter(e =>
+                    isRealChromaEntry(e) && matchesRequestedBase(e, namedBaseId)
+                );
+            }
+        }
+
+        if (chromaCandidates.length === 0 && targetSkinNum !== 0) {
+            chromaCandidates = championEntries.filter(e => {
+                const rawSkinId = getEntryBaseId(e);
+                const rawVariantId = getEntryVariantId(e);
+                return rawSkinId > 0 &&
+                    rawSkinId % 1000 === targetSkinNum &&
+                    rawVariantId > 0 &&
+                    rawVariantId !== rawSkinId;
+            });
+        }
+
+        if (chromaCandidates.length === 0 && targetSkinNum === 0) {
+            sendResponse([], null);
+            return;
+        }
+
+        const resolvedBaseSkinId = getEntryBaseId(chromaCandidates[0]) || skinId;
+
+        const chromas = await Promise.all(chromaCandidates.map(async (v) => {
+          const variantId = getEntryVariantId(v) || 0;
+          const baseId = getEntryBaseId(v) || 0;
+          const previewPath = v.localPreviewPath && await fileExists(v.localPreviewPath)
+            ? v.localPreviewPath
+            : await findIndexedPreviewFile({ championId: championKey, skinId: baseId, chromaId: variantId })
+              || await findLeagueSkinsPreviewFile({ championId: championKey, skinId: baseId, chromaId: variantId });
+          return {
+            id: variantId,
+            baseId,
+            name: v.variant || v.skin || `Skin ${v.skinNum}`,
+            variant: v.variant || "",
+            skin: v.skin || "",
+            imagePath: previewPath
+              ? getLocalPreviewUri({ championId: championKey, skinId: baseId, chromaId: variantId })
+              : "",
+            colors: [],
+            primaryColor: null,
+          };
+        }));
+
+        sendResponse(chromas, null, resolvedBaseSkinId);
+    } catch (e) {
+        try { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "chroma-data", chromas: [], error: "handler-error" })); } catch (_) {}
     }
-
-    if (entries.length === 0) return;
-
-    const reqSkinNum = skinId % 1000;
-
-    let skinGroup = entries.filter((e) => e.imageSkinNum === reqSkinNum);
-
-    if (skinGroup.length === 0) {
-      const chromaEntry = entries.find((e) => e.skinNum === reqSkinNum);
-      if (chromaEntry) {
-        skinGroup = entries.filter((e) => e.imageSkinNum === chromaEntry.imageSkinNum);
-      }
-    }
-
-    if (skinGroup.length === 0) return;
-
-    const baseEntry = skinGroup.find((e) => e.skinNum === e.imageSkinNum);
-    if (!baseEntry) return;
-
-    const chromaVariants = skinGroup.filter((e) => e.skinNum !== e.imageSkinNum);
-    if (chromaVariants.length === 0) return;
-
-    const chromas = chromaVariants.map((v) => ({
-      id: v.skinNum,
-      baseId: baseEntry.skinNum,
-      name: v.variant || v.skin || `Chroma ${v.skinNum}`,
-      imagePath: v.imageUrl || "",
-      colors: [],
-      primaryColor: null,
-      selected: false,
-      locked: false,
-    }));
-
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "chroma-data", championKey, skinId, chromas }));
-    }
-  } catch (e) {
-    console.warn("[Pengu bridge] chroma lookup error:", e.message);
-  }
 };
 
 const inspectArchivePackage = (filePath) => new Promise((resolve) => {
@@ -1013,7 +1274,9 @@ const inspectArchivePackage = (filePath) => new Promise((resolve) => {
         resolve({
           wadCount: 1,
           maxWadSize: stat.size,
-          suspicious
+          suspicious,
+          targetWads: [path.basename(filePath)],
+          targetSkinNums: []
         });
       })
       .catch(() => resolve({}));
@@ -1036,12 +1299,19 @@ const inspectArchivePackage = (filePath) => new Promise((resolve) => {
     let hasMetaInfo = false;
     let hasMetaDetails = false;
     let hasWadFolder = false;
+    const targetWads = new Set();
+    const targetSkinNums = new Set();
     zipfile.readEntry();
     zipfile.on("entry", (entry) => {
-      const entryName = entry.fileName.toLowerCase();
+      const normalizedEntryName = entry.fileName.replace(/\\/g, "/");
+      const entryName = normalizedEntryName.toLowerCase();
       if (entryName === "meta/info.json") hasMetaInfo = true;
       if (entryName === "meta/details.json") hasMetaDetails = true;
       if (entryName.startsWith("wad/")) hasWadFolder = true;
+      const wadMatch = normalizedEntryName.match(/(?:^|\/)WAD\/([^/]+\.wad(?:\.client)?)(?:\/|$)/i);
+      if (wadMatch?.[1]) targetWads.add(wadMatch[1]);
+      const skinMatch = entryName.match(/(?:^|\/)skins\/skin(\d+)(?:\.bin|\/)/i);
+      if (skinMatch?.[1]) targetSkinNums.add(Number(skinMatch[1]));
       if (entryName.endsWith(".wad") || entryName.endsWith(".wad.client")) {
         wadCount += 1;
         maxWadSize = Math.max(maxWadSize, entry.uncompressedSize || 0);
@@ -1056,7 +1326,9 @@ const inspectArchivePackage = (filePath) => new Promise((resolve) => {
         suspicious,
         hasMetaInfo,
         hasMetaDetails,
-        hasWadFolder
+        hasWadFolder,
+        targetWads: [...targetWads].sort((a, b) => a.localeCompare(b)),
+        targetSkinNums: [...targetSkinNums].sort((a, b) => a - b)
       });
     });
     zipfile.on("error", () => resolve({}));
@@ -1119,7 +1391,7 @@ const processSkinPackage = async (item, metadata) => {
   const repoParts = parts.slice(offset);
   const rawChampion = repoParts[0] || "Sin campeon";
   const rawSkin = repoParts[1] || stripModExtension(item.name);
-  const rawVariant = repoParts.length > 3 ? repoParts[2] : "";
+  const rawVariant = repoParts.length >= 3 ? repoParts[2] : "";
   const championEntry = metadata?.championsByKey.get(String(rawChampion));
   const fileBase = stripModExtension(item.name);
   const fileBaseId = fileBase.match(/^\d+$/) ? fileBase : "";
@@ -1139,6 +1411,11 @@ const processSkinPackage = async (item, metadata) => {
   let imageSkinNum = null;
   let baseImageSkinNum = null;
   let numericSource = isNumericId(rawChampion) || isNumericId(rawSkin) || isNumericId(fileBaseId);
+  const localPreview = await getLocalPreviewInfo(item, repoParts).catch(() => ({
+    localPreviewPath: "",
+    localPreviewUrl: "",
+    localPreviewUri: ""
+  }));
 
   if (championEntry) {
     const skinFromPath = skins.get(String(rawSkin));
@@ -1189,6 +1466,7 @@ const processSkinPackage = async (item, metadata) => {
     rawChampion,
     rawSkin,
     rawVariant,
+    fileBaseId,
     champion,
     championKey,
     championId,
@@ -1196,7 +1474,9 @@ const processSkinPackage = async (item, metadata) => {
     skinNum,
     imageSkinNum,
     baseImageSkinNum,
-    imageUrl: getSkinImageUrl(championKey, imageSkinNum),
+    imageUrl: localPreview.localPreviewUrl || "",
+    localPreviewPath: localPreview.localPreviewPath,
+    localPreviewUri: localPreview.localPreviewUri,
     variant,
     resolved: Boolean(championEntry || skins.has(String(rawSkin)) || skins.has(String(fileBaseId))),
     numericSource,
@@ -1214,7 +1494,8 @@ const getFallbackSkinPackage = (item) => {
     ...item,
     rawChampion: repoParts[0] || "Sin campeon",
     rawSkin: repoParts[1] || stripModExtension(item.name),
-    rawVariant: repoParts.length > 3 ? repoParts[2] : "",
+    rawVariant: repoParts.length >= 3 ? repoParts[2] : "",
+    fileBaseId: stripModExtension(item.name).match(/^\d+$/) ? stripModExtension(item.name) : "",
     champion: repoParts[0] || "Sin campeon",
     championKey: "",
     championId: "",
@@ -1223,7 +1504,9 @@ const getFallbackSkinPackage = (item) => {
     imageSkinNum: null,
     baseImageSkinNum: null,
     imageUrl: "",
-    variant: repoParts.length > 3 ? repoParts[2] : "",
+    localPreviewPath: "",
+    localPreviewUri: "",
+    variant: repoParts.length >= 3 ? repoParts[2] : "",
     resolved: false,
     numericSource: false,
     archiveInfo: item.archiveInfo || {},
@@ -1319,7 +1602,7 @@ const downloadAndIndexLeagueSkins = async (window) => {
   });
   const branch = repo.default_branch || "main";
   const downloadUrl = `https://codeload.github.com/Alban1911/LeagueSkins/zip/refs/heads/${encodeURIComponent(branch)}`;
-  const installRoot = path.join(app.getPath("userData"), "downloaded-libraries");
+  const installRoot = path.join(getAppDataDir(), "downloaded-libraries");
   const targetDir = path.join(installRoot, "LeagueSkins");
   const tempDir = path.join(installRoot, "LeagueSkins.download");
   const zipPath = path.join(tempDir, "LeagueSkins.zip");
@@ -1376,7 +1659,7 @@ const downloadAndIndexLeagueSkins = async (window) => {
 };
 
 const getDownloadedLeagueSkinsPath = async () => {
-  const targetDir = path.join(app.getPath("userData"), "downloaded-libraries", "LeagueSkins");
+  const targetDir = path.join(getAppDataDir(), "downloaded-libraries", "LeagueSkins");
   const skinsDir = path.join(targetDir, "skins");
   try {
     const stat = await fs.stat(skinsDir);
@@ -1427,23 +1710,6 @@ const resolveLeagueGameExecutable = async (selectedPath) => {
   throw new Error("Selecciona el ejecutable del juego: ...\\League of Legends\\Game\\League of Legends.exe, no LeagueClient.exe.");
 };
 
-ipcMain.handle("riot:has-api-key", () => Boolean(sessionRiotApiKey || process.env.RIOT_API_KEY));
-
-ipcMain.handle("riot:set-api-key", (_event, apiKey) => {
-  const normalizedKey = String(apiKey || "").trim();
-  if (!normalizedKey.startsWith("RGAPI-")) {
-    throw new Error("La API key debe empezar con RGAPI-.");
-  }
-
-  sessionRiotApiKey = normalizedKey;
-  return true;
-});
-
-ipcMain.handle("riot:clear-api-key", () => {
-  sessionRiotApiKey = "";
-  return Boolean(process.env.RIOT_API_KEY);
-});
-
 const normalizeVersion = (value = "") =>
   String(value || "").trim().replace(/^v/i, "");
 
@@ -1481,6 +1747,7 @@ ipcMain.handle("app:check-updates", async () => {
   const setupAsset = (release.assets || []).find((asset) =>
     /\.exe$/i.test(asset.name || "") && /setup|rift|atlas/i.test(asset.name || "")
   ) || (release.assets || []).find((asset) => /\.exe$/i.test(asset.name || ""));
+  const latestMetadataAsset = (release.assets || []).find((asset) => /^latest\.ya?ml$/i.test(asset.name || ""));
   const downloadUrl = setupAsset?.browser_download_url || release.html_url || "";
 
   return {
@@ -1490,6 +1757,8 @@ ipcMain.handle("app:check-updates", async () => {
     releaseUrl: release.html_url || "",
     downloadUrl,
     assetName: setupAsset?.name || "",
+    hasAutoUpdate: Boolean(setupAsset && latestMetadataAsset),
+    latestMetadataName: latestMetadataAsset?.name || "",
     publishedAt: release.published_at || "",
     notes: String(release.body || "").slice(0, 1200),
     hasUpdate: compareVersions(latestVersion, currentVersion) > 0
@@ -1578,8 +1847,8 @@ ipcMain.handle("app:download-update", async (event, payload = {}) => {
 
 const cleanupUpdateInstallers = async () => {
   const candidates = [
-    path.join(app.getPath("userData"), "updates"),
-    path.join(app.getPath("userData"), "pending"),
+    path.join(getAppDataDir(), "updates"),
+    path.join(getAppDataDir(), "pending"),
     path.join(app.getPath("temp"), "Rift Atlas-updater"),
     path.join(app.getPath("temp"), "rift-atlas-updater"),
     path.join(app.getPath("temp"), `${app.getName()}-updater`)
@@ -1608,7 +1877,7 @@ ipcMain.handle("app:open-external", (_event, url) => {
   return true;
 });
 
-ipcMain.handle("app:get-user-data-path", () => app.getPath("userData"));
+ipcMain.handle("app:get-user-data-path", () => getAppDataDir());
 ipcMain.handle("app:get-version", () => app.getVersion());
 
 ipcMain.handle("app:get-startup-flags", () => ({
@@ -1625,48 +1894,65 @@ ipcMain.handle("app:mark-first-run-complete", async () => {
 ipcMain.on("app:tutorial-log", () => { });
 
 ipcMain.handle("app:factory-reset", async () => {
-  const userDataPath = app.getPath("userData");
+  const userDataPath = getAppDataDir();
+  await cancelOverlayRun("Restablecer de fabrica.").catch(() => false);
   if (runningOverlayProcess) {
     runningOverlayProcess.stdin?.write("\n");
     runningOverlayProcess.kill();
     runningOverlayProcess = null;
   }
+  await uninstallPenguLoader().catch(() => {});
+  await terminatePenguLoaderUi().catch(() => {});
 
   const resetTargets = [
     "cache",
     "cslol-overlay-cache",
     "cslol-profiles",
+    "downloaded-libraries",
+    "downloaded-updates",
     "engine",
     "hashtable",
+    "ltk-dll",
     "mod-files",
+    "mod-staging-cache",
     "party-files",
+    "pengu-loader",
+    "Pengu Loader",
     "presets",
     "skin-library-index.json",
     "engine-version.txt",
     "overlay.log",
+    "last-overlay-log.txt",
     ".first-run-complete"
   ].map((entry) => path.join(userDataPath, entry));
 
+  const removed = [];
+  const failed = [];
   for (const target of resetTargets) {
-    await fs.rm(target, { recursive: true, force: true }).catch(() => { });
+    try {
+      await fs.rm(target, { recursive: true, force: true });
+      removed.push(target);
+    } catch (error) {
+      failed.push({ target, error: error.message });
+    }
   }
 
   app.relaunch({
     args: [...process.argv.slice(1), "--rift-atlas-show-tutorial"]
   });
   app.exit(0);
-  return { scheduled: true, userDataPath };
+  return { scheduled: true, userDataPath, removed, failed };
 });
 
 ipcMain.handle("app:get-engine-dll-status", async () => {
-  const engineDir = path.join(app.getPath("userData"), "engine");
+  const engineDir = path.join(getAppDataDir(), "engine");
   const dllPath = path.join(engineDir, "cslol-dll.dll");
   const exists = await fs.access(dllPath).then(() => true).catch(() => false);
   return { exists, engineDir, dllPath };
 });
 
 ipcMain.handle("app:open-engine-folder", async () => {
-  const engineDir = path.join(app.getPath("userData"), "engine");
+  const engineDir = path.join(getAppDataDir(), "engine");
   await fs.mkdir(engineDir, { recursive: true });
   const error = await shell.openPath(engineDir);
   if (error) {
@@ -1676,12 +1962,132 @@ ipcMain.handle("app:open-engine-folder", async () => {
 });
 
 ipcMain.handle("app:open-user-data-path", async () => {
-  const targetPath = app.getPath("userData");
+  const targetPath = getAppDataDir();
   await fs.mkdir(targetPath, { recursive: true });
   const error = await shell.openPath(targetPath);
   if (error) {
     throw new Error(error);
   }
+  return targetPath;
+});
+
+ipcMain.handle("library:read-index", async () => {
+  return skinsIndexStore.read();
+});
+
+ipcMain.handle("library:write-index", async (_event, payload = {}) => {
+  return skinsIndexStore.write(payload);
+});
+
+ipcMain.handle("library:select-preview-image", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "Seleccionar preview",
+    properties: ["openFile"],
+    filters: [
+      { name: "Imagenes", extensions: ["png", "jpg", "jpeg", "webp"] },
+      { name: "Todos", extensions: ["*"] }
+    ]
+  });
+  return result.canceled ? "" : result.filePaths[0] || "";
+});
+
+ipcMain.handle("library:cache-preview", async (_event, payload = {}) => {
+  const source = String(payload.source || "");
+  const key = crypto.createHash("sha1").update(String(payload.key || source || Date.now())).digest("hex");
+  const cacheDir = getPreviewCacheDir();
+  await fs.mkdir(cacheDir, { recursive: true });
+  let buffer = null;
+  let extension = ".jpg";
+
+  if (/^https?:\/\//i.test(source)) {
+    const response = await fetch(source, { headers: { "user-agent": "RiftAtlas" } });
+    if (!response.ok) throw new Error(`No pude cachear preview (${response.status}).`);
+    buffer = Buffer.from(await response.arrayBuffer());
+    const contentType = String(response.headers.get("content-type") || "");
+    extension = contentType.includes("png") ? ".png" : contentType.includes("webp") ? ".webp" : ".jpg";
+  } else if (source) {
+    buffer = await fs.readFile(source);
+    const ext = path.extname(source).toLowerCase();
+    extension = [".png", ".jpg", ".jpeg", ".webp"].includes(ext) ? ext : ".png";
+  }
+
+  if (!buffer) throw new Error("Preview vacia.");
+  const previewPath = path.join(cacheDir, `${key}${extension}`);
+  await fs.writeFile(previewPath, buffer);
+  return { previewPath, previewUrl: pathToFileURL(previewPath).href };
+});
+
+const getMaintenanceDirInfo = async (name, relativePath) => {
+  const targetPath = path.join(getAppDataDir(), relativePath);
+  const exists = await fileExists(targetPath);
+  return {
+    name,
+    path: targetPath,
+    exists,
+    size: exists ? await getDirectorySize(targetPath).catch(() => 0) : 0
+  };
+};
+
+ipcMain.handle("maintenance:status", async () => {
+  const targets = await Promise.all([
+    getMaintenanceDirInfo("Overlays", "cslol-overlay-cache"),
+    getMaintenanceDirInfo("Previews", path.join("cache", "previews")),
+    getMaintenanceDirInfo("Party P2P", "p2p"),
+    getMaintenanceDirInfo("Party transfers", "party-transfers"),
+    getMaintenanceDirInfo("Descargas temporales", "downloads"),
+    getMaintenanceDirInfo("Mod staging", "mod-staging-cache")
+  ]);
+  return { appDataDir: getAppDataDir(), targets };
+});
+
+ipcMain.handle("maintenance:cleanup", async (_event, payload = {}) => {
+  const allowed = new Map([
+    ["overlays", "cslol-overlay-cache"],
+    ["previews", path.join("cache", "previews")],
+    ["party", "p2p"],
+    ["party-transfers", "party-transfers"],
+    ["downloads", "downloads"],
+    ["staging", "mod-staging-cache"]
+  ]);
+  const requested = Array.isArray(payload.targets) ? payload.targets : [];
+  const removed = [];
+  for (const key of requested) {
+    const relativePath = allowed.get(key);
+    if (!relativePath) continue;
+    const targetPath = path.resolve(path.join(getAppDataDir(), relativePath));
+    const appDataRoot = path.resolve(getAppDataDir());
+    if (targetPath !== appDataRoot && targetPath.startsWith(`${appDataRoot}${path.sep}`)) {
+      await fs.rm(targetPath, { recursive: true, force: true }).catch(() => {});
+      removed.push(targetPath);
+    }
+  }
+  return { removed };
+});
+
+ipcMain.handle("maintenance:export-diagnostics", async (_event, payload = {}) => {
+  const exportPath = path.join(getAppDataDir(), `rift-atlas-diagnostics-${Date.now()}.json`);
+  const diagnostics = {
+    createdAt: new Date().toISOString(),
+    appVersion: app.getVersion(),
+    appDataDir: getAppDataDir(),
+    payload,
+    maintenance: await Promise.all([
+      getMaintenanceDirInfo("Overlays", "cslol-overlay-cache"),
+      getMaintenanceDirInfo("Previews", path.join("cache", "previews")),
+      getMaintenanceDirInfo("Party P2P", "p2p"),
+      getMaintenanceDirInfo("Mod staging", "mod-staging-cache")
+    ])
+  };
+  await fs.writeFile(exportPath, JSON.stringify(diagnostics, null, 2), "utf8");
+  shell.showItemInFolder(exportPath);
+  return { exportPath };
+});
+
+ipcMain.handle("maintenance:open-logs-folder", async () => {
+  const targetPath = getAppDataDir();
+  await fs.mkdir(targetPath, { recursive: true });
+  const error = await shell.openPath(targetPath);
+  if (error) throw new Error(error);
   return targetPath;
 });
 
@@ -1716,6 +2122,8 @@ ipcMain.handle("pengu:launch-loader", async () => launchPenguLoader({
 }));
 
 ipcMain.handle("pengu:deactivate-loader", async () => deactivatePenguLoader({ allowElevation: true }));
+
+ipcMain.handle("pengu:uninstall-loader", async () => uninstallPenguLoader());
 
 ipcMain.handle("pengu:close-loader-ui", async () => ({ closed: await terminatePenguLoaderUi() }));
 
@@ -1760,6 +2168,169 @@ ipcMain.handle("mods:select-custom-mod-files", async () => {
   return packages.filter(Boolean);
 });
 
+const enrichLocalModPackages = async (folderPath) => {
+  const packages = await listModPackages(folderPath);
+  const enriched = await Promise.all(packages.map((item) => getModPackageFromFile(item.path, folderPath)));
+  return enriched.filter(Boolean).map((item) => ({ ...item, custom: true }));
+};
+
+const getUserModsRoot = () => path.join(getAppDataDir(), "mods");
+const ensureUserModsLayout = async () => {
+  const root = getUserModsRoot();
+  const categories = ["skins", "maps", "fonts", "announcers", "ui", "ux", "voiceover", "loading_screen", "vfx", "sfx", "others"];
+  await Promise.all(categories.map((category) => fs.mkdir(path.join(root, category), { recursive: true })));
+  return root;
+};
+
+ipcMain.handle("mods:open-user-mods-folder", async () => {
+  const folderPath = await ensureUserModsLayout();
+  const error = await shell.openPath(folderPath);
+  if (error) throw new Error(error);
+  return { folderPath };
+});
+
+ipcMain.handle("mods:open-custom-skin-mod-folder", async (_event, skinId) => {
+  const numericSkinId = Number(skinId || 0);
+  if (!numericSkinId) throw new Error("Skin ID invalido.");
+  const root = await ensureUserModsLayout();
+  const folderPath = path.join(root, "skins", String(numericSkinId));
+  await fs.mkdir(folderPath, { recursive: true });
+  const error = await shell.openPath(folderPath);
+  if (error) throw new Error(error);
+  return { folderPath, skinId: numericSkinId };
+});
+
+const normalizeUserModCategory = (category = "") => {
+  switch (String(category || "").trim().toLowerCase()) {
+    case "map":
+    case "maps":
+      return "maps";
+    case "font":
+    case "fonts":
+      return "fonts";
+    case "announcer":
+    case "announcers":
+      return "announcers";
+    case "ui":
+      return "ui";
+    case "ux":
+      return "ux";
+    case "voice":
+    case "voiceover":
+    case "voice_over":
+      return "voiceover";
+    case "loading":
+    case "loading_screen":
+    case "loading-screen":
+      return "loading_screen";
+    case "vfx":
+      return "vfx";
+    case "sfx":
+      return "sfx";
+    case "other":
+    case "others":
+    case "misc":
+      return "others";
+    default:
+      return "";
+  }
+};
+
+ipcMain.handle("mods:open-custom-mod-category-folder", async (_event, category) => {
+  const normalizedCategory = normalizeUserModCategory(category);
+  if (!normalizedCategory) throw new Error("Categoria de mod invalida.");
+  const root = await ensureUserModsLayout();
+  const folderPath = path.join(root, normalizedCategory);
+  await fs.mkdir(folderPath, { recursive: true });
+  const error = await shell.openPath(folderPath);
+  if (error) throw new Error(error);
+  return { folderPath, category: normalizedCategory };
+});
+
+ipcMain.handle("mods:import-custom-mods-to-skin", async (_event, skinId, files = []) => {
+  const numericSkinId = Number(skinId || 0);
+  if (!numericSkinId) throw new Error("Selecciona una skin valida antes de agregar mods.");
+  const root = await ensureUserModsLayout();
+  const folderPath = path.join(root, "skins", String(numericSkinId));
+  await fs.mkdir(folderPath, { recursive: true });
+
+  const copiedPaths = [];
+  const skippedPaths = [];
+  for (const source of Array.isArray(files) ? files : []) {
+    const sourcePath = String(source || "");
+    const extension = getModPackageExtension(sourcePath);
+    if (!sourcePath || !MOD_PACKAGE_EXTENSIONS.has(extension)) {
+      skippedPaths.push(sourcePath);
+      continue;
+    }
+    const stat = await fs.stat(sourcePath).catch(() => null);
+    if (!stat?.isFile()) {
+      skippedPaths.push(sourcePath);
+      continue;
+    }
+    const targetPath = path.join(folderPath, path.basename(sourcePath));
+    await fs.copyFile(sourcePath, targetPath);
+    copiedPaths.push(targetPath);
+  }
+
+  const packages = await Promise.all(copiedPaths.map((filePath) => getModPackageFromFile(filePath, root)));
+  return {
+    folderPath,
+    modsRoot: root,
+    skinId: numericSkinId,
+    copied: copiedPaths.length,
+    skipped: skippedPaths.length,
+    skippedPaths,
+    packages: packages.filter(Boolean)
+  };
+});
+
+ipcMain.handle("mods:import-custom-mods-to-category", async (_event, category, files = []) => {
+  const normalizedCategory = normalizeUserModCategory(category);
+  if (!normalizedCategory) throw new Error("Categoria de mod invalida.");
+  const root = await ensureUserModsLayout();
+  const folderPath = path.join(root, normalizedCategory);
+  await fs.mkdir(folderPath, { recursive: true });
+
+  const copiedPaths = [];
+  const skippedPaths = [];
+  for (const source of Array.isArray(files) ? files : []) {
+    const sourcePath = String(source || "");
+    const extension = getModPackageExtension(sourcePath);
+    if (!sourcePath || !MOD_PACKAGE_EXTENSIONS.has(extension)) {
+      skippedPaths.push(sourcePath);
+      continue;
+    }
+    const stat = await fs.stat(sourcePath).catch(() => null);
+    if (!stat?.isFile()) {
+      skippedPaths.push(sourcePath);
+      continue;
+    }
+    const targetPath = path.join(folderPath, path.basename(sourcePath));
+    await fs.copyFile(sourcePath, targetPath);
+    copiedPaths.push(targetPath);
+  }
+
+  const packages = await Promise.all(copiedPaths.map((filePath) => getModPackageFromFile(filePath, root)));
+  return {
+    folderPath,
+    modsRoot: root,
+    category: normalizedCategory,
+    copied: copiedPaths.length,
+    skipped: skippedPaths.length,
+    skippedPaths,
+    packages: packages.filter(Boolean)
+  };
+});
+
+ipcMain.handle("mods:index-user-mods-folder", async () => {
+  const folderPath = await ensureUserModsLayout();
+  return {
+    folderPath,
+    packages: await enrichLocalModPackages(folderPath)
+  };
+});
+
 ipcMain.handle("mods:select-custom-mod-folder", async () => {
   const result = await dialog.showOpenDialog({
     title: "Agregar carpeta de mods propios",
@@ -1776,8 +2347,34 @@ ipcMain.handle("mods:select-custom-mod-folder", async () => {
   const folderPath = result.filePaths[0];
   return {
     folderPath,
-    packages: (await listModPackages(folderPath)).map((item) => ({ ...item, custom: true }))
+    packages: await enrichLocalModPackages(folderPath)
   };
+});
+
+ipcMain.handle("mods:index-custom-mod-folder", async (_event, folderPath) => {
+  const resolvedFolder = String(folderPath || "");
+  if (!resolvedFolder) {
+    return {
+      folderPath: "",
+      packages: []
+    };
+  }
+
+  const stat = await fs.stat(resolvedFolder);
+  if (!stat.isDirectory()) {
+    throw new Error("La ruta de mods propios no es una carpeta.");
+  }
+
+  return {
+    folderPath: resolvedFolder,
+    packages: await enrichLocalModPackages(resolvedFolder)
+  };
+});
+
+ipcMain.handle("mods:index-custom-mod-files", async (_event, filePaths = []) => {
+  const paths = Array.isArray(filePaths) ? filePaths : [];
+  const packages = await Promise.all(paths.map((filePath) => getModPackageFromFile(String(filePath || "")).catch(() => null)));
+  return packages.filter(Boolean).map((item) => ({ ...item, custom: true }));
 });
 
 ipcMain.handle("mods:reveal-path", (_event, filePath) => {
@@ -1920,7 +2517,7 @@ ipcMain.handle("mods:open-ltk", async (_event, executablePath) => {
   return true;
 });
 
-const LTK_DATA_DIR = path.join(app.getPath("appData"), "ltk-manager");
+const LTK_DATA_DIR = path.join(getAppDataDir(), "ltk-manager");
 
 ipcMain.handle("ltk:detect", async () => {
   const candidates = [
@@ -2120,7 +2717,7 @@ ipcMain.handle("mods:select-bocchi-dll", async () => {
 
   if (result.canceled || !result.filePaths?.[0]) return null;
   const selectedPath = result.filePaths[0];
-  const engineDir = path.join(app.getPath("userData"), "engine");
+  const engineDir = path.join(getAppDataDir(), "engine");
   const installedDllPath = path.join(engineDir, "cslol-dll.dll");
 
   await fs.mkdir(engineDir, { recursive: true });
@@ -2200,10 +2797,10 @@ const getLatestCslolWindowsAsset = async () => {
   return { release, asset };
 };
 
-const getPenguLoaderDownloadDir = () => path.join(app.getPath("userData"), "pengu-loader");
-const getPenguLoaderRuntimeDir = () => path.join(app.getPath("userData"), "Pengu Loader");
+const getPenguLoaderDownloadDir = () => path.join(getAppDataDir(), "pengu-loader");
+const getPenguLoaderRuntimeDir = () => path.join(getAppDataDir(), "Pengu Loader");
 const getRiftAtlasPenguPluginsRuntimeDir = () => path.join(getPenguLoaderRuntimeDir(), "plugins");
-const getRiftAtlasPenguPluginRuntimeDir = () => path.join(getRiftAtlasPenguPluginsRuntimeDir(), "rift-atlas-party");
+const getRiftAtlasPenguPluginRuntimeDir = () => path.join(getRiftAtlasPenguPluginsRuntimeDir(), "RiftAtlas-00-Core");
 const PENGU_LOADER_EXE_NAMES = ["Pengu Loader.exe", "pengu-loader.exe", "PenguLoader.exe"];
 
 const execFileText = (file, args = [], options = {}) => new Promise((resolve, reject) => {
@@ -2238,8 +2835,8 @@ const directoryExists = async (dirPath) => {
   }
 };
 
-const getBundledRiftAtlasPenguPluginDir = () => getPackagedAssetPath("pengu", "rift-atlas-party");
-const getBundledRiftAtlasPenguPluginsDir = () => getPackagedAssetPath("pengu");
+const getBundledRiftAtlasPenguPluginDir = () => getPackagedAssetPath("Pengu Loader", "plugins", "RiftAtlas-00-Core");
+const getBundledRiftAtlasPenguPluginsDir = () => getPackagedAssetPath("Pengu Loader", "plugins");
 
 const installRiftAtlasPenguPlugin = async () => {
   const sourceRoot = getBundledRiftAtlasPenguPluginsDir();
@@ -2249,11 +2846,34 @@ const installRiftAtlasPenguPlugin = async () => {
   }
   const targetRoot = getRiftAtlasPenguPluginsRuntimeDir();
   await fs.mkdir(targetRoot, { recursive: true });
+
+  // Snapshot plugin enable state como Rose (index.js = enabled, index.js_ = disabled)
+  const enableSnapshot = new Map();
+  try {
+    const existing = await fs.readdir(targetRoot, { withFileTypes: true });
+    for (const entry of existing) {
+      if (!entry.isDirectory()) continue;
+      const hasIndexJs = await fileExists(path.join(targetRoot, entry.name, "index.js"));
+      const hasIndexJsDisabled = await fileExists(path.join(targetRoot, entry.name, "index.js_"));
+      enableSnapshot.set(entry.name, hasIndexJs && !hasIndexJsDisabled);
+    }
+  } catch { /* first install, no snapshot needed */ }
+
   const sourcePlugins = await directoryExists(sourceRoot)
     ? (await fs.readdir(sourceRoot, { withFileTypes: true }))
       .filter((entry) => entry.isDirectory())
       .map((entry) => ({ name: entry.name, sourceDir: path.join(sourceRoot, entry.name) }))
-    : [{ name: "rift-atlas-party", sourceDir: fallbackSourceDir }];
+    : [{ name: "RiftAtlas-00-Core", sourceDir: fallbackSourceDir }];
+
+  // Replace the complete Rift Atlas plugin set. Keeping old managed folders
+  // would run two SkinMonitors after upgrades (the exact race Rose avoids by
+  // having a single bridge owner). Third-party Pengu plugins are untouched.
+  try {
+    const existing = await fs.readdir(targetRoot, { withFileTypes: true });
+    await Promise.all(existing
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith("RiftAtlas-"))
+      .map((entry) => fs.rm(path.join(targetRoot, entry.name), { recursive: true, force: true })));
+  } catch { /* first install */ }
 
   for (const plugin of sourcePlugins) {
     const targetDir = path.join(targetRoot, plugin.name);
@@ -2264,6 +2884,18 @@ const installRiftAtlasPenguPlugin = async () => {
       errorOnExist: false
     });
   }
+
+  // Restore enable state como Rose
+  for (const [name, wasEnabled] of enableSnapshot) {
+    if (!wasEnabled) {
+      const pluginDir = path.join(targetRoot, name);
+      const hasIndexJs = await fileExists(path.join(pluginDir, "index.js"));
+      if (hasIndexJs) {
+        await fs.rename(path.join(pluginDir, "index.js"), path.join(pluginDir, "index.js_")).catch(() => {});
+      }
+    }
+  }
+
   const targetDir = getRiftAtlasPenguPluginRuntimeDir();
   return {
     pluginDir: targetDir,
@@ -2463,7 +3095,7 @@ const getLeagueClientReadyState = async () => {
   };
 };
 
-const getRosePenguConfigPath = () => path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "Rose", "config.ini");
+const getRosePenguConfigPath = () => path.join(getAppDataDir(), "Rose", "config.ini");
 
 const setIniValue = (content, section, key, value) => {
   const lines = String(content || "").replace(/^\uFEFF/, "").split(/\r?\n/);
@@ -2518,76 +3150,156 @@ const setRosePenguDisabled = async (disabled) => {
   return configPath;
 };
 
+const PENGU_ACTIVE_FLAG = path.join(getAppDataDir(), ".pengu-active");
+
+const writePenguActiveFlag = async () => {
+  await fs.mkdir(path.dirname(PENGU_ACTIVE_FLAG), { recursive: true });
+  await fs.writeFile(PENGU_ACTIVE_FLAG, "active", "utf8");
+};
+
+const clearPenguActiveFlag = async () => {
+  await fs.rm(PENGU_ACTIVE_FLAG, { force: true }).catch(() => {});
+};
+
+const isPenguActiveFlagPresent = async () => {
+  try { await fs.stat(PENGU_ACTIVE_FLAG); return true; } catch { return false; }
+};
+
+const IFEO_ROOT = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+const IFEO_KEY_NAME = "LeagueClientUx.exe";
+const IFEO_REG_PATH = `${IFEO_ROOT}\\${IFEO_KEY_NAME}`;
+const IFEO_VALUE_NAME = "Debugger";
+
+const cleanupLegacyPenguIFEO = async () => {
+  try {
+    const output = await execFileText("reg", ["query", IFEO_REG_PATH, "/v", IFEO_VALUE_NAME], { timeout: 5000 }).catch(() => "");
+    if (output.includes("core.dll")) {
+      await execFileText("reg", ["delete", IFEO_REG_PATH, "/v", IFEO_VALUE_NAME, "/f"], { timeout: 5000 });
+    }
+  } catch {}
+};
+
+const getIFEOCommand = (coreDllPath) => `rundll32 "${coreDllPath}",#6000`;
+
+const ensurePenguIFEOInstalled = async (executablePath) => {
+  const loaderDir = path.dirname(executablePath);
+  const corePath = path.join(loaderDir, "core.dll");
+  try {
+    await fs.stat(corePath);
+  } catch {
+    return { ifeoInstalled: false, ifeoError: "core.dll no encontrada en el runtime de Pengu Loader." };
+  }
+  const debuggerValue = getIFEOCommand(corePath);
+  try {
+    await execFileText("reg", [
+      "add", IFEO_REG_PATH,
+      "/v", IFEO_VALUE_NAME,
+      "/t", "REG_SZ",
+      "/d", debuggerValue,
+      "/f"
+    ], { timeout: 10000 });
+    return { ifeoInstalled: true, ifeoPath: IFEO_REG_PATH, ifeoValue: debuggerValue };
+  } catch (error) {
+    return { ifeoInstalled: false, ifeoError: error.message || "No pude crear entrada IFEO." };
+  }
+};
+
 const ensurePenguProxyInstalled = async (executablePath, leagueClientPath) => {
   if (!executablePath || !leagueClientPath) {
     return { proxyInstalled: false, proxyPath: "", proxyError: "No encontre la ruta de League." };
   }
 
-  const loaderDir = path.dirname(executablePath);
-  const corePath = path.join(loaderDir, "core.dll");
-  const proxyPath = path.join(leagueClientPath, "d3d9.dll");
-
   try {
     const configPath = await writeRosePenguConfig({ executablePath, leagueClientPath });
-    const [coreStat, proxyStat] = await Promise.all([
-      fs.stat(corePath),
-      fs.stat(proxyPath).catch(() => null)
-    ]);
-    if (proxyStat && proxyStat.size === coreStat.size) {
-      return { proxyInstalled: true, proxyPath, configPath };
+    await runPenguLoaderCli(executablePath, ["--set-league-path", leagueClientPath, "--silent"]).catch(() => {});
+    const activated = await runPenguLoaderCli(executablePath, ["--force-activate", "--silent"]).then(() => true).catch(() => false);
+    if (activated) {
+      await writePenguActiveFlag();
+      await cleanupLegacyPenguIFEO();
+      const proxyPath = path.join(leagueClientPath, "d3d9.dll");
+      return { proxyInstalled: true, proxyPath, configPath, activated, ifeoInstalled: false, method: "force-activate" };
     }
 
-    await fs.copyFile(corePath, proxyPath);
-    const copiedStat = await fs.stat(proxyPath);
-    return {
-      proxyInstalled: copiedStat.size === coreStat.size,
-      proxyPath,
-      configPath,
-      proxyError: copiedStat.size === coreStat.size ? "" : "El proxy d3d9.dll quedo con un tamano inesperado."
-    };
+    // Fallback a IFEO si force-activate fallo
+    const ifeoResult = await ensurePenguIFEOInstalled(executablePath);
+    if (ifeoResult.ifeoInstalled) {
+      await writePenguActiveFlag();
+      const proxyPath = path.join(leagueClientPath, "d3d9.dll");
+      return { proxyInstalled: true, proxyPath, configPath, activated: true, ifeoInstalled: true, method: "ifeo", ...ifeoResult };
+    }
+
+    const proxyPath = path.join(leagueClientPath, "d3d9.dll");
+    return { proxyInstalled: false, proxyPath, configPath, activated: false, ifeoInstalled: false, ...ifeoResult };
   } catch (error) {
     return {
       proxyInstalled: false,
-      proxyPath,
-      proxyError: error.message || "No pude escribir d3d9.dll en la carpeta de League."
+      proxyPath: path.join(leagueClientPath, "d3d9.dll"),
+      proxyError: error.message || "No pude activar Pengu Loader."
     };
   }
 };
 
 const removePenguProxyIfManaged = async (executablePath, leagueClientPath) => {
-  if (!executablePath || !leagueClientPath) {
+  if (!leagueClientPath) {
     return { proxyRemoved: false, proxyPath: "", proxyError: "No encontre la ruta de League." };
   }
 
-  const corePath = path.join(path.dirname(executablePath), "core.dll");
   const proxyPath = path.join(leagueClientPath, "d3d9.dll");
-  const configPath = await setRosePenguDisabled(true);
+  await setRosePenguDisabled(true).catch(() => {});
+
+  if (executablePath) {
+    await removePenguIFEOIfManaged(executablePath, leagueClientPath).catch(() => {});
+  }
 
   try {
-    const [coreStat, proxyStat] = await Promise.all([
-      fs.stat(corePath).catch(() => null),
-      fs.stat(proxyPath).catch(() => null)
-    ]);
+    const proxyStat = await fs.stat(proxyPath).catch(() => null);
     if (!proxyStat) {
-      return { proxyRemoved: true, proxyPath, configPath, proxyExisted: false };
+      await clearPenguActiveFlag();
+      return { proxyRemoved: true, proxyPath, proxyExisted: false };
     }
-    if (coreStat && proxyStat.size === coreStat.size) {
-      await fs.rm(proxyPath, { force: true });
-      return { proxyRemoved: true, proxyPath, configPath, proxyExisted: true };
-    }
-    return {
-      proxyRemoved: false,
-      proxyPath,
-      configPath,
-      proxyError: "No borre d3d9.dll porque no parece ser el proxy de Rift Atlas."
-    };
+    await fs.rm(proxyPath, { force: true });
+    await clearPenguActiveFlag();
+    return { proxyRemoved: true, proxyPath, proxyExisted: true };
   } catch (error) {
     return {
       proxyRemoved: false,
       proxyPath,
-      configPath,
       proxyError: error.message || "No pude quitar d3d9.dll de League."
     };
+  }
+};
+
+const removePenguIFEOIfManaged = async (executablePath, leagueClientPath) => {
+  if (!executablePath || !leagueClientPath) {
+    return { ifeoRemoved: false, ifeoPath: "", ifeoExisted: false, ifeoError: "No encontre la ruta de League." };
+  }
+  const loaderDir = path.dirname(executablePath);
+  const corePath = path.join(loaderDir, "core.dll");
+  try {
+    const output = await execFileText("reg", [
+      "query", IFEO_REG_PATH,
+      "/v", IFEO_VALUE_NAME
+    ], { timeout: 10000 });
+    const isOurs = output.includes("core.dll");
+    if (isOurs) {
+      await execFileText("reg", [
+        "delete", IFEO_REG_PATH,
+        "/v", IFEO_VALUE_NAME,
+        "/f"
+      ], { timeout: 10000 });
+    }
+    return { ifeoRemoved: true, ifeoPath: IFEO_REG_PATH, ifeoExisted: isOurs };
+  } catch {
+    return { ifeoRemoved: true, ifeoPath: IFEO_REG_PATH, ifeoExisted: false };
+  }
+};
+
+const getPenguIFEOActivationStatus = async () => {
+  try {
+    const output = await execFileText("reg", ["query", IFEO_REG_PATH, "/v", IFEO_VALUE_NAME], { timeout: 5000 });
+    return { ifeoActive: output.includes("core.dll") };
+  } catch {
+    return { ifeoActive: false };
   }
 };
 
@@ -2598,22 +3310,19 @@ const getPenguLoaderActivationStatus = async (executablePath) => {
     return { active: false, proxyInstalled: false, proxyPath: "", leagueClientPath, leagueGamePath, lockfilePath, leagueReady };
   }
 
-  const loaderDir = path.dirname(executablePath);
-  const corePath = path.join(loaderDir, "core.dll");
   const proxyPath = path.join(leagueClientPath, "d3d9.dll");
 
   try {
-    const [coreStat, proxyStat] = await Promise.all([
-      fs.stat(corePath),
-      fs.stat(proxyPath).catch(() => null)
-    ]);
+    const proxyStat = await fs.stat(proxyPath).catch(() => null);
     const configPath = getRosePenguConfigPath();
     const configContent = await fs.readFile(configPath, "utf8").catch(() => "");
     const disabled = /^\s*disabled\s*=\s*1\s*$/im.test(configContent);
-    const proxyInstalled = Boolean(proxyStat && proxyStat.size === coreStat.size);
+    const proxyInstalled = Boolean(proxyStat);
+    const { ifeoActive } = await getPenguIFEOActivationStatus();
     return {
-      active: proxyInstalled && !disabled,
+      active: (proxyInstalled || ifeoActive) && !disabled,
       proxyInstalled,
+      ifeoActive,
       disabled,
       configPath,
       proxyPath,
@@ -2623,7 +3332,7 @@ const getPenguLoaderActivationStatus = async (executablePath) => {
       leagueReady
     };
   } catch {
-    return { active: false, proxyInstalled: false, proxyPath, leagueClientPath, leagueGamePath, lockfilePath, leagueReady };
+    return { active: false, proxyInstalled: false, proxyPath: "", leagueClientPath, leagueGamePath, lockfilePath, leagueReady };
   }
 };
 
@@ -2669,6 +3378,8 @@ const launchPenguLoader = async ({ allowElevation = false, requireLeagueReady = 
       await appendOverlayLog("[Pengu Loader] No se ejecuto --set-league-path porque no se encontro la carpeta Game de League.").catch(() => { });
     }
     await runPenguLoaderCli(executablePath, ["--force-activate", "--silent"]);
+    await cleanupLegacyPenguIFEO();
+    await writePenguActiveFlag();
     const proxyState = await getPenguLoaderActivationStatus(executablePath);
     let restartedClient = false;
     if (restartClient) {
@@ -2712,10 +3423,12 @@ const launchPenguLoader = async ({ allowElevation = false, requireLeagueReady = 
       proxyState = {};
     }
 
+    const isActivated = Boolean(proxyState.active || proxyState.proxyInstalled || proxyState.ifeoActive);
+
     if (allowElevation) {
       return {
-        launched: Boolean(proxyState.proxyInstalled),
-        activated: Boolean(proxyState.active || proxyState.proxyInstalled),
+        launched: Boolean(proxyState.proxyInstalled || proxyState.ifeoInstalled),
+        activated: isActivated,
         elevated: false,
         alreadyRunning: await isPenguLoaderRunning(),
         executablePath,
@@ -2729,8 +3442,8 @@ const launchPenguLoader = async ({ allowElevation = false, requireLeagueReady = 
     }
 
     return {
-      launched: Boolean(proxyState.proxyInstalled),
-      activated: Boolean(proxyState.active || proxyState.proxyInstalled),
+      launched: Boolean(proxyState.proxyInstalled || proxyState.ifeoInstalled),
+      activated: isActivated,
       alreadyRunning: await isPenguLoaderRunning(),
       executablePath,
       leagueClientPath,
@@ -2761,13 +3474,15 @@ const deactivatePenguLoader = async ({ allowElevation = false } = {}) => {
 
   try {
     await terminatePenguLoaderUi();
-    let proxyState = {};
+    await setRosePenguDisabled(true).catch(() => {});
     try {
       await runPenguLoaderCli(executablePath, ["--force-deactivate", "--silent"]);
-      proxyState = await getPenguLoaderActivationStatus(executablePath);
     } catch {
-      proxyState = await removePenguProxyIfManaged(executablePath, leagueClientPath);
+      // CLI fallback handled below
     }
+    await removePenguProxyIfManaged(executablePath, leagueClientPath).catch(() => {});
+    await removePenguIFEOIfManaged(executablePath, leagueClientPath).catch(() => {});
+    const proxyState = await getPenguLoaderActivationStatus(executablePath);
     let restartedClient = false;
     if (restartClient) {
       try {
@@ -2779,7 +3494,7 @@ const deactivatePenguLoader = async ({ allowElevation = false } = {}) => {
     }
     await terminatePenguLoaderUi();
     return {
-      deactivated: !proxyState.active && !proxyState.proxyInstalled,
+      deactivated: !proxyState.active && !proxyState.proxyInstalled && !proxyState.ifeoActive,
       executablePath,
       leagueClientPath,
       needsClientRestart: restartClient,
@@ -2811,11 +3526,109 @@ const deactivatePenguLoader = async ({ allowElevation = false } = {}) => {
   }
 };
 
+const uninstallPenguLoader = async () => {
+  const deactivateResult = await deactivatePenguLoader({ allowElevation: true }).catch((error) => ({
+    deactivated: false,
+    error: error.message || "No pude desactivar Pengu Loader antes de desinstalar."
+  }));
+  await terminatePenguLoaderUi().catch(() => {});
+
+  const paths = [
+    getPenguLoaderRuntimeDir(),
+    getPenguLoaderDownloadDir()
+  ];
+  const removedPaths = [];
+  const failedPaths = [];
+
+  for (const targetPath of paths) {
+    const resolved = path.resolve(targetPath);
+    const appDataRoot = path.resolve(getAppDataDir());
+    if (!resolved.startsWith(`${appDataRoot}${path.sep}`)) {
+      failedPaths.push({ path: targetPath, error: "Ruta fuera de AppData de Rift Atlas." });
+      continue;
+    }
+
+    try {
+      await fs.rm(resolved, { recursive: true, force: true });
+      removedPaths.push(resolved);
+    } catch (error) {
+      failedPaths.push({ path: resolved, error: error.message });
+    }
+  }
+
+  await clearPenguActiveFlag().catch(() => {});
+  await appendOverlayLog(`[Pengu Loader] Desinstalacion solicitada. removidas=${removedPaths.length} fallidas=${failedPaths.length}`).catch(() => {});
+
+  return {
+    uninstalled: failedPaths.length === 0,
+    removedPaths,
+    failedPaths,
+    ...deactivateResult
+  };
+};
+
+const syncBundledPenguToRuntime = async () => {
+  const bundledDir = getPackagedAssetPath("Pengu Loader");
+  const runtimeDir = getPenguLoaderRuntimeDir();
+  if (!await directoryExists(bundledDir)) return;
+  await fs.mkdir(runtimeDir, { recursive: true });
+
+  // Snapshot plugin enabled/disabled state before overwriting
+  const enabledPlugins = new Set();
+  const disabledPlugins = new Set();
+  const pluginsDir = path.join(runtimeDir, "plugins");
+  if (await directoryExists(pluginsDir)) {
+    const pluginDirs = await fs.readdir(pluginsDir, { withFileTypes: true });
+    for (const entry of pluginDirs) {
+      if (!entry.isDirectory()) continue;
+      const pluginPath = path.join(pluginsDir, entry.name);
+      const hasEnabled = await fs.stat(path.join(pluginPath, "index.js")).catch(() => null);
+      const hasDisabled = await fs.stat(path.join(pluginPath, "index.js_")).catch(() => null);
+      if (hasDisabled) disabledPlugins.add(entry.name);
+      else if (hasEnabled) enabledPlugins.add(entry.name);
+    }
+  }
+
+  const exclude = new Set(["datastore", "Pengu Loader.exe", "core.dll"]);
+  const entries = await fs.readdir(bundledDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (exclude.has(entry.name)) continue;
+    const src = path.join(bundledDir, entry.name);
+    const dst = path.join(runtimeDir, entry.name);
+    if (entry.isDirectory()) {
+      await fs.cp(src, dst, { recursive: true, force: true, errorOnExist: false }).catch(() => {});
+    } else {
+      await fs.copyFile(src, dst).catch(() => {});
+    }
+  }
+
+  // Restore plugin state after sync
+  for (const pluginName of enabledPlugins) {
+    const pluginPath = path.join(pluginsDir, pluginName);
+    const disabledFile = path.join(pluginPath, "index.js_");
+    if (await fs.stat(disabledFile).catch(() => null)) {
+      await fs.rm(disabledFile, { force: true }).catch(() => {});
+    }
+  }
+  for (const pluginName of disabledPlugins) {
+    const pluginPath = path.join(pluginsDir, pluginName);
+    const enabledFile = path.join(pluginPath, "index.js");
+    const disabledFile = path.join(pluginPath, "index.js_");
+    if (await fs.stat(enabledFile).catch(() => null) && await fs.stat(disabledFile).catch(() => null)) {
+      await fs.rm(enabledFile, { force: true }).catch(() => {});
+    }
+  }
+};
+
 const preparePenguRuntime = async () => {
   const executablePath = await findBundledPenguLoaderExecutable();
   if (!executablePath) {
     return { prepared: false, missing: true };
   }
+
+  // Sync bundled Pengu Loader dir a runtime como Rose
+  await syncBundledPenguToRuntime();
+
   const leagueClientPath = await getPenguLeagueClientPath();
   const leagueGamePath = await getPenguLeagueGamePath(leagueClientPath);
   const plugin = await installRiftAtlasPenguPlugin();
@@ -2980,7 +3793,7 @@ const normalizeDllSource = (source) => {
   return "cslol";
 };
 const getBundledCslolDllPath = () => getUnpackedAssetPath("assets", "cslol-dll.dll");
-const getDllSourceMetadataPath = () => path.join(app.getPath("userData"), "engine", "dll-source.json");
+const getDllSourceMetadataPath = () => path.join(getAppDataDir(), "engine", "dll-source.json");
 
 const readDllSourceMetadata = async () => {
   try {
@@ -3026,7 +3839,7 @@ const getDllDownloadSources = (preferredSource = "cslol") => {
 };
 
 const downloadAndExtractLtkDll = async (window = null, { forceDownload = false, dllSource = "cslol" } = {}) => {
-  const targetDir = path.join(app.getPath("userData"), "ltk-dll");
+  const targetDir = path.join(getAppDataDir(), "ltk-dll");
   const installedDllPath = path.join(targetDir, "cslol-dll.dll");
 
   if (forceDownload) {
@@ -3173,7 +3986,7 @@ const downloadAndInstallHitoriEngine = async (window, options = {}) => {
       throw new Error("No encontre el setup del engine en el ultimo release.");
     }
 
-    const targetDir = path.join(app.getPath("userData"), "engine");
+    const targetDir = path.join(getAppDataDir(), "engine");
     const tempDir = path.join(app.getPath("temp"), "rift-atlas-hitori-download");
     const setupExtractPath = path.join(tempDir, "setup");
     const appExtractPath = path.join(setupExtractPath, "$PLUGINSDIR", "app");
@@ -3234,24 +4047,6 @@ const downloadAndInstallHitoriEngine = async (window, options = {}) => {
       }
       : null;
 
-    if (!extractedDllPath) {
-      sendDownloadProgress(window, {
-        type: "engine",
-        message: "DLL no encontrada junto al engine; intentando descargar cslol-dll.dll automaticamente..."
-      });
-      const downloadedDll = await downloadAndExtractLtkDll(window, {
-        forceDownload: false,
-        dllSource: normalizeDllSource(options?.dllSource)
-      });
-      await fs.copyFile(downloadedDll.path, installedDllPath);
-      extractedDllPath = await findExistingPath([installedDllPath]);
-      dllInstallInfo = {
-        ...downloadedDll,
-        sourceLabel: downloadedDll.sourceLabel || "DLL descargada por Rift Atlas",
-        installedPath: extractedDllPath || installedDllPath
-      };
-    }
-
     if (extractedDllPath && dllInstallInfo) {
       await writeDllSourceMetadata({
         sourceId: dllInstallInfo.sourceId || "",
@@ -3277,7 +4072,7 @@ const downloadAndInstallHitoriEngine = async (window, options = {}) => {
     }
 
     await fs.access(installedEnginePath);
-    await fs.writeFile(path.join(app.getPath("userData"), "engine-version.txt"), release.tag_name || release.name || "");
+    await fs.writeFile(path.join(getAppDataDir(), "engine-version.txt"), release.tag_name || release.name || "");
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
 
     return {
@@ -3288,6 +4083,7 @@ const downloadAndInstallHitoriEngine = async (window, options = {}) => {
       dllPath: extractedDllPath,
       dllSourcePath: extractedDllPath,
       dllSourceLabel: dllInstallInfo?.sourceLabel || (extractedDllPath ? "DLL local en carpeta engine" : "DLL manual requerida"),
+      manualDllRequired: !extractedDllPath,
       dllInstallMessage: extractedDllPath
         ? `DLL lista junto al engine: ${extractedDllPath}`
         : `DLL no encontrada. Pégala manualmente en ${installedDllPath}`
@@ -3363,7 +4159,7 @@ const getHitoriEngineCandidates = (selectedPath = "") => {
   }
 
   candidates.push(
-    path.join(app.getPath("userData"), "engine", "ltk-manager.exe"),
+    path.join(getAppDataDir(), "engine", "ltk-manager.exe"),
     path.join(process.env.LOCALAPPDATA || "", "Programs", "Bocchi", "resources", "ltk-manager.exe"),
     path.join(process.env.LOCALAPPDATA || "", "Programs", "bocchi", "resources", "ltk-manager.exe")
   );
@@ -3382,7 +4178,7 @@ const resolveHitoriEngineExecutable = async (selectedPath) => {
 };
 
 const getDllCandidates = (_selectedDllPath = "", _enginePath = "") => [
-  path.join(app.getPath("userData"), "engine", "cslol-dll.dll")
+  path.join(getAppDataDir(), "engine", "cslol-dll.dll")
 ];
 
 const resolveCslolDll = async (_selectedDllPath, enginePath) => {
@@ -3446,7 +4242,7 @@ ipcMain.handle("mods:download-cslol-tools", async (event, payload = {}) => {
 });
 
 const ensureCslolDll = async (enginePath, selectedDllPath) => {
-  const bundledDllPath = path.join(app.getPath("userData"), "engine", "cslol-dll.dll");
+  const bundledDllPath = path.join(getAppDataDir(), "engine", "cslol-dll.dll");
 
   try {
     await fs.access(bundledDllPath);
@@ -3458,7 +4254,7 @@ const ensureCslolDll = async (enginePath, selectedDllPath) => {
 };
 
 const ensureGameHashtable = async () => {
-  const hashtablePath = path.join(app.getPath("userData"), "hashtable", "hashes.game.txt");
+  const hashtablePath = path.join(getAppDataDir(), "hashtable", "hashes.game.txt");
   try {
     const stat = await fs.stat(hashtablePath);
     if (stat.size > 1024 * 1024 * 10) {
@@ -3667,6 +4463,54 @@ const appendDirectoryLogInfo = async (label, dirPath) => {
   }
 };
 
+const buildMkoverlayArgs = ({ gameFolder, overlayPath, statePath, modPaths = [] }) => {
+  const args = [
+    "mkoverlay",
+    "--game", path.normalize(gameFolder),
+    "--overlay", path.normalize(overlayPath),
+    "--state", path.normalize(statePath)
+  ];
+  for (const modPath of modPaths) {
+    args.push("--mod", path.normalize(modPath));
+  }
+  return args;
+};
+
+const execMkoverlayWithFallback = async ({
+  sidecarPath,
+  toolsDir,
+  gameFolder,
+  overlayPath,
+  statePath,
+  modPaths,
+  runToken,
+  label = "mkoverlay"
+}) => {
+  let activeModPaths = modPaths;
+  let args = buildMkoverlayArgs({ gameFolder, overlayPath, statePath, modPaths: activeModPaths });
+  let inputBytes = await getFilesTotalSize(activeModPaths);
+  let timeoutMs = getMkoverlayTimeoutMs(inputBytes);
+  await appendOverlayLog(`${label} args: ${args.join(" ")}`);
+  await appendOverlayLog(`${label} timeout: ${Math.round(timeoutMs / 1000)}s para ${formatLogBytes(inputBytes)} de mods.`);
+  try {
+    return await execToolWithTimeout(sidecarPath, args, timeoutMs, { cwd: toolsDir, runToken });
+  } catch (error) {
+    const fallbackPaths = await getOverlayModFallbackPaths(activeModPaths);
+    if (!fallbackPaths) throw error;
+    await appendOverlayLog(`${label} fallo con staging (${error.message}). Reintentando con paquete original.`);
+    await fs.rm(overlayPath, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(statePath, { recursive: true, force: true }).catch(() => {});
+    await fs.mkdir(statePath, { recursive: true });
+    activeModPaths = fallbackPaths;
+    args = buildMkoverlayArgs({ gameFolder, overlayPath, statePath, modPaths: activeModPaths });
+    inputBytes = await getFilesTotalSize(activeModPaths);
+    timeoutMs = getMkoverlayTimeoutMs(inputBytes);
+    await appendOverlayLog(`${label} fallback args: ${args.join(" ")}`);
+    await appendOverlayLog(`${label} fallback timeout: ${Math.round(timeoutMs / 1000)}s para ${formatLogBytes(inputBytes)} de mods.`);
+    return execToolWithTimeout(sidecarPath, args, timeoutMs, { cwd: toolsDir, runToken });
+  }
+};
+
 const normalizeZipPackageForOverlay = async (skin = {}) => {
   const sourcePath = String(skin?.path || "");
   const archiveInfo = skin.archiveInfo?.wadCount !== undefined
@@ -3681,7 +4525,7 @@ const normalizeZipPackageForOverlay = async (skin = {}) => {
   }
 
   const sourceStat = await fs.stat(sourcePath);
-  const outputDir = path.join(app.getPath("userData"), "mod-files", "normalized");
+  const outputDir = path.join(getAppDataDir(), "mod-files", "normalized");
   const sourceHash = crypto.createHash("sha1").update(sourcePath).digest("hex").slice(0, 8);
   const displayName = sanitizeFileName(String(skin.skin || skin.name || stripModExtension(path.basename(sourcePath))));
   const outputPath = path.join(outputDir, `${displayName}_${sourceHash}.fantome`);
@@ -3740,6 +4584,54 @@ const normalizeZipPackageForOverlay = async (skin = {}) => {
   }
 };
 
+const extractArchiveModForOverlay = async (sourcePath, skin = {}) => {
+  const sourceStat = await fs.stat(sourcePath);
+  const sourceHash = crypto.createHash("sha1")
+    .update(path.normalize(sourcePath).toLowerCase())
+    .update(`:${sourceStat.size}:${Math.trunc(sourceStat.mtimeMs)}`)
+    .digest("hex")
+    .slice(0, 12);
+  const displayName = sanitizeFileName(String(skin.skin || skin.name || stripModExtension(path.basename(sourcePath))));
+  const outputDir = path.join(getAppDataDir(), "mod-staging-cache", `${displayName}_${sourceHash}`);
+
+  const existing = await countDirectoryFiles(outputDir).catch(() => null);
+  if (existing?.files > 0) {
+    await appendOverlayLog(`Usando mod extraido cache: ${outputDir}`);
+    await appendDirectoryLogInfo("Mod extraido cache detalle", outputDir);
+    return outputDir;
+  }
+
+  const tempRoot = path.join(app.getPath("temp"), `rift-atlas-extract-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const tempDir = path.join(tempRoot, "mod");
+  try {
+    await appendOverlayLog(`Extrayendo paquete estilo Rose: ${sourcePath} -> ${outputDir}`);
+    await fs.mkdir(tempDir, { recursive: true });
+    await extractZip(sourcePath, { dir: tempDir });
+    await appendDirectoryLogInfo("Paquete extraido temp", tempDir);
+    await fs.rm(outputDir, { recursive: true, force: true }).catch(() => { });
+    await fs.mkdir(path.dirname(outputDir), { recursive: true });
+    await fs.rename(tempDir, outputDir).catch(async () => {
+      await copyDirectory(tempDir, outputDir);
+    });
+    await fs.writeFile(path.join(outputDir, MOD_STAGING_SOURCE_MARKER), JSON.stringify({
+      sourcePath,
+      createdAt: new Date().toISOString()
+    }, null, 2)).catch(() => {});
+    await appendDirectoryLogInfo("Mod extraido final", outputDir);
+    pruneModStagingCache().catch(() => {});
+    return outputDir;
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => { });
+  }
+};
+
+const warmLocalModStagingCache = async (sourcePath, skin = {}) => {
+  await extractArchiveModForOverlay(sourcePath, skin).catch((error) => {
+    appendOverlayLog(`Staging Rose omitido para ${sourcePath}: ${error.message}`).catch(() => {});
+  });
+  return sourcePath;
+};
+
 const generateResolvedFantonizePackage = async ({ sidecarPath, gamePath, resolvedSkin }) => {
   await appendOverlayLog(`Generando .fantome local: ${resolvedSkin.champion} - ${resolvedSkin.skin} skin${resolvedSkin.skinNum}`);
 
@@ -3764,7 +4656,7 @@ const generateResolvedFantonizePackage = async ({ sidecarPath, gamePath, resolve
   }
   await appendFileLogInfo("WAD base de League", wadPath);
 
-  const outputDir = path.join(app.getPath("userData"), "mod-files");
+  const outputDir = path.join(getAppDataDir(), "mod-files");
   await fs.mkdir(outputDir, { recursive: true });
 
   const cleanSkinName = sanitizeFileName(String(resolvedSkin.skin || resolvedSkin.name || `skin${resolvedSkin.skinNum}`));
@@ -3826,23 +4718,39 @@ const generateResolvedFantonizePackage = async ({ sidecarPath, gamePath, resolve
 const generateFantomeFromLeagueWad = async ({ sidecarPath, gamePath, skin }) => {
   const sourcePath = String(skin?.path || "");
   const extension = sourcePath.toLowerCase().endsWith(".wad.client") ? ".wad.client" : path.extname(sourcePath).toLowerCase();
+  const isLocalCustomArchive = Boolean(skin?.custom) &&
+    !sourcePath.replace(/\//g, "\\").toLowerCase().includes("\\rift atlas\\downloaded-libraries\\leagueskins\\") &&
+    [".zip", ".fantome"].includes(extension);
   await appendOverlayLog(`Preparando mod para overlay: extension=${extension || "sin extension"} display=${skin.champion || ""} - ${skin.skin || skin.name || ""}`);
   await appendFileLogInfo("Mod origen", sourcePath);
   if (extension === ".zip") {
     const resolvedSkin = await resolveFantonizeSkinEntry(skin);
     if (resolvedSkin?.needsFantonize) {
-      await appendOverlayLog("ZIP con WAD mini resuelto; se genera .fantome local en vez de usar el WAD mini directo.");
-      return generateResolvedFantonizePackage({ sidecarPath, gamePath, resolvedSkin });
+      await appendOverlayLog("ZIP con WAD mini resuelto; se usa el paquete LeagueSkins directo para mkoverlay.");
+      return sourcePath;
     }
     const archiveInfo = resolvedSkin?.archiveInfo || skin.archiveInfo || {};
     if (archiveInfo.suspicious) {
       await appendOverlayLog("ERROR ZIP miniatura no resuelto; se cancela para evitar aplicar un WAD incompleto/bug visual.");
       throw new Error(`No pude resolver ${skin.skin || skin.name || path.basename(sourcePath)} a una skin de League. Reindexa LeagueSkins o revisa el paquete; no lo aplico directo para evitar modelos/VFX rotos.`);
     }
+    if (isLocalCustomArchive && (archiveInfo.hasWadFolder || archiveInfo.wadCount)) {
+      await appendOverlayLog("Mod local ZIP: calentando staging estilo Rose; mkoverlay usa el .zip original.");
+      return warmLocalModStagingCache(sourcePath, skin);
+    }
     return normalizeZipPackageForOverlay({ ...skin, archiveInfo: resolvedSkin?.archiveInfo || skin.archiveInfo });
   }
   if (extension === ".fantome") {
-    await appendOverlayLog(`Usando paquete directo: ${sourcePath}`);
+    if (isLocalCustomArchive) {
+      const archiveInfo = skin.archiveInfo?.wadCount !== undefined
+        ? skin.archiveInfo
+        : await inspectArchivePackage(sourcePath).catch(() => ({}));
+      if (archiveInfo.hasWadFolder || archiveInfo.wadCount) {
+        await appendOverlayLog("Mod local .fantome: calentando staging estilo Rose; mkoverlay usa el .fantome original.");
+        return warmLocalModStagingCache(sourcePath, skin);
+      }
+    }
+    await appendOverlayLog(`Usando paquete .fantome directo: ${sourcePath}`);
     await appendFileLogInfo("Paquete .fantome directo", sourcePath);
     return sourcePath;
   }
@@ -3856,9 +4764,94 @@ const generateFantomeFromLeagueWad = async ({ sidecarPath, gamePath, skin }) => 
   return generateResolvedFantonizePackage({ sidecarPath, gamePath, resolvedSkin });
 };
 
+const spawnPatcherAndMonitor = async ({ sidecarPath, dllPath, overlayPath, runToken, dllSourceMetadata }) => {
+  if (runningOverlayProcess) {
+    await appendOverlayLog(`Deteniendo patcher anterior. PID=${runningOverlayProcess.pid}`);
+    const previousProcess = runningOverlayProcess;
+    previousProcess.stdin?.write("\n");
+    previousProcess.kill();
+    await waitForProcessExit(previousProcess, 2500);
+    if (runningOverlayProcess === previousProcess) {
+      runningOverlayProcess = null;
+    }
+  }
+  throwIfOverlayRunCanceled(runToken);
+  currentOverlayError = "";
+
+  const bundledDll = dllPath;
+  try { await fs.access(bundledDll); } catch {
+    throw new Error(`cslol-dll.dll no encontrada en ${bundledDll}.`);
+  }
+
+  const runoverlayArgs = [
+    "patcher",
+    "--dll", bundledDll,
+    "--overlay-root", path.normalize(overlayPath),
+    "--flags", "0"
+  ];
+
+  await appendOverlayLog(`Iniciando patcher con overlay: ${overlayPath}`);
+  await appendOverlayLog(`patcher args: ${runoverlayArgs.join(" ")}`);
+  const patcherProcess = spawn(sidecarPath, runoverlayArgs, {
+    cwd: path.dirname(sidecarPath),
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true
+  });
+  runningOverlayProcess = patcherProcess;
+  runToken.processes.add(patcherProcess);
+  currentProfilePath = overlayPath;
+
+  let patcherExited = false;
+  const handleOutput = (label, data) => {
+    const text = String(data).trim();
+    if (text) appendOverlayLog(`[${label}] ${text}`);
+    if (runningOverlayProcess === patcherProcess && /end of life reached|EOL_TIMESTAMP|timestamp\s*>\s*EOL/i.test(text)) {
+      const src = dllSourceMetadata?.sourceLabel
+        ? ` Fuente usada: ${dllSourceMetadata.sourceLabel} ${dllSourceMetadata.version || ""}.`
+        : "";
+      currentOverlayError = `La DLL del engine esta vencida (End of life reached).${src} Reemplaza cslol-dll.dll manualmente en la carpeta engine.`;
+      appendOverlayLog(`ERROR DLL vencida detectada: ${currentOverlayError}`);
+      patcherProcess.stdin?.write("\n");
+      patcherProcess.kill();
+    }
+  };
+  patcherProcess.stdout?.on("data", (d) => handleOutput("PATCHER STDOUT", d));
+  patcherProcess.stderr?.on("data", (d) => handleOutput("PATCHER STDERR", d));
+  patcherProcess.on("exit", (code) => {
+    patcherExited = true;
+    runToken.processes.delete(patcherProcess);
+    if (runningOverlayProcess === patcherProcess) {
+      runningOverlayProcess = null;
+      currentProfilePath = "";
+    }
+    appendOverlayLog(`Patcher exit code: ${code}`);
+    cleanupNoCacheOverlay(overlayPath).then(() => pruneOverlayCache()).catch(() => {});
+  });
+  patcherProcess.on("error", (err) => {
+    patcherExited = true;
+    runToken.processes.delete(patcherProcess);
+    if (runningOverlayProcess === patcherProcess) {
+      runningOverlayProcess = null;
+      currentProfilePath = "";
+    }
+    appendOverlayLog(`Patcher error: ${err.message}`);
+    cleanupNoCacheOverlay(overlayPath).then(() => pruneOverlayCache()).catch(() => {});
+  });
+
+  await sleepMs(2000);
+  throwIfOverlayRunCanceled(runToken);
+  if (patcherExited || runningOverlayProcess !== patcherProcess) {
+    throw new Error("El patcher fallo al iniciar (salio antes de tiempo).");
+  }
+
+  await appendOverlayLog(`Patcher activo. PID: ${patcherProcess.pid}`);
+  await runToken.suspensionGuard?.markPatcherActive?.().catch(() => {});
+  return { pid: patcherProcess.pid, profilePath: overlayPath };
+};
+
 ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
   if (activeOverlayRun) {
-    await cancelOverlayRun("Nueva ejecucion solicitada.");
+    throw new Error("Ya hay una inyeccion en curso. Espera a que termine.");
   }
   const runToken = createOverlayRunToken();
   activeOverlayRun = runToken;
@@ -3868,22 +4861,132 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
   const skinEntries = Array.isArray(payload?.skinEntries)
     ? payload.skinEntries
     : (payload?.skinPaths || []).map((skinPath) => ({ path: skinPath }));
+  const baseOverlayPath = payload?.baseOverlayPath;
+  const allowNoCacheBase = Boolean(payload?.allowNoCacheBase);
 
   try {
     await appendOverlayLog("============================================================");
-    await appendOverlayLog(`INICIO OVERLAY runId=${Date.now()} appUserData=${app.getPath("userData")}`);
+    await appendOverlayLog(`INICIO OVERLAY runId=${Date.now()} appUserData=${getAppDataDir()}`);
     await appendOverlayLog(`Payload: skins=${skinEntries.length} sidecar=${sidecarPath} dllConfigurada=${dllPath || "no configurada"} game=${gamePath}`);
 
     if (!gamePath.toLowerCase().endsWith("league of legends.exe")) {
       await appendOverlayLog(`ERROR configuracion League invalida: ${gamePath}`);
       throw new Error("League of Legends.exe no configurado.");
     }
-    if (!skinEntries.length) {
+    runToken.suspensionGuard = createGameSuspensionGuard({ gamePath, runToken });
+    await appendOverlayLog(`[GameSuspend] Monitor activo durante preparacion del overlay.`);
+    const overlayCacheDir = path.join(getAppDataDir(), "cslol-overlay-cache");
+    const canUseBase = baseOverlayPath && await isUsableOverlayPath(baseOverlayPath, { allowNoCache: allowNoCacheBase }).catch(() => false);
+
+    if (!skinEntries.length && !canUseBase) {
       await appendOverlayLog("ERROR no hay skins seleccionadas.");
       throw new Error("No hay skins seleccionadas.");
     }
     throwIfOverlayRunCanceled(runToken);
 
+    if (canUseBase) {
+      if (!skinEntries.length) {
+        await appendOverlayLog(`MODO PREBUILD DIRECTO: overlay=${baseOverlayPath}`);
+        const ensuredDll = await ensureCslolDll(sidecarPath, dllPath);
+        throwIfOverlayRunCanceled(runToken);
+        const dllMeta = await readDllSourceMetadata();
+        await appendOverlayLog(`Engine: ${sidecarPath}`);
+        await appendOverlayLog(`DLL: ${ensuredDll}`);
+        await appendOverlayLog(`League: ${gamePath}`);
+        const patcherResult = await spawnPatcherAndMonitor({
+          sidecarPath, dllPath: ensuredDll, overlayPath: baseOverlayPath, runToken, dllSourceMetadata: dllMeta
+        });
+        await markOverlayCachePolicy(baseOverlayPath);
+        await pruneOverlayCache({ protectedPaths: [baseOverlayPath] }).catch(() => {});
+        await appendOverlayLog("FIN INICIO OVERLAY (prebuild directo): patcher activo.");
+        return { success: true, ...patcherResult, enginePath: sidecarPath };
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // QUICK MERGE PATH: base overlay pre-construido + skin extra
+      // ═══════════════════════════════════════════════════════════════
+      await appendOverlayLog(`MODO MERGE: base=${baseOverlayPath} extras=${skinEntries.length}`);
+
+      // Procesar solo las skins extra (las que NO estan en la base)
+      const extraSkinPaths = [];
+      for (const [index, entry] of skinEntries.entries()) {
+        throwIfOverlayRunCanceled(runToken);
+        await appendOverlayLog(`Extra #${index + 1}/${skinEntries.length}: champion=${entry?.champion || ""} skin=${entry?.skin || entry?.name || ""} path=${entry?.path}`);
+        try { await fs.access(entry?.path); } catch {
+          throw new Error(`Archivo no encontrado: ${entry?.path}`);
+        }
+        const modPath = await generateFantomeFromLeagueWad({ sidecarPath, gamePath, skin: entry });
+        extraSkinPaths.push(modPath);
+      }
+      await appendOverlayLog(`Extra mods finales: ${extraSkinPaths.join(" | ")}`);
+      throwIfOverlayRunCanceled(runToken);
+
+      // Construir overlay extra (1 solo mod → rapido incluso cache miss)
+      const extraCacheKey = await getOverlayCacheKey({ gamePath, skinPaths: extraSkinPaths });
+      const extraOverlayPath = path.join(overlayCacheDir, extraCacheKey);
+      const extraHit = await isUsableOverlayPath(extraOverlayPath).catch(() => false);
+
+      if (!extraHit) {
+        await appendOverlayLog(`Extra overlay cache MISS. mkoverlay para ${extraSkinPaths.length} mod(s)...`);
+        await fs.rm(extraOverlayPath, { recursive: true, force: true }).catch(() => { });
+        const gameFolder = path.dirname(gamePath);
+        const toolsDir = path.dirname(sidecarPath);
+        const profilesDir = path.join(getAppDataDir(), "cslol-profiles");
+        const overlayStateDir = path.join(profilesDir, ".mkoverlay-state");
+        await fs.mkdir(profilesDir, { recursive: true });
+        await fs.mkdir(overlayCacheDir, { recursive: true });
+        await fs.rm(overlayStateDir, { recursive: true, force: true }).catch(() => { });
+        await fs.mkdir(overlayStateDir, { recursive: true });
+
+        await execMkoverlayWithFallback({
+          sidecarPath,
+          toolsDir,
+          gameFolder,
+          overlayPath: extraOverlayPath,
+          statePath: overlayStateDir,
+          modPaths: extraSkinPaths,
+          runToken,
+          label: "mkoverlay extra"
+        });
+        throwIfOverlayRunCanceled(runToken);
+        await markOverlayCachePolicy(extraOverlayPath);
+        await pruneOverlayCache({ protectedPaths: [baseOverlayPath, extraOverlayPath] }).catch(() => {});
+      }
+
+      // Verificar extra overlay
+      const extraFiles = await fs.readdir(extraOverlayPath).catch(() => []);
+      if (!extraFiles.length) throw new Error("Extra overlay no genero archivos");
+
+      // MERGE: copiar base + extra en directorio de trabajo
+      const workingDir = path.join(overlayCacheDir, `merged-${Date.now()}`);
+      await fs.mkdir(workingDir, { recursive: true });
+      await appendOverlayLog(`Merge base → ${workingDir}`);
+      await copyDirectory(baseOverlayPath, workingDir);
+      await appendOverlayLog(`Merge extra → ${workingDir}`);
+      await copyDirectory(extraOverlayPath, workingDir);
+      await appendOverlayLog("Merge completado. Iniciando patcher...");
+
+      // Patcher
+      const ensuredDll = await ensureCslolDll(sidecarPath, dllPath);
+      throwIfOverlayRunCanceled(runToken);
+      const dllMeta = await readDllSourceMetadata();
+      await appendOverlayLog(`Engine: ${sidecarPath}`);
+      await appendOverlayLog(`DLL: ${ensuredDll}`);
+      await appendOverlayLog(`League: ${gamePath}`);
+
+      const patcherResult = await spawnPatcherAndMonitor({
+        sidecarPath, dllPath: ensuredDll, overlayPath: workingDir, runToken, dllSourceMetadata: dllMeta
+      });
+      await markOverlayCachePolicy(workingDir);
+      await pruneOverlayCache({ protectedPaths: [workingDir] }).catch(() => {});
+
+      await appendOverlayLog("FIN INICIO OVERLAY (merge): patcher activo.");
+      return { success: true, ...patcherResult, enginePath: sidecarPath };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FULL BUILD PATH (comportamiento original)
+    // ═══════════════════════════════════════════════════════════════
     const ensuredDllPath = await ensureCslolDll(sidecarPath, dllPath);
     throwIfOverlayRunCanceled(runToken);
     const dllSourceMetadata = await readDllSourceMetadata();
@@ -3923,8 +5026,7 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
 
     const gameFolder = path.dirname(gamePath);
     const toolsDir = path.dirname(sidecarPath);
-    const profilesDir = path.join(app.getPath("userData"), "cslol-profiles");
-    const overlayCacheDir = path.join(app.getPath("userData"), "cslol-overlay-cache");
+    const profilesDir = path.join(getAppDataDir(), "cslol-profiles");
     const overlayStateDir = path.join(profilesDir, ".mkoverlay-state");
     const overlayCacheKey = await getOverlayCacheKey({ gamePath, skinPaths });
     const overlayPath = path.join(overlayCacheDir, overlayCacheKey);
@@ -3935,43 +5037,35 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
     await fs.mkdir(overlayCacheDir, { recursive: true });
     const oldProfiles = await fs.readdir(profilesDir, { withFileTypes: true }).catch(() => []);
     await Promise.all(oldProfiles
-      .filter((entry) => entry.name !== ".mkoverlay-state")
       .map((entry) => fs.rm(path.join(profilesDir, entry.name), { recursive: true, force: true }).catch(() => { })));
     await fs.mkdir(profilesDir, { recursive: true });
+    await fs.rm(overlayStateDir, { recursive: true, force: true }).catch(() => { });
     await fs.mkdir(overlayStateDir, { recursive: true });
-    await appendOverlayLog("Directorio de perfiles limpiado para nueva ejecucion; cache mkoverlay conservada.");
+    await appendOverlayLog("Directorio de perfiles y state mkoverlay limpiados para nueva ejecucion.");
 
     const overlayCacheHit = await isUsableOverlayPath(overlayPath);
     if (overlayCacheHit) {
       await appendOverlayLog(`Overlay cache HIT: ${overlayPath}. Se salta mkoverlay.`);
       await appendDirectoryLogInfo("Overlay cache reutilizado", overlayPath);
     } else {
-      await appendOverlayLog(`Overlay cache MISS: ${overlayPath}. Construyendo por partes con mkoverlay.`);
+      await appendOverlayLog(`Overlay cache MISS: ${overlayPath}. Construyendo con mkoverlay.`);
       await fs.rm(overlayPath, { recursive: true, force: true }).catch(() => { });
-    }
-
-    const mkoverlayArgs = [
-      "mkoverlay",
-      "--game",
-      path.normalize(gameFolder),
-      "--overlay",
-      path.normalize(overlayPath),
-      "--state",
-      path.normalize(statePath)
-    ];
-    for (const skinPath of skinPaths) {
-      mkoverlayArgs.push("--mod", path.normalize(skinPath));
     }
 
     if (!overlayCacheHit) {
       await appendOverlayLog(`Ejecutando mkoverlay en: ${overlayPath}`);
-      await appendOverlayLog(`mkoverlay args: ${mkoverlayArgs.join(" ")}`);
-      const mkoverlayInputBytes = await getFilesTotalSize(skinPaths);
-      const mkoverlayTimeoutMs = getMkoverlayTimeoutMs(mkoverlayInputBytes);
-      await appendOverlayLog(`mkoverlay timeout: ${Math.round(mkoverlayTimeoutMs / 1000)}s para ${formatLogBytes(mkoverlayInputBytes)} de mods.`);
       let mkoverlayStdout = "";
       try {
-        mkoverlayStdout = await execToolWithTimeout(sidecarPath, mkoverlayArgs, mkoverlayTimeoutMs, { cwd: toolsDir, runToken });
+        mkoverlayStdout = await execMkoverlayWithFallback({
+          sidecarPath,
+          toolsDir,
+          gameFolder,
+          overlayPath,
+          statePath,
+          modPaths: skinPaths,
+          runToken,
+          label: "mkoverlay"
+        });
       } catch (error) {
         await appendOverlayLog(`mkoverlay fallo: ${error.message}`);
         throw new Error(`mkoverlay fallo: ${error.message}`);
@@ -3980,7 +5074,6 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
       await appendOverlayLog(`mkoverlay OK${mkoverlayStdout ? `: ${mkoverlayStdout.slice(0, 500)}` : ""}`);
     }
 
-    // Verificar que el overlay tenga archivos
     const overlayFiles = await fs.readdir(overlayPath).catch(() => []);
     await appendOverlayLog(`Archivos generados por overlay: ${overlayFiles.length}${overlayFiles.length ? ` (${overlayFiles.slice(0, 8).join(", ")})` : ""}`);
     await appendDirectoryLogInfo("Overlay generado detalle", overlayPath);
@@ -3990,98 +5083,109 @@ ipcMain.handle("mods:run-bocchi-overlay", async (_event, payload) => {
       throw new Error(`mkoverlay no genero archivos en ${overlayPath}`);
     }
 
-    if (runningOverlayProcess) {
-      await appendOverlayLog(`Deteniendo patcher anterior antes de iniciar uno nuevo. PID=${runningOverlayProcess.pid}`);
-      runningOverlayProcess.stdin?.write("\n");
-      runningOverlayProcess.kill();
-      runningOverlayProcess = null;
-    }
-    throwIfOverlayRunCanceled(runToken);
-    currentOverlayError = "";
-
-    const bundledDll = ensuredDllPath;
-    try {
-      await fs.access(bundledDll);
-    } catch {
-      await appendOverlayLog(`ERROR DLL de Rift Atlas no encontrada: ${bundledDll}`);
-      throw new Error(`cslol-dll.dll no encontrada en ${bundledDll}. Pegalo manualmente en la carpeta engine.`);
-    }
-    await appendFileLogInfo("DLL usada por patcher", bundledDll);
-
-    const runoverlayArgs = [
-      "patcher",
-      "--dll",
-      bundledDll,
-      "--overlay-root",
-      path.normalize(overlayPath),
-      "--flags",
-      "0"
-    ];
-
-    await appendOverlayLog(`Iniciando patcher con overlay: ${overlayPath}`);
-    await appendOverlayLog(`patcher args: ${runoverlayArgs.join(" ")}`);
-    runningOverlayProcess = spawn(sidecarPath, runoverlayArgs, {
-      cwd: toolsDir,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
+    const patcherResult = await spawnPatcherAndMonitor({
+      sidecarPath, dllPath: ensuredDllPath, overlayPath, runToken, dllSourceMetadata
     });
-    runToken.processes.add(runningOverlayProcess);
+    await markOverlayCachePolicy(overlayPath);
+    await pruneOverlayCache({ protectedPaths: [overlayPath] }).catch(() => {});
 
-    currentProfilePath = overlayPath;
-    let patcherExited = false;
-    const handlePatcherOutput = (label, data) => {
-      const text = String(data).trim();
-      console.log(`[${label}]: ${String(data)}`);
-      if (text) appendOverlayLog(`[${label}] ${text}`);
-      if (/end of life reached|EOL_TIMESTAMP|timestamp\s*>\s*EOL/i.test(text)) {
-        const sourceText = dllSourceMetadata?.sourceLabel
-          ? ` Fuente usada: ${dllSourceMetadata.sourceLabel} ${dllSourceMetadata.version || ""}.`
-          : "";
-        currentOverlayError = `La DLL del engine esta vencida (End of life reached).${sourceText} Reemplaza cslol-dll.dll manualmente en la carpeta engine.`;
-        appendOverlayLog(`ERROR DLL vencida detectada: ${currentOverlayError}`);
-        runningOverlayProcess?.stdin?.write("\n");
-        runningOverlayProcess?.kill();
-      }
-    };
-    runningOverlayProcess.stdout?.on("data", (d) => handlePatcherOutput("PATCHER STDOUT", d));
-    runningOverlayProcess.stderr?.on("data", (d) => handlePatcherOutput("PATCHER STDERR", d));
-    runningOverlayProcess.on("exit", (code) => {
-      patcherExited = true;
-      runToken.processes.delete(runningOverlayProcess);
-      runningOverlayProcess = null;
-      currentProfilePath = "";
-      appendOverlayLog(`Patcher exit code: ${code}`);
-    });
-    runningOverlayProcess.on("error", (err) => {
-      patcherExited = true;
-      runToken.processes.delete(runningOverlayProcess);
-      runningOverlayProcess = null;
-      currentProfilePath = "";
-      appendOverlayLog(`Patcher error: ${err.message}`);
-    });
-
-    await sleepMs(2000);
-    throwIfOverlayRunCanceled(runToken);
-
-    if (patcherExited || !runningOverlayProcess) {
-      await appendOverlayLog("El patcher fallo al iniciar (salio antes de tiempo).");
-      throw new Error("El patcher fallo al iniciar (salio antes de tiempo).");
-    }
-
-    await appendOverlayLog(`Patcher activo. PID: ${runningOverlayProcess.pid}`);
-    await appendOverlayLog("FIN INICIO OVERLAY: patcher sigue corriendo; entra a partida para validar skins.");
-    return { success: true, pid: runningOverlayProcess.pid, profilePath: overlayPath, enginePath: sidecarPath };
+    await appendOverlayLog("FIN INICIO OVERLAY: patcher activo.");
+    return { success: true, ...patcherResult, enginePath: sidecarPath };
   } finally {
+    await runToken.suspensionGuard?.release?.("fin-ejecucion").catch(() => {});
+    runToken.suspensionGuard = null;
     if (activeOverlayRun === runToken) {
       activeOverlayRun = null;
     }
   }
 });
 
+// ── Pre-build base overlay from custom mods (no patcher start) ──
+ipcMain.handle("mods:build-base-overlay", async (_event, payload) => {
+  if (activeOverlayRun) {
+    await appendOverlayLog("Base overlay omitido: hay una inyeccion/compilacion en curso.").catch(() => {});
+    return { overlayPath: "" };
+  }
+  const sidecarPath = await resolveHitoriEngineExecutable(payload?.sidecarPath);
+  const gamePath = String(payload?.gamePath || "");
+  const skinEntries = payload?.skinEntries || [];
+
+  if (!gamePath.toLowerCase().endsWith("league of legends.exe")) {
+    return { overlayPath: "" };
+  }
+  if (!skinEntries.length) {
+    return { overlayPath: "" };
+  }
+
+  const runToken = createOverlayRunToken();
+  activeOverlayRun = runToken;
+  const overlayCacheDir = path.join(getAppDataDir(), "cslol-overlay-cache");
+
+  try {
+    await appendOverlayLog("=== PRE-BUILD BASE OVERLAY (mods custom) ===");
+    const skinPaths = [];
+    for (const [index, entry] of skinEntries.entries()) {
+      throwIfOverlayRunCanceled(runToken);
+      await appendOverlayLog(`Base mod #${index + 1}/${skinEntries.length}: ${entry.champion || ""} - ${entry.skin || entry.name || ""}`);
+      const modPath = await generateFantomeFromLeagueWad({ sidecarPath, gamePath, skin: entry });
+      skinPaths.push(modPath);
+    }
+    await appendOverlayLog(`Base mods finales: ${skinPaths.join(" | ")}`);
+    throwIfOverlayRunCanceled(runToken);
+
+    const gameFolder = path.dirname(gamePath);
+    const toolsDir = path.dirname(sidecarPath);
+    const profilesDir = path.join(getAppDataDir(), "cslol-profiles");
+    const overlayStateDir = path.join(profilesDir, ".mkoverlay-state");
+    const overlayCacheKey = await getOverlayCacheKey({ gamePath, skinPaths });
+    const overlayPath = path.join(overlayCacheDir, overlayCacheKey);
+    await appendOverlayLog(`Base overlay cacheKey=${overlayCacheKey} path=${overlayPath}`);
+
+    const overlayCacheHit = await isUsableOverlayPath(overlayPath);
+    if (overlayCacheHit) {
+      await appendOverlayLog(`Base overlay cache HIT: ${overlayPath}. Se salta mkoverlay.`);
+    } else {
+      await appendOverlayLog(`Base overlay cache MISS. Ejecutando mkoverlay...`);
+      await fs.rm(overlayPath, { recursive: true, force: true }).catch(() => { });
+      await fs.mkdir(profilesDir, { recursive: true });
+      await fs.mkdir(overlayCacheDir, { recursive: true });
+      await fs.rm(overlayStateDir, { recursive: true, force: true }).catch(() => { });
+      await fs.mkdir(overlayStateDir, { recursive: true });
+
+      await execMkoverlayWithFallback({
+        sidecarPath,
+        toolsDir,
+        gameFolder,
+        overlayPath,
+        statePath: overlayStateDir,
+        modPaths: skinPaths,
+        runToken,
+        label: "mkoverlay base"
+      });
+      throwIfOverlayRunCanceled(runToken);
+
+      const overlayFiles = await fs.readdir(overlayPath).catch(() => []);
+      if (!overlayFiles.length) throw new Error("mkoverlay no genero archivos");
+      await appendOverlayLog(`Base overlay generado: ${overlayFiles.length} archivos`);
+    }
+
+    await markOverlayCachePolicy(overlayPath);
+    await pruneOverlayCache({ protectedPaths: [overlayPath] }).catch(() => {});
+    return { overlayPath };
+  } catch (error) {
+    await appendOverlayLog(`Base overlay error: ${error.message}`);
+    return { overlayPath: "" };
+  } finally {
+    await runToken.suspensionGuard?.release?.("fin-prebuild").catch(() => {});
+    runToken.suspensionGuard = null;
+    if (activeOverlayRun === runToken) activeOverlayRun = null;
+  }
+});
+
 ipcMain.handle("ltk:download-and-install", async () => {
   const { release, asset } = await getLatestLtkSetupAsset();
 
-  const downloadDir = path.join(app.getPath("userData"), "ltk-download");
+  const downloadDir = path.join(getAppDataDir(), "ltk-download");
   await fs.mkdir(downloadDir, { recursive: true });
   const setupPath = path.join(downloadDir, asset.name);
 
@@ -4105,18 +5209,23 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const createOverlayRunToken = () => ({
   canceled: false,
-  processes: new Set()
+  processes: new Set(),
+  suspensionGuard: null
 });
 
 const cancelOverlayRun = async (reason = "Cancelado por el usuario.") => {
-  if (!activeOverlayRun) return false;
-  activeOverlayRun.canceled = true;
-  activeOverlayRun.reason = reason;
-  for (const proc of activeOverlayRun.processes) {
+  const token = activeOverlayRun;
+  if (!token) return false;
+  token.canceled = true;
+  token.reason = reason;
+  for (const proc of token.processes) {
     proc.stdin?.write("\n");
     proc.kill();
   }
-  activeOverlayRun.processes.clear();
+  token.processes.clear();
+  await token.suspensionGuard?.release?.("cancelacion").catch(() => {});
+  token.suspensionGuard = null;
+  activeOverlayRun = null;
   await appendOverlayLog(`Cancelacion solicitada: ${reason}`);
   return true;
 };
@@ -4127,11 +5236,175 @@ const throwIfOverlayRunCanceled = (token = activeOverlayRun) => {
   }
 };
 
+const waitForProcessExit = (proc, timeoutMs = 2500) => new Promise((resolve) => {
+  if (!proc || proc.exitCode !== null) {
+    resolve(false);
+    return;
+  }
+  let settled = false;
+  const done = (exited) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    proc.off?.("exit", onExit);
+    proc.off?.("error", onExit);
+    resolve(exited);
+  };
+  const onExit = () => done(true);
+  const timer = setTimeout(() => done(false), timeoutMs);
+  proc.once("exit", onExit);
+  proc.once("error", onExit);
+});
+
+const runPowerShellJson = (script, args = [], timeout = 5000) => new Promise((resolve, reject) => {
+  const env = { ...process.env };
+  args.forEach((arg, index) => {
+    env[`RIFT_ATLAS_PS_ARG_${index}`] = String(arg);
+  });
+  execFile("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-Command", `& {\n${script}\n}`
+  ], { windowsHide: true, timeout, env }, (error, stdout, stderr) => {
+    if (error) {
+      reject(new Error(String(stderr || error.message).trim() || "PowerShell fallo."));
+      return;
+    }
+    const text = String(stdout || "").trim();
+    if (!text) {
+      resolve(null);
+      return;
+    }
+    try {
+      resolve(JSON.parse(text));
+    } catch {
+      resolve(text);
+    }
+  });
+});
+
+const getLeagueGameProcessPids = async (gamePath = "") => {
+  if (process.platform !== "win32") return [];
+  const script = `
+$target = [System.IO.Path]::GetFullPath($env:RIFT_ATLAS_PS_ARG_0).ToLowerInvariant()
+$items = Get-CimInstance Win32_Process -Filter "Name = 'League of Legends.exe'" |
+  Where-Object {
+    $_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath).ToLowerInvariant() -eq $target)
+  } |
+  Select-Object -ExpandProperty ProcessId
+@($items) | ConvertTo-Json -Compress
+`;
+  const result = await runPowerShellJson(script, [gamePath], 5000);
+  return (Array.isArray(result) ? result : (result ? [result] : []))
+    .map((pid) => Number(pid))
+    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+};
+
+const setProcessSuspended = async (pid, suspend = true) => {
+  const script = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class NtProc {
+  [DllImport("ntdll.dll")] public static extern uint NtSuspendProcess(IntPtr hProcess);
+  [DllImport("ntdll.dll")] public static extern uint NtResumeProcess(IntPtr hProcess);
+}
+"@
+$pidValue = [int]$env:RIFT_ATLAS_PS_ARG_0
+$mode = $env:RIFT_ATLAS_PS_ARG_1
+$proc = [System.Diagnostics.Process]::GetProcessById($pidValue)
+try {
+  if ($mode -eq "suspend") {
+    [NtProc]::NtSuspendProcess($proc.Handle) | Out-Null
+  } else {
+    for ($i = 0; $i -lt 4; $i++) {
+      [NtProc]::NtResumeProcess($proc.Handle) | Out-Null
+    }
+  }
+  @{ ok = $true; pid = $pidValue; mode = $mode } | ConvertTo-Json -Compress
+} finally {
+  $proc.Dispose()
+}
+`;
+  await runPowerShellJson(script, [pid, suspend ? "suspend" : "resume"], 5000);
+};
+
+const createGameSuspensionGuard = ({ gamePath = "", runToken = null } = {}) => {
+  if (process.platform !== "win32" || !gamePath) {
+    return { release: async () => {}, markPatcherActive: async () => {} };
+  }
+
+  let active = true;
+  let released = false;
+  let timer = null;
+  let suspendedPid = 0;
+  let suspendStartedAt = 0;
+  let busy = false;
+
+  const release = async (reason = "release") => {
+    active = false;
+    released = true;
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+    const pid = suspendedPid;
+    suspendedPid = 0;
+    if (pid) {
+      try {
+        await setProcessSuspended(pid, false);
+        await appendOverlayLog(`[GameSuspend] League reanudado pid=${pid} reason=${reason}`);
+      } catch (error) {
+        await appendOverlayLog(`[GameSuspend] ERROR al reanudar pid=${pid}: ${error.message}`);
+      }
+    }
+  };
+
+  const tick = async () => {
+    if (!active || released || busy || runToken?.canceled) return;
+    busy = true;
+    try {
+      if (suspendedPid) {
+        if (Date.now() - suspendStartedAt >= GAME_SUSPEND_AUTO_RESUME_MS) {
+          await appendOverlayLog(`[GameSuspend] Auto-resume tras ${Math.round(GAME_SUSPEND_AUTO_RESUME_MS / 1000)}s.`);
+          await release("auto-timeout");
+        }
+        return;
+      }
+      const pids = await getLeagueGameProcessPids(gamePath).catch((error) => {
+        appendOverlayLog(`[GameSuspend] No pude buscar proceso League: ${error.message}`).catch(() => {});
+        return [];
+      });
+      const pid = pids[0];
+      if (!pid || !active || released || runToken?.canceled) return;
+      try {
+        await setProcessSuspended(pid, true);
+        suspendedPid = pid;
+        suspendStartedAt = Date.now();
+        await appendOverlayLog(`[GameSuspend] League suspendido pid=${pid}. Auto-resume=${Math.round(GAME_SUSPEND_AUTO_RESUME_MS / 1000)}s`);
+      } catch (error) {
+        await appendOverlayLog(`[GameSuspend] ERROR suspendiendo pid=${pid}: ${error.message}`);
+        await release("suspend-error");
+      }
+    } finally {
+      busy = false;
+    }
+  };
+
+  timer = setInterval(() => tick().catch(() => {}), GAME_SUSPEND_MONITOR_INTERVAL_MS);
+  tick().catch(() => {});
+
+  return {
+    release,
+    markPatcherActive: () => release("patcher-activo")
+  };
+};
+
 const appendOverlayLog = async (line) => {
   const text = String(line || "").trim();
   if (!text) return;
   currentOverlayLog = `${currentOverlayLog}${text}\n`.slice(-30000);
-  await fs.appendFile(path.join(app.getPath("userData"), "last-overlay-log.txt"), `${new Date().toISOString()} ${text}\n`).catch(() => { });
+  await fs.appendFile(path.join(getAppDataDir(), "last-overlay-log.txt"), `${new Date().toISOString()} ${text}\n`).catch(() => { });
 };
 
 const testCslolDllLoad = async ({ enginePath, dllPath }) => {
@@ -4212,18 +5485,28 @@ const testCslolDllLoad = async ({ enginePath, dllPath }) => {
 ipcMain.handle("mods:stop-overlay", async () => {
   const canceledRun = await cancelOverlayRun("Detenido manualmente desde la UI.");
   if (runningOverlayProcess) {
-    await appendOverlayLog(`STOP solicitado desde UI. PID=${runningOverlayProcess.pid} profile=${currentProfilePath}`);
-    runningOverlayProcess.stdin?.write("\n");
-    runningOverlayProcess.kill();
-    runningOverlayProcess = null;
-    currentProfilePath = "";
+    const processToStop = runningOverlayProcess;
+    const stoppedProfilePath = currentProfilePath;
+    await appendOverlayLog(`STOP solicitado desde UI. PID=${processToStop.pid} profile=${currentProfilePath}`);
+    processToStop.stdin?.write("\n");
+    processToStop.kill();
+    await waitForProcessExit(processToStop, 2500);
+    if (runningOverlayProcess === processToStop) {
+      runningOverlayProcess = null;
+      currentProfilePath = "";
+    }
     currentOverlayError = "";
+    await cleanupNoCacheOverlay(stoppedProfilePath).catch(() => false);
+    await pruneOverlayCache().catch(() => {});
     await appendOverlayLog("STOP completado: proceso marcado como detenido.");
     return { stopped: true };
   }
   if (canceledRun) {
+    const stoppedProfilePath = currentProfilePath;
     currentProfilePath = "";
     currentOverlayError = "";
+    await cleanupNoCacheOverlay(stoppedProfilePath).catch(() => false);
+    await pruneOverlayCache().catch(() => {});
     await appendOverlayLog("STOP completado: ejecucion en preparacion cancelada.");
     return { stopped: true };
   }
@@ -4237,6 +5520,19 @@ ipcMain.handle("mods:overlay-status", async () => {
     await appendOverlayLog(`Estado inconsistente: no hay proceso pero profilePath=${currentProfilePath}`);
   }
   return status;
+});
+
+ipcMain.handle("mods:is-league-game-running", async (_event, gamePath = "") => {
+  const pids = await getLeagueGameProcessPids(gamePath).catch(() => []);
+  const pid = pids[0] || 0;
+  return {
+    running: pid > 0,
+    pid
+  };
+});
+
+ipcMain.handle("mods:append-overlay-log", async (_event, message) => {
+  await appendOverlayLog(String(message || ""));
 });
 
 ipcMain.handle("mods:diagnose-overlay", async (_event, payload = {}) => {
@@ -4383,7 +5679,7 @@ ipcMain.handle("party:write-file", async (_event, payload = {}) => {
   const expectedHash = String(payload.hash || "");
   const chunks = Array.isArray(payload.chunks) ? payload.chunks : [];
   const skin = payload.skin || {};
-  const outputDir = path.join(app.getPath("userData"), "p2p");
+  const outputDir = path.join(getAppDataDir(), "p2p");
   await fs.mkdir(outputDir, { recursive: true });
   const outputPath = path.join(outputDir, `${Date.now()}-${fileName}`);
   const buffers = chunks.map((chunk) => Buffer.from(chunk));
@@ -4412,8 +5708,8 @@ ipcMain.handle("party:write-file", async (_event, payload = {}) => {
 
 ipcMain.handle("party:delete-file", async (_event, filePath) => {
   const target = path.resolve(String(filePath || ""));
-  const p2pDir = path.resolve(path.join(app.getPath("userData"), "p2p"));
-  const oldP2pDir = path.resolve(path.join(app.getPath("userData"), "party-transfers"));
+  const p2pDir = path.resolve(path.join(getAppDataDir(), "p2p"));
+  const oldP2pDir = path.resolve(path.join(getAppDataDir(), "party-transfers"));
   if (!target.startsWith(`${p2pDir}${path.sep}`) && !target.startsWith(`${oldP2pDir}${path.sep}`)) {
     throw new Error("Solo se pueden borrar archivos P2P recibidos por Rift Atlas.");
   }
@@ -4422,8 +5718,8 @@ ipcMain.handle("party:delete-file", async (_event, filePath) => {
 });
 
 ipcMain.handle("party:clear-p2p-files", async () => {
-  const outputDir = path.join(app.getPath("userData"), "p2p");
-  const oldOutputDir = path.join(app.getPath("userData"), "party-transfers");
+  const outputDir = path.join(getAppDataDir(), "p2p");
+  const oldOutputDir = path.join(getAppDataDir(), "party-transfers");
   await fs.rm(outputDir, { recursive: true, force: true }).catch(() => { });
   await fs.rm(oldOutputDir, { recursive: true, force: true }).catch(() => { });
   await fs.mkdir(outputDir, { recursive: true });
@@ -4467,7 +5763,8 @@ const execToolWithTimeout = (command, args, timeout, options = {}) => {
         } else if (code === 0) {
           resolve(stdout);
         } else {
-          reject(new Error(stderr.slice(0, 500) || `exit code ${code}`));
+          const detail = [stderr, stdout].filter(Boolean).join("\n").slice(-4000);
+          reject(new Error(detail || `exit code ${code}`));
         }
       });
     });
@@ -4526,73 +5823,6 @@ ipcMain.handle("mods:index-downloaded-league-skins", async () => {
   };
 });
 
-ipcMain.handle("riot:lookup-player", async (_event, payload) => {
-  const platform = String(payload.platform || "la2").toLowerCase();
-  const region = PLATFORM_TO_REGION[platform];
-  if (!region) {
-    throw new Error("Region de League no soportada.");
-  }
-
-  const { gameName, tagLine } = parseRiotId(payload.riotId);
-  const account = await riotRequest(`${region}.api.riotgames.com`, `/riot/account/v1/accounts/by-riot-id/${gameName}/${tagLine}`);
-  const summoner = await riotRequest(`${platform}.api.riotgames.com`, `/lol/summoner/v4/summoners/by-puuid/${encodeURIComponent(account.puuid)}`);
-
-  const [ranked, matchIds, activeGameResult] = await Promise.all([
-    riotRequest(`${platform}.api.riotgames.com`, `/lol/league/v4/entries/by-summoner/${encodeURIComponent(summoner.id)}`).catch(() => []),
-    riotRequest(`${region}.api.riotgames.com`, `/lol/match/v5/matches/by-puuid/${encodeURIComponent(account.puuid)}/ids?start=0&count=8`),
-    riotRequest(`${platform}.api.riotgames.com`, `/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(account.puuid)}`).catch((error) => {
-      if (error.status === 404) {
-        return null;
-      }
-      throw error;
-    })
-  ]);
-
-  const matches = await Promise.all(
-    matchIds.map(async (matchId) => {
-      const match = await riotRequest(`${region}.api.riotgames.com`, `/lol/match/v5/matches/${encodeURIComponent(matchId)}`);
-      const participant = match.info.participants.find((item) => item.puuid === account.puuid);
-      const teamId = participant?.teamId;
-      const allyTeam = match.info.participants.filter((item) => item.teamId === teamId).map(mapParticipant);
-      const enemyTeam = match.info.participants.filter((item) => item.teamId !== teamId).map(mapParticipant);
-      const itemTimeline = participant ? await getTimelineForParticipant(region, matchId, account.puuid) : [];
-      const creepScore = (participant?.totalMinionsKilled ?? 0) + (participant?.neutralMinionsKilled ?? 0);
-      const durationMinutes = Math.max(1, match.info.gameDuration / 60);
-      return {
-        id: match.metadata.matchId,
-        queueId: match.info.queueId,
-        gameCreation: match.info.gameCreation,
-        gameDuration: match.info.gameDuration,
-        gameMode: match.info.gameMode,
-        championName: participant?.championName || "Desconocido",
-        championId: participant?.championId,
-        kills: participant?.kills ?? 0,
-        deaths: participant?.deaths ?? 0,
-        assists: participant?.assists ?? 0,
-        creepScore,
-        creepScorePerMinute: creepScore / durationMinutes,
-        goldEarned: participant?.goldEarned ?? 0,
-        visionScore: participant?.visionScore ?? 0,
-        itemIds: [participant?.item0, participant?.item1, participant?.item2, participant?.item3, participant?.item4, participant?.item5, participant?.item6].filter(Boolean),
-        itemTimeline,
-        win: Boolean(participant?.win),
-        playerPuuid: account.puuid,
-        teamPosition: participant?.teamPosition || participant?.individualPosition || "",
-        allyTeam,
-        enemyTeam
-      };
-    })
-  );
-
-  return {
-    account,
-    summoner,
-    ranked,
-    activeGame: activeGameResult,
-    matches
-  };
-});
-
 ipcMain.handle("tiers:get-lane", (_event, payload) => getChampionTierLane(String(payload?.lane || "top"), String(payload?.version || "")));
 ipcMain.handle("data:get-champions", () => getDataDragonChampionData());
 ipcMain.handle("builds:get-champion", (_event, payload) => fetchUggChampionBuild({
@@ -4600,6 +5830,52 @@ ipcMain.handle("builds:get-champion", (_event, payload) => fetchUggChampionBuild
   championName: String(payload?.championName || ""),
   version: String(payload?.version || "")
 }));
+
+const createApplicationTray = (mainWindow, appIcon) => {
+  if (appTray || process.platform !== "win32") return;
+  appTray = new Tray(appIcon);
+  appTray.setToolTip("Rift Atlas");
+
+  const showWindow = () => {
+    if (mainWindow.isDestroyed()) return;
+    mainWindow.show();
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  };
+
+  const updateMenu = () => {
+    appTray.setContextMenu(Menu.buildFromTemplate([
+      { label: "Mostrar Rift Atlas", click: showWindow },
+      {
+        label: "Detener overlay",
+        click: () => {
+          cancelOverlayRun("Detenido desde bandeja.").catch(() => {});
+          if (runningOverlayProcess) {
+            appendOverlayLog(`STOP solicitado desde bandeja. PID=${runningOverlayProcess.pid} profile=${currentProfilePath}`).catch(() => {});
+            runningOverlayProcess.stdin?.write("\n");
+            runningOverlayProcess.kill();
+            runningOverlayProcess = null;
+            const stoppedProfilePath = currentProfilePath;
+            currentProfilePath = "";
+            currentOverlayError = "";
+            cleanupNoCacheOverlay(stoppedProfilePath).then(() => pruneOverlayCache()).catch(() => {});
+          }
+        }
+      },
+      { type: "separator" },
+      {
+        label: "Salir",
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        }
+      }
+    ]));
+  };
+
+  appTray.on("click", showWindow);
+  updateMenu();
+};
 
 const createWindow = () => {
   const appIcon = nativeImage.createFromPath(process.platform === "win32" ? APP_ICON : APP_ICON_PNG);
@@ -4620,6 +5896,7 @@ const createWindow = () => {
   });
 
   mainWindow.setIcon(appIcon);
+  createApplicationTray(mainWindow, appIcon);
   mainWindow.setMenuBarVisibility(false);
   mainWindow.loadFile(path.join(__dirname, "src", "index.html"));
   mainWindow.webContents.once("did-finish-load", () => {
@@ -4635,6 +5912,30 @@ const createWindow = () => {
     }
   });
   mainWindow.once("ready-to-show", () => mainWindow.maximize());
+
+  let penguCleanupDone = false;
+  mainWindow.on("close", (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      mainWindow.hide();
+      return;
+    }
+    if (penguCleanupDone) return;
+    event.preventDefault();
+    penguCleanupDone = true;
+    const modFilesDir = path.join(getAppDataDir(), "mod-files");
+    const CLOSE_TIMEOUT_MS = 8000;
+    const cleanup = async () => {
+      await Promise.race([
+        deactivatePenguLoader({ allowElevation: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), CLOSE_TIMEOUT_MS))
+      ]).catch(() => {});
+      await terminatePenguLoaderUi().catch(() => {});
+      await fs.rm(modFilesDir, { recursive: true, force: true }).catch(() => { });
+      app.quit();
+    };
+    cleanup();
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
@@ -4675,11 +5976,229 @@ const sendPenguBridgeMessage = (payload = {}) => {
   return sent;
 };
 
+const getImageMimeType = (filePath = "") => {
+  const ext = path.extname(String(filePath)).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  return "image/png";
+};
+
+const findLeagueSkinsPreviewFile = async ({ championId, skinId, chromaId }) => {
+  const root = await getDownloadedLeagueSkinsPath();
+  if (!root) return "";
+  const safeChampionId = String(Number(championId) || "");
+  const skinIds = getLeagueSkinIdCandidates(safeChampionId, skinId);
+  const chromaIds = getLeagueSkinIdCandidates(safeChampionId, chromaId);
+  if (!safeChampionId || !skinIds.length || !chromaIds.length) return "";
+
+  for (const candidateSkinId of skinIds) {
+    for (const candidateChromaId of chromaIds) {
+      const dirs = [
+        path.join(root, "skins", safeChampionId, candidateSkinId, candidateChromaId),
+        path.join(root, "skins", safeChampionId, candidateSkinId)
+      ];
+      const names = [...new Set([candidateChromaId, candidateSkinId, String(Number(chromaId) || ""), String(Number(skinId) || "")].filter(Boolean))];
+      for (const dir of dirs) {
+        for (const name of names) {
+          for (const ext of LOCAL_PREVIEW_EXTENSIONS) {
+            const candidate = path.join(dir, `${name}${ext}`);
+            if (await fileExists(candidate)) return candidate;
+          }
+        }
+      }
+    }
+  }
+
+  const championDir = path.join(root, "skins", safeChampionId);
+  const skinDirs = await fs.readdir(championDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of skinDirs) {
+    if (!entry.isDirectory()) continue;
+    for (const candidateChromaId of chromaIds) {
+      const chromaDir = path.join(championDir, entry.name, candidateChromaId);
+      for (const name of [...new Set([candidateChromaId, String(Number(chromaId) || "")].filter(Boolean))]) {
+        for (const ext of LOCAL_PREVIEW_EXTENSIONS) {
+          const candidate = path.join(chromaDir, `${name}${ext}`);
+          if (await fileExists(candidate)) return candidate;
+        }
+      }
+    }
+  }
+  return "";
+};
+
+const findIndexedPreviewFile = async ({ championId, skinId, chromaId }) => {
+  const safeChampionId = String(Number(championId) || "");
+  const skinIds = new Set(getLeagueSkinIdCandidates(safeChampionId, skinId));
+  const chromaIds = new Set(getLeagueSkinIdCandidates(safeChampionId, chromaId));
+  if (!safeChampionId || !skinIds.size || !chromaIds.size) return "";
+
+  try {
+    const payload = JSON.parse(await fs.readFile(getSkinIndexCachePath(), "utf8"));
+    const skins = Array.isArray(payload.skins) ? payload.skins : [];
+    const match = skins.find((entry) => {
+      const entryChampion = String(entry.championId || entry.rawChampion || "");
+      if (entryChampion !== safeChampionId) return false;
+      const entryBaseValues = [
+        entry.rawSkin,
+        entry.baseSkinId,
+        entry.baseImageSkinNum,
+        entry.imageSkinNum,
+        entry.skinNum
+      ].flatMap((value) => getLeagueSkinIdCandidates(safeChampionId, value));
+      const entryVariantValues = [
+        entry.rawVariant,
+        entry.fileBaseId,
+        entry.skinNum,
+        entry.imageSkinNum
+      ].flatMap((value) => getLeagueSkinIdCandidates(safeChampionId, value));
+      return entry.localPreviewPath &&
+        entryBaseValues.some((value) => skinIds.has(value)) &&
+        entryVariantValues.some((value) => chromaIds.has(value));
+    });
+    if (match?.localPreviewPath && await fileExists(match.localPreviewPath)) {
+      return match.localPreviewPath;
+    }
+  } catch {}
+
+  return "";
+};
+
+const getPenguAssetUrl = (routePath) => `http://127.0.0.1:${PENGU_ASSET_PORT}${routePath}`;
+
+const writeHttpResponse = (response, statusCode, headers = {}, body = "") => {
+  response.writeHead(statusCode, {
+    "Access-Control-Allow-Origin": "https://127.0.0.1:65236",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Cache-Control": "public, max-age=3600",
+    ...headers
+  });
+  response.end(body);
+};
+
+const serveFileResponse = async (response, filePath) => {
+  const fileBuffer = await fs.readFile(filePath);
+  writeHttpResponse(response, 200, { "Content-Type": getImageMimeType(filePath) }, fileBuffer);
+};
+
+const getLocalAssetFile = async (assetPath = "") => {
+  const normalized = String(assetPath || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!normalized || normalized.includes("..")) return "";
+  const candidates = [
+    getPackagedAssetPath("assets", normalized),
+    path.join(getAppDataDir(), "downloaded-libraries", "LeagueSkins", normalized)
+  ];
+  return findExistingPath(candidates);
+};
+
+const startPenguAssetServer = () => {
+  if (penguAssetServer) return;
+  penguAssetServer = http.createServer(async (request, response) => {
+    try {
+      if (request.method === "OPTIONS") {
+        writeHttpResponse(response, 204);
+        return;
+      }
+      if (request.method !== "GET") {
+        writeHttpResponse(response, 405, { "Content-Type": "text/plain" }, "Method Not Allowed");
+        return;
+      }
+
+      const requestUrl = new URL(request.url || "/", `http://127.0.0.1:${PENGU_ASSET_PORT}`);
+      const parts = requestUrl.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+      if (parts[0] === "preview" && parts.length >= 5) {
+        const previewPath = await findIndexedPreviewFile({
+          championId: parts[1],
+          skinId: parts[2],
+          chromaId: parts[3]
+        }) || await findLeagueSkinsPreviewFile({
+          championId: parts[1],
+          skinId: parts[2],
+          chromaId: parts[3]
+        });
+        if (previewPath) {
+          await serveFileResponse(response, previewPath);
+          return;
+        }
+      }
+
+      if (parts[0] === "asset" && parts.length >= 2) {
+        const assetPath = parts.slice(1).join("/");
+        const found = await getLocalAssetFile(assetPath);
+        if (found) {
+          await serveFileResponse(response, found);
+          return;
+        }
+      }
+
+      writeHttpResponse(response, 404, { "Content-Type": "text/plain" }, "Not Found");
+    } catch (error) {
+      appendOverlayLog(`[Pengu Preview] HTTP asset error: ${error.message}`).catch(() => {});
+      writeHttpResponse(response, 500, { "Content-Type": "text/plain" }, "Internal Server Error");
+    }
+  });
+
+  penguAssetServer.listen(PENGU_ASSET_PORT, "127.0.0.1");
+  penguAssetServer.on("error", (error) => {
+    console.warn("[Pengu asset server] error", error.message);
+  });
+};
+
+const handleLocalPreviewRequest = async (message, socket) => {
+  const chromaId = Number(message.chromaId || 0);
+  try {
+    const previewPath = await findIndexedPreviewFile({
+      championId: message.championId,
+      skinId: message.skinId,
+      chromaId
+    }) || await findLeagueSkinsPreviewFile({
+      championId: message.championId,
+      skinId: message.skinId,
+      chromaId
+    });
+    if (!previewPath) return;
+    const url = getPenguAssetUrl(`/preview/${encodeURIComponent(String(message.championId || ""))}/${encodeURIComponent(String(message.skinId || ""))}/${encodeURIComponent(String(chromaId))}/${encodeURIComponent(path.basename(previewPath))}`);
+    const previewBuffer = await fs.readFile(previewPath);
+    const dataUrl = `data:${getImageMimeType(previewPath)};base64,${previewBuffer.toString("base64")}`;
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        type: "local-preview-url",
+        championId: Number(message.championId || 0),
+        skinId: Number(message.skinId || 0),
+        chromaId,
+        url,
+        dataUrl
+      }));
+    }
+  } catch (error) {
+    appendOverlayLog(`[Pengu Preview] No pude servir preview local ${chromaId}: ${error.message}`).catch(() => {});
+  }
+};
+
+const handleLocalAssetRequest = async (message, socket) => {
+  const chromaId = Number(message.chromaId || 0);
+  try {
+    const assetPath = String(message.assetPath || "").replace(/\\/g, "/").replace(/^\/+/, "");
+    const found = await getLocalAssetFile(assetPath);
+    if (!found) return;
+    const url = getPenguAssetUrl(`/asset/${assetPath.split("/").map(encodeURIComponent).join("/")}`);
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        type: "local-asset-url",
+        assetPath,
+        chromaId,
+        url
+      }));
+    }
+  } catch (error) {
+    appendOverlayLog(`[Pengu Preview] No pude servir asset local ${chromaId}: ${error.message}`).catch(() => {});
+  }
+};
+
 const startPenguBridgeServer = () => {
   if (penguBridgeServer) return;
   penguBridgeServer = new WebSocketServer({
     host: "127.0.0.1",
-    port: 45731,
+    port: PENGU_BRIDGE_PORT,
     maxPayload: 1024 * 1024
   });
 
@@ -4693,7 +6212,6 @@ const startPenguBridgeServer = () => {
 
     socket.on("message", (rawMessage) => {
       const text = rawMessage.toString("utf8");
-      console.log("[BRIDGE RAW]", text.slice(0, 500));
       try {
         const message = JSON.parse(text);
         sendPenguBridgeToWindows("pengu:message", {
@@ -4708,8 +6226,6 @@ const startPenguBridgeServer = () => {
           message?.type === "skin-apply" ||
           message?.type === "skin-apply-result"
         ) {
-          console.log("[PENGU]", message);
-
           appendOverlayLog(
             `[Pengu Skin] ${JSON.stringify(message, null, 2)}`
           ).catch(() => { });
@@ -4722,6 +6238,12 @@ const startPenguBridgeServer = () => {
         }
         if (message?.type === "request-chroma-data") {
           handleChromaDataRequest(message, socket);
+        }
+        if (message?.type === "request-local-preview") {
+          handleLocalPreviewRequest(message, socket);
+        }
+        if (message?.type === "request-local-asset") {
+          handleLocalAssetRequest(message, socket);
         }
       } catch (error) {
         console.warn("[Pengu bridge] invalid message", error.message);
@@ -4742,6 +6264,8 @@ const startPenguBridgeServer = () => {
   });
 
   penguBridgeServer.on("error", (error) => {
+    // If port is already in use, the Rust bridge server is handling it — skip
+    if (error.code === "EADDRINUSE" || error.message?.includes("EADDRINUSE")) return;
     console.warn("[Pengu bridge] server error", error.message);
     sendPenguBridgeToWindows("pengu:bridge-status", {
       connected: false,
@@ -4751,12 +6275,12 @@ const startPenguBridgeServer = () => {
 };
 
 const resetOverlayLogForSession = async () => {
-  const logPath = path.join(app.getPath("userData"), "last-overlay-log.txt");
-  const previousLogPath = path.join(app.getPath("userData"), "last-overlay-log.previous.txt");
+  const logPath = path.join(getAppDataDir(), "last-overlay-log.txt");
+  const previousLogPath = path.join(getAppDataDir(), "last-overlay-log.previous.txt");
   const header = [
     `Rift Atlas overlay log`,
     `Sesion iniciada: ${new Date().toISOString()}`,
-    `userData: ${app.getPath("userData")}`,
+    `userData: ${getAppDataDir()}`,
     `platform: ${process.platform} ${os.release()}`,
     "============================================================",
     ""
@@ -4772,11 +6296,49 @@ const resetOverlayLogForSession = async () => {
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
   await cleanupUpdateInstallers();
+  await fs.rm(path.join(getAppDataDir(), "mod-files"), { recursive: true, force: true }).catch(() => {});
   await resetOverlayLogForSession();
+  pruneOverlayCache();
+  pruneModStagingCache();
+  startPenguAssetServer();
   startPenguBridgeServer();
-  await appendOverlayLog("[Pengu Loader] Inicio estilo Rose: no se abre Riot Client. Se espera LCU/lockfile para activar Pengu.").catch(() => { });
-  startPenguAutoActivationWatcher();
   createWindow();
+
+  // Cleanup leftover d3d9.dll de sesiones anteriores (no tocamos IFEO, lo decidira ensurePenguProxyInstalled)
+  const leagueClientPathAtBoot = await getPenguLeagueClientPath().catch(() => "");
+  if (leagueClientPathAtBoot) {
+    const removed = await removePenguProxyIfManaged("", leagueClientPathAtBoot).catch(() => ({}));
+    if (removed.proxyExisted) {
+      await appendOverlayLog("[Pengu Loader] Se limpio d3d9.dll izquierdo de sesion anterior.").catch(() => {});
+    }
+  }
+
+  // Auto-activar Pengu inmediatamente como Rose (solo CLI, sin IFEO)
+  try {
+    const penguPrepared = await preparePenguRuntime();
+    if (penguPrepared.prepared) {
+      const leagueRunning = await isLeagueClientRunning();
+      await appendOverlayLog(`[Pengu Loader] Auto-activacion inmediata estilo Rose. leagueRunning=${leagueRunning}`).catch(() => { });
+      if (leagueRunning) {
+        try {
+          const exePath = penguPrepared.executablePath;
+          if (exePath) {
+            await runPenguLoaderCli(exePath, ["--restart-client", "--silent"]);
+            await appendOverlayLog("[Pengu Loader] League Client reiniciado post-activacion inmediata.").catch(() => { });
+          }
+        } catch (restartErr) {
+          await appendOverlayLog(`[Pengu Loader] No se pudo reiniciar League post-activacion: ${restartErr.message}`).catch(() => { });
+        }
+      }
+    } else {
+      await appendOverlayLog(`[Pengu Loader] Activacion inmediata omitida: ${penguPrepared.proxyError || "Pengu no disponible"}`).catch(() => { });
+    }
+  } catch (startupErr) {
+    await appendOverlayLog(`[Pengu Loader] Error en activacion inmediata: ${startupErr.message}`).catch(() => { });
+  }
+
+  // Watcher por si League no estaba instalado y aparece despues
+  startPenguAutoActivationWatcher();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -4792,9 +6354,15 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  isQuitting = true;
+  activeOverlayRun?.suspensionGuard?.release?.("app-quit").catch(() => {});
   if (penguAutoActivationTimer) {
     clearInterval(penguAutoActivationTimer);
     penguAutoActivationTimer = null;
+  }
+  if (appTray) {
+    appTray.destroy();
+    appTray = null;
   }
   penguBridgeClients.forEach((socket) => socket.close());
   penguBridgeClients.clear();
@@ -4802,8 +6370,18 @@ app.on("before-quit", () => {
     penguBridgeServer.close();
     penguBridgeServer = null;
   }
-  if (!runningOverlayProcess) return;
-  runningOverlayProcess.stdin?.write("\n");
-  runningOverlayProcess.kill();
-  runningOverlayProcess = null;
+  if (penguAssetServer) {
+    penguAssetServer.close();
+    penguAssetServer = null;
+  }
+  if (runningOverlayProcess) {
+    runningOverlayProcess.stdin?.write("\n");
+    runningOverlayProcess.kill();
+    runningOverlayProcess = null;
+  }
+  fs.rm(path.join(getAppDataDir(), "mod-files"), { recursive: true, force: true }).catch(() => {});
+  // Cleanup leftover d3d9.dll on quit
+  getPenguLeagueClientPath().then((path) => {
+    if (path) removePenguProxyIfManaged("", path).catch(() => {});
+  }).catch(() => {});
 });

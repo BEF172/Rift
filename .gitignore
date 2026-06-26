@@ -1,10 +1,19 @@
 # Dependencies
 node_modules/
-package-lock.json
 
 # Build output
 dist/
 out/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/target/
+src-tauri/**/*.sig
+src-tauri/**/latest.json
+*.blockmap
+*.msi
+*.exe
+!src-tauri/icons/*.ico
+!assets/*.ico
 
 # IDE
 .vscode/
@@ -23,11 +32,32 @@ Thumbs.db
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+logs/
+crash-dumps/
 
 # Environment
 .env
 .env.local
+.env.*
+!.env.example
+
+# Secrets / signing keys
+*.key
+*.key.pub
+*.pem
+*.p12
+*.pfx
+*.cer
+*.crt
+*.password
+.tauri/
 
 # Temporary files
 *.tmp
 status.txt
+
+# Local/generated reference material
+.codex-refs/
+webview-data/
+cache/
+downloaded-updates/

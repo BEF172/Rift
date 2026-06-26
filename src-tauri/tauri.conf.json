@@ -1,0 +1,52 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
+  "productName": "Rift Atlas",
+  "version": "2.0.0",
+  "identifier": "com.riftatlas.desktop",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:45732 https://ddragon.leagueoflegends.com https://0.peerjs.com wss://0.peerjs.com; img-src 'self' http://127.0.0.1:45732 https://ddragon.leagueoflegends.com data: file:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "../assets/": "assets/",
+      "../Pengu Loader/plugins/": "bundled-plugins/"
+    },
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "startMenuFolder": "Rift Atlas",
+        "installerHooks": "../build/installer.nsh"
+      }
+    },
+    "publisher": "BEF172"
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERENDY0ODM2RUJGQzgwQTEKUldTaGdQenJOa2hHM2ZwVHZHL21vajNIaCt1aXBpdnR3QlZQdk82R3ZJMENFaXA4ZEhrS09sb04K",
+      "endpoints": [
+        "https://github.com/BEF172/Rift/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

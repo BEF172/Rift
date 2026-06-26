@@ -17,6 +17,9 @@ const state = {
   skinType: "all",
   skinState: "all",
   skinVisibleCount: 15,
+  groupSkinsByChampion: localStorage.getItem("riftAtlas:groupSkinsByChampion") === "1",
+  libraryIndex: { skins: [], profiles: [], metadata: {}, indexPath: "" },
+  skinMetadata: JSON.parse(localStorage.getItem("riftAtlas:skinMetadata") || "{}"),
   selectedSkinKey: "",
   favoriteSkins: new Set(JSON.parse(localStorage.getItem("riftAtlas:favoriteSkins") || "[]")),
   overlayHistory: JSON.parse(localStorage.getItem("riftAtlas:overlayHistory") || "[]"),
@@ -42,17 +45,68 @@ const state = {
   penguBridgeConnected: false,
   penguLobby: null,
   penguGameflowPhase: "",
+  penguHadInGamePhase: false,
+  penguSessionActive: false,
+  penguChampionLocked: false,
+  penguSessionQueuedSkins: new Set(),
+  penguOwnedSkinIds: new Set(),
+  penguOwnedSkinsReady: false,
   penguAutoParty: localStorage.getItem("riftAtlas:penguAutoParty") !== "0",
   penguAutoPartyRoom: "",
   favorites: new Set(JSON.parse(localStorage.getItem("riftAtlas:favorites") || "[]")),
   ltkOverlaySidecarPath: localStorage.getItem("riftAtlas:ltkOverlaySidecarPath") || "",
-  ltkOverlayDllPath: localStorage.getItem("riftAtlas:ltkOverlayDllPath") || ""
+  ltkOverlayDllPath: localStorage.getItem("riftAtlas:ltkOverlayDllPath") || "",
+  engineBinaryName: localStorage.getItem("riftAtlas:engineBinaryName") || "mod-tools.exe",
+  customOverlayPath: "",
+  customOverlayKeys: [],
+  customOverlayTimer: null,
+  autoRunCustomOverlaySignature: "",
+  preflightAcceptedOnce: false,
+  roseEarlyMonitorStarted: false,
+  roseFinalizationTimer: null,
+  roseFinalizationDeadline: 0,
+  roseFinalizationSignature: "",
+  roseFinalizationApplyStarted: false,
+  roseFinalizationCommitted: false,
+  loadoutCountdownActive: false,
+  loadoutT0: 0,
+  loadoutLeft0Ms: 0,
+  lastRemainMs: 0,
+  lastHoverWritten: false,
+  tickerSeq: 0,
+  currentTicker: 0,
+  skinWriteMs: Math.max(100, Math.min(2000, Number(localStorage.getItem("riftAtlas:roseInjectionThresholdMs") || 500))),
+  penguApplyLockedKey: "",
+  penguApplyLockedAt: 0
 };
+
+const lcuChampionSkinCache = new Map(); // championId -> Map(full skin/chroma ID -> localized name)
+const PENGU_CATALOG_FORCE_REASONS = new Set([
+  "bridge-connected",
+  "client-request",
+  "library-updated",
+  "custom-mods-updated",
+  "metadata-updated",
+  "champions-loaded",
+  "skin-selected-in-client",
+  "skin-applied"
+]);
+let lastPenguCatalogSignature = "";
+let lastOverlayStatusSignature = "";
+let lastPenguOwnedSkinCount = -1;
+let lastPenguSkinStateSignature = "";
+let lastPenguSkinStateAt = 0;
+let lastPenguChromaRequestSignature = "";
+let lastPenguSyncLogSignature = "";
+let lastPenguSyncLogAt = 0;
 
 const els = {
   mainContent: document.querySelector(".main-content"),
   sidebar: document.querySelector(".sidebar"),
-  apiKeyLabel: document.querySelector("#apiKeyLabel"),
+  titlebar: document.querySelector(".app-titlebar"),
+  windowMinimizeButton: document.querySelector("#windowMinimizeButton"),
+  windowMaximizeButton: document.querySelector("#windowMaximizeButton"),
+  windowCloseButton: document.querySelector("#windowCloseButton"),
   championToolbar: document.querySelector("#championToolbar"),
   patchLabel: document.querySelector("#patchLabel"),
   championGrid: document.querySelector("#championGrid"),
@@ -62,16 +116,6 @@ const els = {
   refreshTiersButton: document.querySelector("#refreshTiersButton"),
   searchInput: document.querySelector("#searchInput"),
   countLabel: document.querySelector("#countLabel"),
-  favoritesGrid: document.querySelector("#favoritesGrid"),
-  favoritesCount: document.querySelector("#favoritesCount"),
-  apiKeyForm: document.querySelector("#apiKeyForm"),
-  apiKeyInput: document.querySelector("#apiKeyInput"),
-  apiKeyHint: document.querySelector("#apiKeyHint"),
-  clearApiKeyButton: document.querySelector("#clearApiKeyButton"),
-  playerSearchForm: document.querySelector("#playerSearchForm"),
-  riotIdInput: document.querySelector("#riotIdInput"),
-  platformSelect: document.querySelector("#platformSelect"),
-  playerResults: document.querySelector("#playerResults"),
   buildSearchForm: document.querySelector("#buildSearchForm"),
   buildChampionInput: document.querySelector("#buildChampionInput"),
   buildChampionList: document.querySelector("#buildChampionList"),
@@ -88,15 +132,10 @@ const els = {
   modsFolderLabel: document.querySelector("#modsFolderLabel"),
   modsPackageList: document.querySelector("#modsPackageList"),
   leagueGamePathLabel: document.querySelector("#leagueGamePathLabel"),
+  detectLeaguePathButton: document.querySelector("#detectLeaguePathButton"),
   selectLeagueGameButton: document.querySelector("#selectLeagueGameButton"),
   importStatusLabel: document.querySelector("#importStatusLabel"),
   configStatusLabel: document.querySelector("#configStatusLabel"),
-  compactStatusLabel: document.querySelector("#compactStatusLabel"),
-  compactOverlayPill: document.querySelector("#compactOverlayPill"),
-  compactPresetSelect: document.querySelector("#compactPresetSelect"),
-  compactLoadPresetButton: document.querySelector("#compactLoadPresetButton"),
-  compactRunButton: document.querySelector("#compactRunButton"),
-  compactStopButton: document.querySelector("#compactStopButton"),
   downloadCslolButton: document.querySelector("#downloadCslolButton"),
   autoConfigureButton: document.querySelector("#autoConfigureButton"),
   runDiagnosticsButton: document.querySelector("#runDiagnosticsButton"),
@@ -115,17 +154,14 @@ const els = {
   updateDismissButton: document.querySelector("#updateDismissButton"),
   checkUpdatesButton: document.querySelector("#checkUpdatesButton"),
   ltkOverlaySidecarLabel: document.querySelector("#ltkOverlaySidecarLabel"),
+  engineBinarySelector: document.querySelector("#engineBinarySelector"),
+  engineModeButtons: [...document.querySelectorAll(".engine-mode-option")],
   ltkOverlayDllLabel: document.querySelector("#ltkOverlayDllLabel"),
   appDataPathLabel: document.querySelector("#appDataPathLabel"),
   openAppDataFolderButton: document.querySelector("#openAppDataFolderButton"),
   factoryResetButton: document.querySelector("#factoryResetButton"),
   selectLtkOverlaySidecarButton: document.querySelector("#selectLtkOverlaySidecarButton"),
   selectLtkOverlayDllButton: document.querySelector("#selectLtkOverlayDllButton"),
-  ltkPathLabel: document.querySelector("#ltkPathLabel"),
-  selectLtkButton: document.querySelector("#selectLtkButton"),
-  openLtkButton: document.querySelector("#openLtkButton"),
-  downloadLtkButton: document.querySelector("#downloadLtkButton"),
-  revealLtkDownloadButton: document.querySelector("#revealLtkDownloadButton"),
   overlayStatusIndicator: document.querySelector("#overlayStatusIndicator"),
   overlayStatusLabel: document.querySelector("#overlayStatusLabel"),
   skinsOverlayStatusIndicator: document.querySelector("#skinsOverlayStatusIndicator"),
@@ -156,20 +192,21 @@ const els = {
   partyMembersList: document.querySelector("#partyMembersList"),
   partyFileProfile: document.querySelector("#partyFileProfile"),
   presetNameInput: document.querySelector("#presetNameInput"),
+  presetIconInput: document.querySelector("#presetIconInput"),
+  presetColorInput: document.querySelector("#presetColorInput"),
   createPresetButton: document.querySelector("#createPresetButton"),
   presetSelect: document.querySelector("#presetSelect"),
   presetStatusLabel: document.querySelector("#presetStatusLabel"),
   saveQueuePresetButton: document.querySelector("#saveQueuePresetButton"),
   loadPresetQueueButton: document.querySelector("#loadPresetQueueButton"),
+  togglePresetAutoApplyButton: document.querySelector("#togglePresetAutoApplyButton"),
   deletePresetButton: document.querySelector("#deletePresetButton"),
   presetList: document.querySelector("#presetList"),
-  howItWorksTitle: document.querySelector("#howItWorksTitle"),
-  howItWorksDesc: document.querySelector("#howItWorksDesc"),
-  downloadLeagueSkinsButton: document.querySelector("#downloadLeagueSkinsButton"),
   downloadEngineButton: document.querySelector("#downloadEngineButton"),
   downloadLeagueSkinsButtonDownload: document.querySelector("#downloadLeagueSkinsButtonDownload"),
   downloadPenguLoaderButton: document.querySelector("#downloadPenguLoaderButton"),
   launchPenguLoaderButton: document.querySelector("#launchPenguLoaderButton"),
+  uninstallPenguLoaderButton: document.querySelector("#uninstallPenguLoaderButton"),
   openEngineFolderButton: document.querySelector("#openEngineFolderButton"),
   openDllFolderButton: document.querySelector("#openDllFolderButton"),
   openLeagueSkinsFolderButton: document.querySelector("#openLeagueSkinsFolderButton"),
@@ -184,23 +221,21 @@ const els = {
   firstDllOpenFolderButton: document.querySelector("#firstDllOpenFolderButton"),
   firstDllDoneButton: document.querySelector("#firstDllDoneButton"),
   firstDllLaterButton: document.querySelector("#firstDllLaterButton"),
+  engineChoiceModal: document.querySelector("#engineChoiceModal"),
+  chooseLtkManagerButton: document.querySelector("#chooseLtkManagerButton"),
+  chooseModToolsButton: document.querySelector("#chooseModToolsButton"),
+  cancelEngineChoiceButton: document.querySelector("#cancelEngineChoiceButton"),
   selectSkinLibraryButton: document.querySelector("#selectSkinLibraryButton"),
-  addCustomModFilesButton: document.querySelector("#addCustomModFilesButton"),
-  addCustomModFolderButton: document.querySelector("#addCustomModFolderButton"),
+  openModsFolderButton: document.querySelector("#openModsFolderButton"),
+  modDropZone: document.querySelector("#modDropZone"),
+  libraryIndexStatus: document.querySelector("#libraryIndexStatus"),
+  groupSkinsCheckbox: document.querySelector("#groupSkinsCheckbox"),
   customModsLabel: document.querySelector("#customModsLabel"),
   customModsList: document.querySelector("#customModsList"),
   skinsP2PSection: document.querySelector("#skinsP2PSection"),
   skinsP2PLabel: document.querySelector("#skinsP2PLabel"),
   skinsP2PList: document.querySelector("#skinsP2PList"),
   skinsP2PSyncButton: document.querySelector("#skinsP2PSyncButton"),
-  skinsP2PApplyButton: document.querySelector("#skinsP2PApplyButton"),
-  skinLibraryLabel: document.querySelector("#skinLibraryLabel"),
-  skinSearchInput: document.querySelector("#skinSearchInput"),
-  skinChampionSelect: document.querySelector("#skinChampionSelect"),
-  skinTypeSelect: document.querySelector("#skinTypeSelect"),
-  skinStateSelect: document.querySelector("#skinStateSelect"),
-  skinLibraryList: document.querySelector("#skinLibraryList"),
-  skinProfilePanel: document.querySelector("#skinProfilePanel"),
   managedSkinsCount: document.querySelector("#managedSkinsCount"),
   queuedSkinsCount: document.querySelector("#queuedSkinsCount"),
   clearQueueButton: document.querySelector("#clearQueueButton"),
@@ -215,38 +250,46 @@ const els = {
   bottomStopOverlayButton: document.querySelector("#bottomStopOverlayButton"),
   overlayHistoryList: document.querySelector("#overlayHistoryList"),
   clearOverlayHistoryButton: document.querySelector("#clearOverlayHistoryButton"),
-  bottomApplyButton: document.querySelector("#bottomApplyButton")
+  bottomApplyButton: document.querySelector("#bottomApplyButton"),
+  baseOverlayStatusLabel: document.querySelector("#baseOverlayStatusLabel"),
+  rebuildBaseOverlayButton: document.querySelector("#rebuildBaseOverlayButton"),
+  skinMetadataModal: document.querySelector("#skinMetadataModal"),
+  skinMetadataForm: document.querySelector("#skinMetadataForm"),
+  metadataSkinKeyInput: document.querySelector("#metadataSkinKeyInput"),
+  metadataNameInput: document.querySelector("#metadataNameInput"),
+  metadataChampionInput: document.querySelector("#metadataChampionInput"),
+  metadataBaseInput: document.querySelector("#metadataBaseInput"),
+  metadataAuthorInput: document.querySelector("#metadataAuthorInput"),
+  metadataVersionInput: document.querySelector("#metadataVersionInput"),
+  metadataPreviewInput: document.querySelector("#metadataPreviewInput"),
+  chooseMetadataPreviewButton: document.querySelector("#chooseMetadataPreviewButton"),
+  regenerateMetadataPreviewButton: document.querySelector("#regenerateMetadataPreviewButton"),
+  cancelMetadataButton: document.querySelector("#cancelMetadataButton"),
+  preflightModal: document.querySelector("#preflightModal"),
+  preflightSummary: document.querySelector("#preflightSummary"),
+  preflightList: document.querySelector("#preflightList"),
+  cancelPreflightButton: document.querySelector("#cancelPreflightButton"),
+  confirmPreflightButton: document.querySelector("#confirmPreflightButton"),
+  maintenanceList: document.querySelector("#maintenanceList"),
+  refreshMaintenanceButton: document.querySelector("#refreshMaintenanceButton"),
+  cleanupOverlayCacheButton: document.querySelector("#cleanupOverlayCacheButton"),
+  cleanupPreviewCacheButton: document.querySelector("#cleanupPreviewCacheButton"),
+  cleanupPartyCacheButton: document.querySelector("#cleanupPartyCacheButton"),
+  cleanupDownloadsButton: document.querySelector("#cleanupDownloadsButton"),
+  openLogsFolderButton: document.querySelector("#openLogsFolderButton"),
+  exportDiagnosticsButton: document.querySelector("#exportDiagnosticsButton")
 };
 
 const template = document.querySelector("#championCardTemplate");
 const CDN = "https://ddragon.leagueoflegends.com";
 const SKIN_PAGE_SIZE = 15;
 const skinArtFallbackCache = new Map();
-const QUEUES = {
-  400: "Normal Draft",
-  420: "Ranked Solo/Duo",
-  430: "Normal Blind",
-  440: "Ranked Flex",
-  450: "ARAM",
-  700: "Clash",
-  900: "ARURF",
-  1020: "One for All",
-  1700: "Arena",
-  1900: "Pick URF"
-};
 const ROLE_LABELS = {
   top: "Top",
   jungle: "Jungla",
   middle: "Mid",
   bottom: "ADC",
   support: "Support"
-};
-const POSITION_LABELS = {
-  TOP: "Top",
-  JUNGLE: "Jungla",
-  MIDDLE: "Mid",
-  BOTTOM: "ADC",
-  UTILITY: "Support"
 };
 
 const escapeHtml = (value = "") =>
@@ -256,6 +299,29 @@ const escapeHtml = (value = "") =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+
+const stopButtonEvent = (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+};
+
+const sendPenguDebugMode = (enabled = false, source = "startup") => {
+  window.riftAtlas.sendPenguMessage?.({
+    type: "debug-mode",
+    enabled: Boolean(enabled),
+    source
+  }).catch(() => null);
+};
+
+const setAppDebugMode = (enabled = false, source = "startup") => {
+  const active = Boolean(enabled);
+  window.__riftAtlasDebug = active;
+  localStorage.setItem("riftAtlas:debugMode", active ? "1" : "0");
+  sendPenguDebugMode(active, source);
+  if (active) {
+    window.riftAtlas.appendOverlayLog?.("[Debug] Modo debug activo por parametro -debug.").catch(() => { });
+  }
+};
 
 const cleanText = (value = "") =>
   value
@@ -283,18 +349,6 @@ const fetchJsonWithTimeout = async (url, options = {}, timeoutMs = 20000) => {
 };
 
 const getChampionByNumericId = (championId) => state.champions.find((champion) => Number(champion.key) === Number(championId));
-
-const getChampionSquare = (championId, fallbackName) => {
-  const champion = getChampionByNumericId(championId);
-  const image = champion?.image?.full || `${fallbackName}.png`;
-  return `${CDN}/cdn/${state.version}/img/champion/${image}`;
-};
-
-const formatDuration = (seconds = 0) => {
-  const minutes = Math.floor(seconds / 60);
-  const rest = Math.floor(seconds % 60).toString().padStart(2, "0");
-  return `${minutes}:${rest}`;
-};
 
 const formatDate = (timestamp) =>
   new Intl.DateTimeFormat("es-AR", {
@@ -337,8 +391,25 @@ const getChampionByTextHint = (...parts) => {
     }) || null;
 };
 
+const getChampionByTargetWads = (skin = {}) => {
+  const targetWads = [
+    ...(Array.isArray(skin.targetWads) ? skin.targetWads : []),
+    ...(Array.isArray(skin.archiveInfo?.targetWads) ? skin.archiveInfo.targetWads : [])
+  ];
+  for (const wadName of targetWads) {
+    const baseName = String(wadName || "")
+      .replace(/\.wad(?:\.client)?$/i, "")
+      .trim();
+    if (!baseName) continue;
+    const champion = getChampionByNumericId(baseName) || getChampionByDatasetName(baseName) || getChampionByTextHint(baseName);
+    if (champion) return champion;
+  }
+  return null;
+};
+
 const getSkinChampionFromHints = (skin = {}) =>
   getChampionByNumericId(skin.rawChampion) ||
+  getChampionByTargetWads(skin) ||
   getChampionByDatasetName(skin.champion) ||
   getChampionByTextHint(
     skin.champion,
@@ -430,8 +501,6 @@ const getChampionByTierRow = (row) => {
 
 const getTierClass = (tier = "") => `tier-${String(tier).toLowerCase().replace("+", "plus").replace(/[^a-z0-9]/g, "")}`;
 
-const getItemImage = (itemId) => `${CDN}/cdn/${state.version}/img/item/${itemId}.png`;
-
 const getChampionIconByKey = (championKey, fallbackName) => {
   const champion = getChampionByNumericId(championKey) || getChampionByDatasetName(fallbackName);
   return champion ? `${CDN}/cdn/${state.version}/img/champion/${champion.image.full}` : "";
@@ -443,7 +512,9 @@ const getSkinChampionId = (skin) => {
 };
 
 const getSkinLoadingImage = (skin) => {
+  if (skin.previewUrl) return skin.previewUrl;
   if (skin.imageUrl) return skin.imageUrl;
+  if (Object.prototype.hasOwnProperty.call(skin || {}, "localPreviewPath")) return "";
   const championId = getSkinChampionId(skin);
   if (!championId) return "";
   const artNum = skin.imageSkinNum ?? skin.skinNum;
@@ -464,6 +535,7 @@ const getSkinDefaultSplashImage = (skin) => {
 };
 
 const getSkinBaseLoadingImage = (skin) => {
+  if (Object.prototype.hasOwnProperty.call(skin || {}, "localPreviewPath")) return "";
   const championId = getSkinChampionId(skin);
   const baseNum = skin.baseImageSkinNum ?? skin.imageSkinNum;
   if (!championId || baseNum === null || baseNum === undefined || baseNum === "") return "";
@@ -482,6 +554,9 @@ const formatDownloadProgress = (payload = {}) => {
   const total = Number(payload.total) || 0;
   const percent = payload.percent ?? (total ? Math.round((downloaded / total) * 100) : null);
 
+  if (downloaded && !total) {
+    return ` ${formatBytes(downloaded)} descargados`;
+  }
   if (percent != null && total) {
     return ` ${percent}% (${formatBytes(downloaded)} / ${formatBytes(total)})`;
   }
@@ -501,6 +576,7 @@ const saveFavorites = () => {
 
 const saveManagedSkins = () => {
   localStorage.setItem("riftAtlas:managedSkins", JSON.stringify([...state.managedSkins]));
+  persistLibraryIndex();
   renderSkinLibrary();
 };
 
@@ -509,13 +585,16 @@ const saveQueuedSkins = () => {
   if (normalizedKeys.length !== state.queuedSkins.size) {
     state.queuedSkins = new Set(normalizedKeys);
   }
+  state.autoRunCustomOverlaySignature = "";
+  state.customOverlayPath = "";
+  state.customOverlayKeys = [];
   localStorage.setItem("riftAtlas:queuedSkins", JSON.stringify([...state.queuedSkins]));
   // Update only the queue counters and status, not the entire library
   if (els.queuedSkinsCount) els.queuedSkinsCount.textContent = `${state.queuedSkins.size} seleccionadas`;
   if (els.clearQueueButton) {
     const hasActiveP2P = [...state.queuedSkins].some(isActivePartyP2PPath);
     els.clearQueueButton.textContent = hasActiveP2P ? "Limpiar no P2P" : "Limpiar todo";
-    els.clearQueueButton.disabled = (state.queuedSkins.size === 0 && state.managedSkins.size === 0) || state.importingQueue;
+    els.clearQueueButton.disabled = state.queuedSkins.size === 0 || state.importingQueue;
   }
   // Update queued styling on skin rows
   els.skinLibraryList?.querySelectorAll(".skin-row").forEach((row) => {
@@ -529,30 +608,26 @@ const saveQueuedSkins = () => {
       queueButton.textContent = queued ? "Quitar" : "Seleccionar";
     }
   });
+  updateCustomModsQueueState();
   renderPresets();
   renderCompactLauncher();
   renderSelectionTray();
+  renderBaseOverlayStatus();
+  persistLibraryIndex();
   if (state.partyStatus === "connected") renderParty();
   schedulePartySync();
   sendPenguSkinCatalog("queue-updated");
 };
 
-const saveCustomMods = () => {
-  localStorage.setItem("riftAtlas:customMods", JSON.stringify(state.customMods));
-  renderCustomMods();
-  renderSelectionTray();
-  renderPresets();
-  renderCompactLauncher();
-  sendPenguSkinCatalog("custom-mods-updated");
-};
-
 const saveFavoriteSkins = () => {
   localStorage.setItem("riftAtlas:favoriteSkins", JSON.stringify([...state.favoriteSkins]));
+  persistLibraryIndex();
   renderSkinLibrary();
 };
 
 const saveOverlayHistory = () => {
   localStorage.setItem("riftAtlas:overlayHistory", JSON.stringify(state.overlayHistory.slice(0, 12)));
+  persistLibraryIndex();
   renderOverlayHistory();
 };
 
@@ -578,27 +653,131 @@ const setOverlayPanelStatus = ({ label, message, active = false, error = false }
   els.skinsOverlayStatusIndicator?.classList.toggle("active", Boolean(active && !error));
 };
 
+const resolveSkinLibraryNames = () => {
+  const champions = state.champions || [];
+  state.skinLibrary = state.skinLibrary.map((entry) => {
+    const championKey = String(entry.championKey || entry.champion || "");
+    let champion = championKey ? champions.find((c) => String(c.key) === championKey) : null;
+    if (!champion && entry.champion) {
+      const nameLookup = entry.champion.trim().toLowerCase();
+      champion = champions.find((c) => c.name.trim().toLowerCase() === nameLookup || c.id.trim().toLowerCase() === nameLookup);
+    }
+    if (champion) {
+      entry.champion = champion.name;
+      entry.championKey = champion.key;
+      entry.championId = champion.key;
+    }
+    const skinIds = [
+      entry.fileBaseId,
+      entry.rawSkin,
+      entry.rawVariant,
+    ].filter(Boolean).map((id) => {
+      const trimmed = String(id).trim();
+      return trimmed.match(/^\d+$/) ? trimmed : null;
+    }).filter(Boolean);
+    let resolvedFromCatalog = false;
+    if (skinIds.length) {
+      const numericId = Number(skinIds[0]);
+      entry.skinNum = numericId;
+      entry.imageSkinNum = numericId;
+      entry.baseImageSkinNum = numericId;
+      if (champion) {
+        const skinMap = lcuChampionSkinCache.get(String(champion.key)) || new Map();
+        for (const skinId of skinIds) {
+          const skinName = skinMap.get(skinId);
+          if (skinName) {
+            entry.skin = skinName;
+            resolvedFromCatalog = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!entry.skin) {
+      entry.skin = entry.rawSkin || entry.fileBaseId || entry.skin || "desconocido";
+    }
+    // LeagueSkins is numeric. Keep entries pending until the running client's
+    // LCU catalog resolves the localized name (Rose-style source of truth).
+    entry.resolved = skinIds.length === 0 || resolvedFromCatalog;
+    return entry;
+  });
+};
+
 const setSkinLibrary = (result) => {
   if (!result) return;
   state.skinLibrary = result.skins || [];
+  resolveSkinLibraryNames();
   state.skinChampion = "all";
   resetSkinView({ clearProfile: true });
   state.skinLibraryPath = result.folderPath || "";
   if (state.skinLibraryPath) {
     localStorage.setItem("riftAtlas:skinLibraryPath", state.skinLibraryPath);
   }
-  els.skinLibraryLabel.textContent = `${state.skinLibraryPath} - ${state.skinLibrary.length} skin/package(s)`;
+  if (els.skinLibraryLabel) {
+    els.skinLibraryLabel.textContent = `${state.skinLibraryPath} - ${state.skinLibrary.length} skin/package(s)`;
+  }
   if (els.downloadSkinLibraryLabel) els.downloadSkinLibraryLabel.textContent = state.skinLibraryPath || "No configurado";
+  if (els.leagueSkinsLocalPanel) els.leagueSkinsLocalPanel.hidden = false;
   renderSkinChampionOptions();
   renderSkinLibrary();
+  persistLibraryIndex();
   sendPenguSkinCatalog("library-updated");
+  syncUserModsFolder("library-updated", { silent: true }).catch(() => null);
 };
 
 const clearSkinSelection = () => {
   state.queuedSkins.clear();
+  state.penguSessionQueuedSkins.clear();
   state.managedSkins.clear();
   localStorage.setItem("riftAtlas:managedSkins", JSON.stringify([]));
   saveQueuedSkins();
+};
+
+const isUserCustomModKey = (key = "") => {
+  const mod = state.customMods.find((item) => getSkinKey(item) === key);
+  return Boolean(mod && mod.source !== "p2p");
+};
+
+const clearPenguSessionQueuedSkins = (reason = "game-ended") => {
+  const keys = [...state.penguSessionQueuedSkins]
+    .filter((key) => state.queuedSkins.has(key) && !isUserCustomModKey(key));
+  const preservedUserMods = [...state.penguSessionQueuedSkins]
+    .filter((key) => state.queuedSkins.has(key) && isUserCustomModKey(key));
+  if (!keys.length) {
+    preservedUserMods.forEach((key) => state.penguSessionQueuedSkins.delete(key));
+    state.penguSessionQueuedSkins.clear();
+    lastPenguSkinSyncPayload = null;
+    clearRoseAuthoritativeSelection();
+    lastPenguLcuSelection = null;
+    lastPenguSkinSyncKey = "";
+    lastPenguSkinSyncAt = 0;
+    lastPenguChromaSelection = null;
+    lastPenguChromaPanel = null;
+    lastRosePreforceSignature = "";
+    lastRosePreforceAt = 0;
+    return false;
+  }
+
+  keys.forEach((key) => removeQueuedSkinKey(key));
+  preservedUserMods.forEach((key) => state.penguSessionQueuedSkins.delete(key));
+  state.penguSessionQueuedSkins.clear();
+  lastPenguSkinSyncPayload = null;
+  clearRoseAuthoritativeSelection();
+  lastPenguLcuSelection = null;
+  lastPenguSkinSyncKey = "";
+  lastPenguSkinSyncAt = 0;
+  lastPenguChromaSelection = null;
+  lastPenguChromaPanel = null;
+  lastRosePreforceSignature = "";
+  lastRosePreforceAt = 0;
+  state.customOverlayPath = "";
+  state.customOverlayKeys = [];
+  saveQueuedSkins();
+  renderSkinLibrary();
+  renderSelectionTray();
+  renderBaseOverlayStatus();
+  window.riftAtlas.appendOverlayLog(`[Diagnostico] Limpieza Pengu post-partida (${reason}): ${keys.length} seleccion(es) removidas.`).catch(() => { });
+  return true;
 };
 
 const GAMEFLOW_CLEAR_PHASES = new Set([
@@ -611,22 +790,280 @@ const GAMEFLOW_CLEAR_PHASES = new Set([
   "ReadyCheck"
 ]);
 
+const GAMEFLOW_ACTIVE_PHASES = new Set([
+  "GameStart",
+  "InProgress",
+  "Reconnect"
+]);
+
+const ROSE_SUSPEND_PHASES = new Set([
+  "ChampSelect",
+  "FINALIZATION",
+  "SWIFTPLAY_SEARCHING",
+  "GameStart"
+]);
+
+const shouldKeepRoseEarlyMonitor = () =>
+  ROSE_SUSPEND_PHASES.has(String(state.penguGameflowPhase || ""));
+
+const ROSE_INJECTION_THRESHOLD_MS = Math.max(
+  100,
+  Math.min(2000, Number(localStorage.getItem("riftAtlas:roseInjectionThresholdMs") || 500))
+);
+let roseLocalTickerGeneration = 0;
+let roseLocalTickerRunning = false;
+
+const clearRoseFinalizationTimer = () => {
+  if (state.roseFinalizationTimer) {
+    clearInterval(state.roseFinalizationTimer);
+    state.roseFinalizationTimer = null;
+  }
+  state.roseFinalizationDeadline = 0;
+  state.loadoutCountdownActive = false;
+  state.loadoutLeft0Ms = 0;
+  state.loadoutT0 = 0;
+  state.lastRemainMs = 0;
+};
+
+const clearPenguApplyLock = () => {
+  state.penguApplyLockedKey = "";
+  state.penguApplyLockedAt = 0;
+};
+
+const startRoseEarlyMonitor = async (reason = "rose") => {
+  if (!window.riftAtlas.startEarlyMonitor || !state.leagueGamePath) return false;
+  if (["InProgress", "Reconnect"].includes(state.penguGameflowPhase)) return false;
+  if (state.roseEarlyMonitorStarted) return true;
+  try {
+    const result = await window.riftAtlas.startEarlyMonitor(state.leagueGamePath);
+    state.roseEarlyMonitorStarted = Boolean(result?.started);
+    window.riftAtlas.appendOverlayLog(`[RoseSuspend] monitor temprano iniciado (${reason}).`).catch(() => { });
+    return state.roseEarlyMonitorStarted;
+  } catch (error) {
+    window.riftAtlas.appendOverlayLog(`[RoseSuspend] no pude iniciar monitor temprano (${reason}): ${error.message || error}`).catch(() => { });
+    return false;
+  }
+};
+
+const stopRoseEarlyMonitor = async (reason = "release") => {
+  if (!window.riftAtlas.stopEarlyMonitor || !state.roseEarlyMonitorStarted) return false;
+  const forcedRelease = String(reason).includes("no-apply");
+  if (shouldKeepRoseEarlyMonitor() && !forcedRelease) {
+    return false;
+  }
+  try {
+    const result = await window.riftAtlas.stopEarlyMonitor();
+    window.riftAtlas.appendOverlayLog(`[RoseSuspend] monitor temprano liberado (${reason}) suspended=${Boolean(result?.hadSuspended)}.`).catch(() => { });
+    return true;
+  } catch (error) {
+    window.riftAtlas.appendOverlayLog(`[RoseSuspend] no pude liberar monitor temprano (${reason}): ${error.message || error}`).catch(() => { });
+    return false;
+  } finally {
+    state.roseEarlyMonitorStarted = false;
+  }
+};
+
+const triggerRoseFinalizationApply = async (reason = "finalization") => {
+  if (state.lastHoverWritten || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted || state.importingQueue || state.overlayRunning) return false;
+  state.lastHoverWritten = true;
+  state.roseFinalizationCommitted = true;
+  state.roseFinalizationApplyStarted = true;
+  let applied = false;
+  try {
+    // Rose does not wait for every queued/repeated DOM notification at the
+    // injection threshold. It consumes the latest cached selection. Waiting for
+    // the whole JS queue can push the LCU base-skin force past ChampSelect and
+    // leave League on the previously owned skin.
+    let payload = roseAuthoritativeSelection.payload || lastPenguSkinSyncPayload || {};
+    const fallbackSkin = roseAuthoritativeSelection.skinKey ? getSkinByKey(roseAuthoritativeSelection.skinKey) : null;
+    const resolved = await resolveRoseAuthoritativeSkinEntry(payload, fallbackSkin);
+    payload = resolved.payload || payload;
+    const skin = resolved.skin;
+    if (skin) {
+      lastPenguSkinSyncPayload = { ...payload };
+      // Rose calls _force_owned_skin/_force_base_skin synchronously inside
+      // trigger_injection, before starting the injection thread. Do the LCU
+      // write here, at the threshold, so it cannot be delayed behind the
+      // overlay/background queue and miss ChampSelect.
+      await maybeForceLeagueSkinForOverlay(skin, payload);
+      applied = Boolean(await handlePenguSkinApply({ ...payload, key: getSkinKey(skin), type: payload.type || "loadout-finalization" }));
+      return applied;
+    }
+    window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION sin una skin solicitada y resuelta; no se reutiliza la seleccion anterior.").catch(() => { });
+    return false;
+  } finally {
+    if (!applied) {
+      state.lastHoverWritten = false;
+      state.roseFinalizationCommitted = false;
+      await stopRoseEarlyMonitor("finalization-no-apply");
+    }
+    state.roseFinalizationApplyStarted = false;
+  }
+};
+
+const cancelRoseLocalFinalizationTicker = () => {
+  roseLocalTickerGeneration += 1;
+  roseLocalTickerRunning = false;
+};
+
+const startRoseLocalFinalizationTicker = () => {
+  if (!window.riftAtlas.waitForLcuFinalizationThreshold || roseLocalTickerRunning) {
+    return roseLocalTickerRunning;
+  }
+  const generation = ++roseLocalTickerGeneration;
+  roseLocalTickerRunning = true;
+  window.riftAtlas.appendOverlayLog(
+    `[RoseTicker] local Rust/LCU monotonic iniciado; threshold=${ROSE_INJECTION_THRESHOLD_MS}ms.`
+  ).catch(() => { });
+  window.riftAtlas.waitForLcuFinalizationThreshold(ROSE_INJECTION_THRESHOLD_MS)
+    .then((result) => {
+      if (generation !== roseLocalTickerGeneration || !result?.ready) return;
+      state.penguGameflowPhase = "FINALIZATION";
+      state.lastRemainMs = Math.max(0, Number(result.remainingMs || 0));
+      clearRoseFinalizationTimer();
+      window.riftAtlas.appendOverlayLog(
+        `[RoseTicker] threshold local alcanzado: remaining=${result.remainingMs}ms source=${result.source}.`
+      ).catch(() => { });
+      triggerRoseFinalizationApply("Rust LCU monotonic threshold").catch((error) => {
+        window.riftAtlas.appendOverlayLog(`[RoseTicker] apply local fallo: ${error.message || error}`).catch(() => { });
+      });
+    })
+    .catch((error) => {
+      if (generation !== roseLocalTickerGeneration) return;
+      window.riftAtlas.appendOverlayLog(`[RoseTicker] ticker local termino: ${error.message || error}`).catch(() => { });
+    })
+    .finally(() => {
+      if (generation === roseLocalTickerGeneration) roseLocalTickerRunning = false;
+    });
+  return true;
+};
+
+const handlePenguLoadoutFinalization = (payload = {}) => {
+  if (String(payload.phase || "").toUpperCase() === "SWIFTPLAY_SEARCHING") {
+    state.penguGameflowPhase = "SWIFTPLAY_SEARCHING";
+    const champions = Array.isArray(payload.champions) ? payload.champions : [];
+    const signature = champions
+      .map((entry) => `${Number(entry?.championId || 0)}:${Number(entry?.skinId || 0)}`)
+      .filter((entry) => !entry.startsWith("0:"))
+      .sort()
+      .join("|");
+    if (!signature || signature === state.roseFinalizationSignature) return;
+    state.roseFinalizationSignature = signature;
+    triggerRoseSwiftplayApply(champions).catch((error) => {
+      window.riftAtlas.appendOverlayLog(`[Rose/Swiftplay] apply fallo: ${error.message || error}`).catch(() => { });
+    });
+    return true;
+  }
+  state.penguGameflowPhase = "FINALIZATION";
+  const leftMs = Math.max(0, Number(payload.adjustedTimeLeftInPhase || payload.leftMs || 0));
+  if (!state.loadoutCountdownActive && leftMs > 0) {
+    state.loadoutLeft0Ms = leftMs;
+    state.loadoutT0 = performance.now();
+    state.tickerSeq = (state.tickerSeq || 0) + 1;
+    state.currentTicker = state.tickerSeq;
+    state.loadoutCountdownActive = true;
+  }
+  if (startRoseLocalFinalizationTicker()) return true;
+  const signature = `${payload.phase || "FINALIZATION"}:${Math.floor(leftMs / 250)}`;
+  if (signature === state.roseFinalizationSignature) return;
+  state.roseFinalizationSignature = signature;
+  const candidateDeadline = performance.now() + leftMs;
+  if (!state.roseFinalizationDeadline || candidateDeadline < state.roseFinalizationDeadline) {
+    state.roseFinalizationDeadline = candidateDeadline;
+  }
+  if (!state.roseFinalizationTimer) {
+    const tickerId = state.currentTicker;
+    state.roseFinalizationTimer = setInterval(() => {
+      if (!state.loadoutCountdownActive || state.currentTicker !== tickerId) {
+        clearRoseFinalizationTimer();
+        return;
+      }
+      const remainingMs = Math.max(0, state.roseFinalizationDeadline - performance.now());
+      state.lastRemainMs = Math.min(state.lastRemainMs || remainingMs, remainingMs);
+      if (remainingMs > state.skinWriteMs) return;
+      clearRoseFinalizationTimer();
+      triggerRoseFinalizationApply(`FINALIZATION threshold ${state.skinWriteMs}ms`).catch((error) => {
+        window.riftAtlas.appendOverlayLog(`[RoseSuspend] finalization apply fallo: ${error.message || error}`).catch(() => { });
+      });
+    }, 25);
+  }
+};
+
 const handlePenguPhaseChange = (payload = {}) => {
   const phase = String(payload.phase || "").trim();
   if (!phase) return;
 
-  const previousPhase = state.penguGameflowPhase || String(payload.previousPhase || "").trim();
-  state.penguGameflowPhase = phase;
-
-  if (previousPhase !== "InProgress" || !GAMEFLOW_CLEAR_PHASES.has(phase)) return;
-  if (state.queuedSkins.size === 0 && state.managedSkins.size === 0) return;
-
-  clearSkinSelection();
-  setOverlayPanelStatus({
-    label: state.overlayRunning ? "Overlay activo" : "Sin overlay",
-    message: "Partida finalizada: se limpio la seleccion.",
-    active: state.overlayRunning
-  });
+  const currentPhaseBeforeEvent = state.penguGameflowPhase;
+  const previousPhase = String(payload.previousPhase || "").trim() || currentPhaseBeforeEvent;
+  // Riot reports the outer gameflow phase as ChampSelect while the session
+  // timer is already in FINALIZATION. A late/stale ChampSelect event must not
+  // downgrade that subphase or make it look like a brand-new session.
+  const preservesFinalization = phase === "ChampSelect" && currentPhaseBeforeEvent === "FINALIZATION";
+  state.penguGameflowPhase = preservesFinalization ? "FINALIZATION" : phase;
+  const wasInGame = state.penguHadInGamePhase || GAMEFLOW_ACTIVE_PHASES.has(previousPhase);
+  if (phase === "ChampSelect") {
+    state.penguSessionActive = true;
+    if (!preservesFinalization && !["ChampSelect", "FINALIZATION"].includes(previousPhase)) {
+      state.penguChampionLocked = false;
+      state.penguOwnedSkinIds = new Set();
+      state.penguOwnedSkinsReady = false;
+      lastPenguLcuSelection = null;
+      lastPenguSkinSyncPayload = null;
+      clearRoseAuthoritativeSelection();
+      lastPenguSkinSyncKey = "";
+      lastPenguSkinSyncAt = 0;
+      state.roseFinalizationApplyStarted = false;
+      state.roseFinalizationCommitted = false;
+      state.roseFinalizationSignature = "";
+      state.lastHoverWritten = false;
+      state.loadoutCountdownActive = false;
+      state.loadoutT0 = 0;
+      state.loadoutLeft0Ms = 0;
+      state.lastRemainMs = 0;
+      state.currentTicker = 0;
+      clearPenguApplyLock();
+      startRoseLocalFinalizationTicker();
+    }
+  }
+  if (GAMEFLOW_ACTIVE_PHASES.has(phase)) {
+    state.penguSessionActive = true;
+    state.penguHadInGamePhase = true;
+    if (phase === "InProgress") {
+      pausePartyTransfersForGame();
+    }
+    clearRoseFinalizationTimer();
+    cancelRoseLocalFinalizationTicker();
+    if (phase === "GameStart" && !state.roseFinalizationCommitted) {
+      triggerRoseFinalizationApply("GameStart fallback").catch((error) => {
+        window.riftAtlas.appendOverlayLog(`[Rose] fallback GameStart fallo: ${error.message || error}`).catch(() => { });
+      });
+    }
+    return;
+  }
+  const explicitGameEnd = ["PreEndOfGame", "EndOfGame", "WaitingForStats"].includes(phase);
+  const returningFromSession = GAMEFLOW_CLEAR_PHASES.has(phase) && (
+    state.penguSessionActive || wasInGame ||
+    ["ChampSelect", "FINALIZATION", "GameStart", "Reconnect"].includes(previousPhase)
+  );
+  if (explicitGameEnd || returningFromSession) {
+    clearRoseFinalizationTimer();
+    cancelRoseLocalFinalizationTicker();
+    clearPenguApplyLock();
+    stopRoseEarlyMonitor(`${previousPhase || "?"}->${phase}`).catch(() => { });
+    clearPenguSessionQueuedSkins(`${previousPhase || "?"}->${phase}`);
+    state.penguHadInGamePhase = false;
+    state.penguSessionActive = false;
+    state.importingQueue = false;
+    state.roseEarlyMonitorStarted = false;
+    state.autoRunCustomOverlaySignature = "";
+    penguBackgroundApplyKey = "";
+    penguBackgroundApplyAt = 0;
+    penguBackgroundApplyPromise = Promise.resolve();
+    penguBackgroundApplyInFlightKey = "";
+    resumePartyTransfersAfterGame();
+    state.overlayRunning = false;
+    refreshOverlayStatus().catch(() => { });
+  }
 };
 
 const handlePenguCarouselStatus = (payload = {}) => {
@@ -643,6 +1080,7 @@ const handlePenguCarouselStatus = (payload = {}) => {
 const savePresets = () => {
   localStorage.setItem("riftAtlas:presets", JSON.stringify(state.presets));
   localStorage.setItem("riftAtlas:activePresetId", state.activePresetId || "");
+  persistLibraryIndex();
   renderPresets();
   renderCompactLauncher();
 };
@@ -654,15 +1092,145 @@ const sanitizeImportName = (value = "") =>
     .trim()
     .slice(0, 120) || "Imported Mod";
 
-const getSkinDisplayName = (skin) => `${skin.champion} - ${skin.skin}${skin.variant ? ` - ${skin.variant}` : ""}`;
+const getSkinSource = (skin = {}) =>
+  skin.source === "p2p" ? "party" :
+    skin.generated ? "generado" :
+      skin.custom ? "custom" :
+        isDownloadedLeagueSkinsPath(skin.path) ? "LeagueSkins" :
+          "LeagueSkins";
+
+const applySkinMetadata = (skin = {}) => {
+  const key = getSkinKey(skin);
+  const meta = key ? state.skinMetadata[key] || {} : {};
+  if (!meta || !Object.keys(meta).length) return skin;
+  return {
+    ...skin,
+    metadataEdited: true,
+    displayName: meta.name || skin.displayName,
+    name: meta.name || skin.name,
+    skin: meta.name || skin.skin,
+    champion: meta.champion || skin.champion,
+    targetBaseSkin: meta.baseSkin || skin.targetBaseSkin,
+    author: meta.author || skin.author,
+    version: meta.version || skin.version,
+    previewUrl: meta.preview || skin.previewUrl,
+    previewPath: meta.previewPath || skin.previewPath,
+    previewInferred: meta.previewInferred ?? skin.previewInferred
+  };
+};
+
+const getSkinDisplayName = (skin) => {
+  const resolved = applySkinMetadata(skin);
+  return `${resolved.champion} - ${resolved.skin || resolved.name}${resolved.variant ? ` - ${resolved.variant}` : ""}`;
+};
+
+const getSkinVisibleName = (skin) => {
+  const resolved = applySkinMetadata(skin);
+  return resolved.skin || resolved.name || resolved.displayName || "Skin";
+};
 
 const getSkinImportName = (skin) => sanitizeImportName(getSkinDisplayName(skin));
 
-const getSkinByKey = (key) =>
-  state.skinLibrary.find((skin) => getSkinKey(skin) === key) ||
-  state.customMods.find((mod) => getSkinKey(mod) === key);
+const getSkinByKey = (key) => {
+  const skin = state.customMods.find((mod) => getSkinKey(mod) === key) ||
+    state.skinLibrary.find((item) => getSkinKey(item) === key);
+  return skin ? applySkinMetadata(skin) : skin;
+};
+
+const saveSkinMetadata = () => {
+  localStorage.setItem("riftAtlas:skinMetadata", JSON.stringify(state.skinMetadata));
+  persistLibraryIndex();
+};
+
+const getUnifiedLibrarySkins = () =>
+  [...state.customMods, ...state.skinLibrary]
+    .filter((skin) => getSkinKey(skin))
+    .map((skin) => {
+      const resolved = applySkinMetadata(skin);
+      const key = getSkinKey(resolved);
+      return {
+        id: key,
+        path: resolved.path,
+        name: resolved.skin || resolved.name || getNameFromPath(resolved.path),
+        champion: resolved.champion || "Mod propio",
+        author: resolved.author || "",
+        version: resolved.version || "",
+        source: getSkinSource(resolved),
+        enabled: state.managedSkins.has(key),
+        favorite: state.favoriteSkins.has(key),
+        queued: state.queuedSkins.has(key),
+        lastUsedAt: state.overlayHistory.find((entry) => (entry.skinKeys || []).includes(key))?.createdAt || "",
+        preview: resolved.previewUrl || resolved.imageUrl || getSkinLoadingImage(resolved) || getSkinDefaultLoadingImage(resolved),
+        previewPath: resolved.previewPath || resolved.localPreviewPath || "",
+        previewInferred: Boolean(resolved.previewInferred || (!resolved.previewUrl && !resolved.imageUrl)),
+        extension: resolved.extension || getLocalModExtensionFromPath(resolved.path),
+        size: resolved.size || 0,
+        metadataEdited: Boolean(resolved.metadataEdited)
+      };
+    });
+
+let libraryIndexSaveTimer = null;
+const persistLibraryIndex = () => {
+  clearTimeout(libraryIndexSaveTimer);
+  libraryIndexSaveTimer = setTimeout(async () => {
+    const payload = {
+      skins: getUnifiedLibrarySkins(),
+      profiles: state.presets,
+      metadata: state.skinMetadata
+    };
+    state.libraryIndex = { ...state.libraryIndex, ...payload, updatedAt: new Date().toISOString() };
+    if (els.libraryIndexStatus) {
+      els.libraryIndexStatus.textContent = `${payload.skins.length} entrada(s), guardando indice...`;
+    }
+    try {
+      const result = await window.riftAtlas.writeLibraryIndex?.(payload);
+      if (result?.indexPath && els.libraryIndexStatus) {
+        els.libraryIndexStatus.textContent = `${payload.skins.length} entrada(s). Indice: ${result.indexPath}`;
+      }
+    } catch (error) {
+      if (els.libraryIndexStatus) els.libraryIndexStatus.textContent = `No pude guardar indice: ${error.message}`;
+    }
+  }, 300);
+};
+
+const loadLibraryIndex = async () => {
+  try {
+    const payload = await window.riftAtlas.readLibraryIndex?.();
+    if (!payload) return;
+    state.libraryIndex = payload;
+    if (payload.metadata && typeof payload.metadata === "object") {
+      state.skinMetadata = { ...payload.metadata, ...state.skinMetadata };
+      localStorage.setItem("riftAtlas:skinMetadata", JSON.stringify(state.skinMetadata));
+    }
+    if (Array.isArray(payload.profiles) && payload.profiles.length && !state.presets.length) {
+      state.presets = payload.profiles;
+    }
+    if (els.libraryIndexStatus) {
+      els.libraryIndexStatus.textContent = payload.indexPath
+        ? `${payload.skins?.length || 0} entrada(s). Indice: ${payload.indexPath}`
+        : "Indice local listo.";
+    }
+  } catch (error) {
+    if (els.libraryIndexStatus) els.libraryIndexStatus.textContent = `No pude leer indice: ${error.message}`;
+  }
+};
+
+const isRiftAtlasP2PMod = (mod = {}) => {
+  if (mod.source !== "p2p") return false;
+  const normalizedPath = String(mod.path || "").replace(/\//g, "\\").toLowerCase();
+  return normalizedPath.includes("\\rift atlas\\p2p\\") ||
+    normalizedPath.includes("\\rift atlas\\party-transfers\\");
+};
+
+const isDownloadedLeagueSkinsPath = (filePath = "") => {
+  const normalizedPath = String(filePath || "").replace(/\//g, "\\").toLowerCase();
+  return normalizedPath.includes("\\rift atlas\\downloaded-libraries\\leagueskins\\");
+};
 
 const getQueueChampionKey = (skin = {}) => {
+  const inferred = getSkinChampionFromHints(skin);
+  if (inferred?.key) return String(inferred.key);
+  if (inferred?.id) return String(inferred.id).toLowerCase();
   const champion = String(skin.champion || skin.rawChampion || "").trim().toLowerCase();
   if (!champion || champion === "mod propio" || champion === "party") return "";
   return champion;
@@ -676,6 +1244,7 @@ const removeQueuedSkinsForChampion = (championKey, exceptKey = "") => {
     const queuedSkin = getSkinByKey(queuedKey);
     if (queuedSkin && getQueueChampionKey(queuedSkin) === championKey) {
       state.queuedSkins.delete(queuedKey);
+      state.penguSessionQueuedSkins.delete(queuedKey);
       setTimeout(() => removeP2PFileIfUnused(queuedKey), 0);
       removed += 1;
     }
@@ -683,11 +1252,16 @@ const removeQueuedSkinsForChampion = (championKey, exceptKey = "") => {
   return removed;
 };
 
-const queueSkinKey = (key) => {
+const queueSkinKey = (key, options = {}) => {
   const skin = getSkinByKey(key);
   if (!skin) return { queued: false, replaced: 0 };
-  const replaced = removeQueuedSkinsForChampion(getQueueChampionKey(skin), key);
+  const replaced = options.preserveExistingChampion ? 0 : removeQueuedSkinsForChampion(getQueueChampionKey(skin), key);
   state.queuedSkins.add(key);
+  if (options.sessionSource === "pengu") {
+    state.penguSessionQueuedSkins.add(key);
+  } else {
+    state.penguSessionQueuedSkins.delete(key);
+  }
   return { queued: true, replaced };
 };
 
@@ -700,6 +1274,7 @@ const removeP2PFileIfUnused = async (key = "") => {
   partyReceivedFiles.forEach((localKey, remoteKey) => {
     if (localKey === key) partyReceivedFiles.delete(remoteKey);
   });
+  if (!isRiftAtlasP2PMod(mod)) return false;
   state.customMods = state.customMods.filter((item) => getSkinKey(item) !== key);
   await window.riftAtlas.deletePartyFile?.(mod.path).catch(() => null);
   saveCustomMods();
@@ -708,6 +1283,7 @@ const removeP2PFileIfUnused = async (key = "") => {
 
 const removeQueuedSkinKey = (key = "") => {
   if (!key || !state.queuedSkins.delete(key)) return false;
+  state.penguSessionQueuedSkins.delete(key);
   removeP2PFileIfUnused(key);
   return true;
 };
@@ -736,13 +1312,28 @@ const normalizeQueuedSkinKeys = (skinKeys = []) => {
 
 const getActivePreset = () => state.presets.find((preset) => preset.id === state.activePresetId);
 
+const createProfilePreset = (name, skinKeys = [...state.queuedSkins]) => ({
+  id: `preset-${Date.now()}`,
+  name,
+  icon: (els.presetIconInput?.value.trim() || "RA").slice(0, 8),
+  color: els.presetColorInput?.value || "#c89b3c",
+  skinKeys,
+  enginePath: state.ltkOverlaySidecarPath,
+  dllPath: state.ltkOverlayDllPath,
+  leagueGamePath: state.leagueGamePath,
+  penguAutoParty: state.penguAutoParty,
+  autoApply: false,
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString()
+});
+
 const renderSelectedMiniCard = (skin) => {
   const art = getSkinLoadingImage(skin) || getSkinBaseLoadingImage(skin) || getSkinDefaultLoadingImage(skin);
   const icon = art || getChampionIconByKey(skin.rawChampion, skin.champion);
   return `
     <button class="selected-mini-card" type="button" data-path="${escapeHtml(getSkinKey(skin))}">
-      ${icon ? `<img src="${icon}" alt="${escapeHtml(skin.champion)}" />` : `<span>${escapeHtml(skin.extension.replace(".", ""))}</span>`}
-      <strong>${escapeHtml(skin.skin)}</strong>
+      ${icon ? `<img src="${icon}" alt="${escapeHtml(skin.champion)}" />` : `<span>${escapeHtml(getDisplayExtension(skin))}</span>`}
+      <strong>${escapeHtml(getSkinVisibleName(skin))}</strong>
       <small>${escapeHtml(skin.champion)}</small>
     </button>
   `;
@@ -750,19 +1341,405 @@ const renderSelectedMiniCard = (skin) => {
 
 const normalizeCustomMod = (item) => ({
   ...item,
+  extension: item.extension || getLocalModExtensionFromPath(item.path || item.name || "") || ".fantome",
+  name: item.name || getNameFromPath(item.path || item.relativePath || "") || "Mod local",
+  relativePath: item.relativePath || item.path || item.name || "",
   champion: item.champion || "Mod propio",
   skin: item.skin || item.name || "Mod local",
   variant: item.variant || item.relativePath || "",
   custom: true
 });
 
+const enrichCustomMod = (item = {}) => {
+  const normalized = normalizeCustomMod(item);
+  const inferredChampion = getSkinChampionFromHints(normalized);
+  const fullSkinId = Number(normalized.skinId || normalized.rawSkin || normalized.fileBaseId || 0);
+  const skinNum = Number.isFinite(fullSkinId) && fullSkinId >= 1000 ? fullSkinId % 1000 : Number(normalized.skinNum ?? NaN);
+  const knownSkinName = inferredChampion && Number.isFinite(skinNum)
+    ? lcuChampionSkinCache.get(String(inferredChampion.key))?.get(String((Number(inferredChampion.key) * 1000) + skinNum)) ||
+      lcuChampionSkinCache.get(String(inferredChampion.key))?.get(String(skinNum))
+    : "";
+  if (!inferredChampion) return normalized;
+  return {
+    ...normalized,
+    champion: inferredChampion.name,
+    rawChampion: inferredChampion.key,
+    championKey: inferredChampion.id,
+    championId: inferredChampion.key,
+    skin: knownSkinName || normalized.skin,
+    skinNum: Number.isFinite(skinNum) ? skinNum : normalized.skinNum,
+    skinId: fullSkinId || normalized.skinId
+  };
+};
+
+const saveCustomMods = () => {
+  state.customMods = state.customMods
+    .filter((mod) => !isDownloadedLeagueSkinsPath(mod.path))
+    .map(enrichCustomMod);
+  localStorage.setItem("riftAtlas:customMods", JSON.stringify(state.customMods));
+  persistLibraryIndex();
+  renderCustomMods();
+  renderSelectionTray();
+  renderPresets();
+  renderCompactLauncher();
+  sendPenguSkinCatalog("custom-mods-updated");
+};
+
+const LOCAL_MOD_EXTENSIONS = new Set([".fantome", ".zip", ".rse", ".wad", ".wad.client"]);
+
+const getLocalModExtensionFromPath = (filePath = "") => {
+  const lower = String(filePath).toLowerCase();
+  if (lower.endsWith(".wad.client")) return ".wad.client";
+  const match = lower.match(/\.[^.\\/]+$/);
+  return match ? match[0] : "";
+};
+
+const getNameFromPath = (filePath = "") =>
+  String(filePath).split(/[\\/]/).pop() || String(filePath);
+
+const getDisplayExtension = (item = {}, fallback = "MOD") =>
+  String(item.extension || getLocalModExtensionFromPath(item.path || item.name || "") || fallback)
+    .replace(".", "")
+    .toUpperCase();
+
+const isRestorableLocalModPath = (filePath = "") => {
+  const extension = getLocalModExtensionFromPath(filePath);
+  if (!LOCAL_MOD_EXTENSIONS.has(extension)) return false;
+  if (isDownloadedLeagueSkinsPath(filePath)) return false;
+  const normalizedPath = String(filePath || "").replace(/\//g, "\\").toLowerCase();
+  return !normalizedPath.includes("\\rift atlas\\p2p\\") &&
+    !normalizedPath.includes("\\rift atlas\\party-transfers\\");
+};
+
+const restoreKnownLocalMods = () => {
+  const knownKeys = new Set([
+    ...state.queuedSkins,
+    ...state.presets.flatMap((preset) => preset.skinKeys || []),
+    ...state.overlayHistory.flatMap((entry) => entry.skinKeys || [])
+  ]);
+  const existingKeys = new Set(state.customMods.map(getSkinKey));
+  const restored = [...knownKeys]
+    .filter((key) => key && !existingKeys.has(key) && isRestorableLocalModPath(key))
+    .map((key) => {
+      const name = getNameFromPath(key);
+      return enrichCustomMod({
+        path: key,
+        relativePath: key,
+        name,
+        skin: name,
+        champion: "Mod propio",
+        variant: "",
+        extension: getLocalModExtensionFromPath(key),
+        source: "local-restored",
+        size: 0
+      });
+    });
+  if (!restored.length) return;
+  state.customMods = [...state.customMods, ...restored]
+    .sort((a, b) => String(a.name).localeCompare(String(b.name), "es"));
+  localStorage.setItem("riftAtlas:customMods", JSON.stringify(state.customMods));
+};
+
 const addCustomMods = (items = []) => {
   const nextByPath = new Map(state.customMods.map((item) => [item.path, item]));
-  items.map(normalizeCustomMod).forEach((item) => {
-    if (item.path) nextByPath.set(item.path, item);
-  });
+  items
+    .filter((item) => !isDownloadedLeagueSkinsPath(item.path))
+    .map(enrichCustomMod)
+    .forEach((item) => {
+      if (item.path) nextByPath.set(item.path, item);
+    });
   state.customMods = [...nextByPath.values()].sort((a, b) => String(a.name).localeCompare(String(b.name), "es"));
   saveCustomMods();
+};
+
+const getFullSkinIdForStorage = (skin = {}) => {
+  const championId = Number(skin.championId || skin.championKey || skin.rawChampion || 0);
+  const directSkinId = Number(skin.skinId || skin.rawSkin || skin.fileBaseId || 0);
+  if (directSkinId >= 1000) return directSkinId;
+  const skinNum = Number(skin.skinNum ?? skin.imageSkinNum ?? directSkinId);
+  if (!championId || !Number.isFinite(skinNum) || skinNum < 0) return 0;
+  return (championId * 1000) + skinNum;
+};
+
+const getSelectedModTargetSkin = () => {
+  const selected = getSkinByKey(state.selectedSkinKey);
+  const selectedId = selected ? getFullSkinIdForStorage(selected) : 0;
+  if (selectedId) return { skin: selected, skinId: selectedId };
+
+  const queuedLeagueSkin = [...state.queuedSkins]
+    .map(getSkinByKey)
+    .find((skin) => skin && getFullSkinIdForStorage(skin));
+  const queuedId = queuedLeagueSkin ? getFullSkinIdForStorage(queuedLeagueSkin) : 0;
+  if (queuedId) return { skin: queuedLeagueSkin, skinId: queuedId };
+
+  return { skin: null, skinId: 0 };
+};
+
+const getSkinTargetOptions = async (championKey) => {
+  const champion = state.champions.find((entry) => String(entry.key) === String(championKey));
+  if (!champion) return [];
+  const skinMap = await fetchLcuChampionSkinData(champion.key);
+  return [...skinMap.entries()]
+    .map(([id, name]) => ({ id: Number(id), name }))
+    .filter((entry) => Number.isFinite(entry.id) && entry.id >= Number(champion.key) * 1000)
+    .sort((a, b) => a.id - b.id)
+    .filter((entry, index, list) => list.findIndex((item) => item.id === entry.id) === index);
+};
+
+const CUSTOM_MOD_TARGET_CATEGORIES = [
+  { value: "others", label: "Otros" },
+  { value: "maps", label: "Mapas" },
+  { value: "ui", label: "UI" },
+  { value: "ux", label: "UX" },
+  { value: "fonts", label: "Fonts" },
+  { value: "announcers", label: "Announcers" },
+  { value: "voiceover", label: "Voiceover" },
+  { value: "loading_screen", label: "Loading screen" },
+  { value: "vfx", label: "VFX" },
+  { value: "sfx", label: "SFX" }
+];
+
+const getCustomModCategoryLabel = (category = "others") =>
+  CUSTOM_MOD_TARGET_CATEGORIES.find((item) => item.value === category)?.label || "Otros";
+
+const chooseCustomModTarget = async (suggestedSkinTarget = null) => {
+  await ensureChampionsLoaded().catch(() => {});
+  const hasChampions = state.champions.length > 0;
+
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    const defaultMode = suggestedSkinTarget?.skinId && hasChampions ? "skin" : "category";
+    backdrop.innerHTML = `
+      <div class="modal-panel wide-modal" role="dialog" aria-modal="true">
+        <span class="modal-kicker">Mods propios</span>
+        <h2>Elegir destino</h2>
+        <p>Para skins elegi una base de campeon. Para mapas, UX, fonts u otros, guardalo como mod general al estilo Rose.</p>
+        <div class="mod-target-mode" role="group" aria-label="Tipo de mod">
+          <label><input type="radio" name="mod-target-type" value="category" ${defaultMode === "category" ? "checked" : ""} /> General</label>
+          <label><input type="radio" name="mod-target-type" value="skin" ${defaultMode === "skin" ? "checked" : ""} ${hasChampions ? "" : "disabled"} /> Skin</label>
+        </div>
+        <div class="metadata-form">
+          <label class="mod-target-category-wrap">Categoria
+            <select class="mod-target-category">
+              ${CUSTOM_MOD_TARGET_CATEGORIES.map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join("")}
+            </select>
+          </label>
+          <label class="mod-target-search-wrap">Campeon
+            <input class="mod-target-search" type="search" placeholder="Buscar campeon" autocomplete="off" />
+          </label>
+          <label class="mod-target-champion-wrap">Campeon base
+            <select class="mod-target-champion"></select>
+          </label>
+          <label class="mod-target-skin-wrap">Skin base
+            <select class="mod-target-skin"></select>
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary-button mod-target-cancel" type="button">Cancelar</button>
+          <button class="docs-link mod-target-confirm" type="button">Usar destino</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+
+    const championSelect = backdrop.querySelector(".mod-target-champion");
+    const skinSelect = backdrop.querySelector(".mod-target-skin");
+    const searchInput = backdrop.querySelector(".mod-target-search");
+    const categorySelect = backdrop.querySelector(".mod-target-category");
+    const confirmButton = backdrop.querySelector(".mod-target-confirm");
+    const cancelButton = backdrop.querySelector(".mod-target-cancel");
+    const typeInputs = [...backdrop.querySelectorAll('input[name="mod-target-type"]')];
+    const categoryWrap = backdrop.querySelector(".mod-target-category-wrap");
+    const skinWraps = [
+      backdrop.querySelector(".mod-target-search-wrap"),
+      backdrop.querySelector(".mod-target-champion-wrap"),
+      backdrop.querySelector(".mod-target-skin-wrap")
+    ];
+
+    const close = (value) => {
+      backdrop.remove();
+      resolve(value);
+    };
+
+    const getMode = () => typeInputs.find((input) => input.checked)?.value || "category";
+
+    const updateMode = () => {
+      const mode = getMode();
+      categoryWrap.hidden = mode !== "category";
+      skinWraps.forEach((wrap) => {
+        if (wrap) wrap.hidden = mode !== "skin";
+      });
+      if (mode === "category") {
+        confirmButton.disabled = false;
+      } else {
+        confirmButton.disabled = !skinSelect.value;
+      }
+    };
+
+    const renderChampions = (query = "") => {
+      const normalizedQuery = normalizeSkinSyncText(query);
+      const champions = state.champions
+        .filter((champion) => !normalizedQuery || normalizeSkinSyncText(`${champion.name} ${champion.id}`).includes(normalizedQuery))
+        .sort((a, b) => a.name.localeCompare(b.name, "es"));
+      championSelect.innerHTML = champions
+        .map((champion) => `<option value="${escapeHtml(champion.key)}">${escapeHtml(champion.name)}</option>`)
+        .join("");
+      if (suggestedSkinTarget?.skin?.championId) {
+        championSelect.value = String(suggestedSkinTarget.skin.championId);
+      }
+    };
+
+    const renderSkins = async () => {
+      const championKey = championSelect.value;
+      skinSelect.innerHTML = '<option value="">Cargando skins...</option>';
+      const skins = await getSkinTargetOptions(championKey).catch(() => []);
+      skinSelect.innerHTML = skins.length
+        ? skins.map((skin) => `<option value="${skin.id}">${escapeHtml(skin.name)} (${skin.id})</option>`).join("")
+        : '<option value="">Sin skins disponibles</option>';
+      if (suggestedSkinTarget?.skinId && skins.some((skin) => skin.id === suggestedSkinTarget.skinId)) {
+        skinSelect.value = String(suggestedSkinTarget.skinId);
+      }
+      updateMode();
+    };
+
+    searchInput.addEventListener("input", () => {
+      renderChampions(searchInput.value);
+      renderSkins();
+    });
+    championSelect.addEventListener("change", renderSkins);
+    typeInputs.forEach((input) => input.addEventListener("change", updateMode));
+    cancelButton.addEventListener("click", () => close(null));
+    backdrop.addEventListener("click", (event) => {
+      if (event.target === backdrop) close(null);
+    });
+    confirmButton.addEventListener("click", () => {
+      if (getMode() === "category") {
+        close({
+          targetType: "category",
+          category: categorySelect.value || "others",
+          label: getCustomModCategoryLabel(categorySelect.value)
+        });
+        return;
+      }
+      const skinId = Number(skinSelect.value || 0);
+      if (!skinId) return;
+      const champion = state.champions.find((entry) => String(entry.key) === String(championSelect.value));
+      const skinName = skinSelect.options[skinSelect.selectedIndex]?.textContent?.replace(/\s+\(\d+\)$/, "") || `Skin ${skinId}`;
+      close({
+        targetType: "skin",
+        skinId,
+        skin: {
+          champion: champion?.name || championSelect.value,
+          championId: champion?.key || championSelect.value,
+          championKey: champion?.id || "",
+          skin: skinName,
+          skinId,
+          skinNum: skinId % 1000
+        }
+      });
+    });
+
+    if (hasChampions) {
+      renderChampions();
+      renderSkins();
+    } else {
+      updateMode();
+    }
+    (defaultMode === "category" ? categorySelect : searchInput).focus();
+  });
+};
+
+const importCustomModPathsToSelectedSkin = async (paths = [], reason = "manual") => {
+  const cleanPaths = [...new Set(paths.filter(Boolean))];
+  if (!cleanPaths.length) {
+    if (els.customModsLabel) els.customModsLabel.textContent = "No encontre archivos compatibles para importar.";
+    return null;
+  }
+
+  const chosen = await chooseCustomModTarget(getSelectedModTargetSkin());
+  if (!chosen) {
+    if (els.customModsLabel) els.customModsLabel.textContent = "Importacion cancelada.";
+    return null;
+  }
+
+  if (els.customModsLabel) {
+    els.customModsLabel.textContent = chosen.targetType === "skin"
+      ? `Copiando ${cleanPaths.length} mod(s) a ${chosen.skin?.champion || "champion"} - ${chosen.skin?.skin || chosen.skinId}...`
+      : `Copiando ${cleanPaths.length} mod(s) a ${chosen.label || "Otros"}...`;
+  }
+  const result = chosen.targetType === "skin"
+    ? await window.riftAtlas.importCustomModsToSkin?.(chosen.skinId, cleanPaths)
+    : await window.riftAtlas.importCustomModsToCategory?.(chosen.category || "others", cleanPaths);
+  await syncUserModsFolder(reason, { silent: true });
+  (result?.packages || []).forEach((item) => {
+    if (item?.path) queueSkinKey(item.path, { preserveExistingChampion: chosen.targetType === "skin" });
+  });
+  if (result?.packages?.length) saveQueuedSkins();
+  if (els.customModsLabel) {
+    els.customModsLabel.textContent = `${result?.copied || 0} mod(s) guardados en ${result?.folderPath || "mods"}.`;
+  }
+  return result;
+};
+
+const openCustomModDestinationFolder = async () => {
+  const chosen = await chooseCustomModTarget(getSelectedModTargetSkin());
+  if (!chosen) {
+    if (els.customModsLabel) els.customModsLabel.textContent = "Seleccion cancelada.";
+    return null;
+  }
+
+  if (els.customModsLabel) {
+    els.customModsLabel.textContent = chosen.targetType === "skin"
+      ? `Abriendo carpeta para ${chosen.skin?.champion || "champion"} - ${chosen.skin?.skin || chosen.skinId}...`
+      : `Abriendo carpeta de ${chosen.label || "Otros"}...`;
+  }
+
+  const result = chosen.targetType === "skin"
+    ? await window.riftAtlas.openCustomSkinModFolder?.(chosen.skinId)
+    : await window.riftAtlas.openCustomModCategoryFolder?.(chosen.category || "others");
+
+  if (els.customModsLabel) {
+    els.customModsLabel.textContent = `Carpeta lista: ${result?.folderPath || "mods"}.`;
+  }
+  await syncUserModsFolder("folder-opened", { silent: true }).catch(() => null);
+  return result;
+};
+
+const syncUserModsFolder = async (reason = "manual", options = {}) => {
+  if (!window.riftAtlas.indexUserModsFolder) return;
+  if (!options.silent && els.customModsLabel) els.customModsLabel.textContent = "Sincronizando mods propios...";
+  const result = await window.riftAtlas.indexUserModsFolder();
+  const syncedPackages = result?.packages || [];
+  const syncedPaths = new Set(syncedPackages.map((item) => item.path));
+  state.customMods = state.customMods.filter((item) => item.source === "p2p" || syncedPaths.has(item.path));
+  addCustomMods(syncedPackages);
+  if (!options.silent && els.customModsLabel) {
+    els.customModsLabel.textContent = `${result?.packages?.length || 0} mod(s) sincronizados desde ${result?.folderPath || "mods"}.`;
+  }
+  sendPenguSkinCatalog(`user-mods-${reason}`);
+  return result;
+};
+
+const importModsDirectByPath = async (paths = []) => {
+  const cleanPaths = [...new Set(paths.filter(Boolean))];
+  if (!cleanPaths.length) return;
+  if (els.customModsLabel) els.customModsLabel.textContent = `Copiando ${cleanPaths.length} mod(s) a la carpeta de mods...`;
+  try {
+    const result = await window.riftAtlas.importModsToFolder?.(cleanPaths);
+    const count = result?.copied || 0;
+    if (els.customModsLabel) els.customModsLabel.textContent = count > 0
+      ? `${count} mod(s) agregado(s). Se detectara automaticamente.`
+      : "No se pudieron copiar los archivos.";
+    await syncUserModsFolder("drop", { silent: true }).catch(() => null);
+  } catch (error) {
+    if (els.customModsLabel) els.customModsLabel.textContent = `Error copiando: ${error.message || error}`;
+  }
+};
+
+const importModsDirect = async (files = []) => {
+  const paths = window.riftAtlas.getDroppedFilePaths?.(files) || [];
+  await importModsDirectByPath(paths);
 };
 
 function buildPenguSkinCatalog() {
@@ -770,6 +1747,7 @@ function buildPenguSkinCatalog() {
   return [...state.customMods, ...state.skinLibrary]
     .filter((skin) => getSkinKey(skin) && skin.path)
     .map((skin) => {
+      skin = applySkinMetadata(skin);
       const key = getSkinKey(skin);
       const inferredChampion = getSkinChampionFromHints(skin);
       return {
@@ -781,7 +1759,7 @@ function buildPenguSkinCatalog() {
         championKey: getSkinChampionId(skin),
         rawChampion: skin.rawChampion,
 
-        skin: skin.skin || skin.name || "Skin",
+        skin: getSkinVisibleName(skin),
         rawSkin: skin.rawSkin,
         rawVariant: skin.rawVariant,
 
@@ -804,23 +1782,377 @@ function buildPenguSkinCatalog() {
 
 function sendPenguSkinCatalog(reason = "catalog") {
   if (!window.riftAtlas.sendPenguMessage) return;
+  const queued = [...state.queuedSkins];
+  const signature = [
+    state.skinLibrary.length,
+    state.customMods.length,
+    state.champions.length,
+    queued.slice().sort().join("|")
+  ].join("::");
+  if (!PENGU_CATALOG_FORCE_REASONS.has(reason) && signature === lastPenguCatalogSignature) return;
+  lastPenguCatalogSignature = signature;
   window.riftAtlas.sendPenguMessage({
     type: "skin-catalog",
     reason,
     skins: buildPenguSkinCatalog(),
-    queued: [...state.queuedSkins]
+    queued,
+    libraryReady: state.skinLibrary.length > 0,
+    customCount: state.customMods.length,
+    libraryCount: state.skinLibrary.length
   }).catch(() => null);
 }
 
 let penguBackgroundApplyKey = "";
 let penguBackgroundApplyAt = 0;
 let penguBackgroundApplyPromise = Promise.resolve();
+let penguBackgroundApplyInFlightKey = "";
+let penguSkinSyncQueue = Promise.resolve();
+const pendingPenguForceSkinRequests = new Map();
+
+const waitForPrebuildOverlay = async (timeoutMs = 90000) => {
+  const startedAt = Date.now();
+  while (state.prebuildingOverlay && Date.now() - startedAt < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+};
+
+const getOverlayTargetSkinId = (skin = {}, championId = 0) => {
+  const numericChampionId = Number(championId || getSkinSyncChampionNumber(skin) || 0);
+  const toFullSkinId = (rawValue) => {
+    const value = Number(rawValue);
+    if (!Number.isFinite(value) || value < 0) return 0;
+    if (value >= 1000) return value;
+    return numericChampionId ? (numericChampionId * 1000) + value : 0;
+  };
+  const isCustomSkin = Boolean(skin.custom && !isDownloadedLeagueSkinsPath(getSkinKey(skin)));
+  // Rose treats mods/skins/{skinId} as authoritative. A numeric custom
+  // filename must not override the target encoded by its storage folder.
+  const rawValues = isCustomSkin
+    ? [
+      skin.skinId,
+      skin.rawSkin,
+      ...(Array.isArray(skin.targetSkinNums) ? skin.targetSkinNums : []),
+      skin.rawVariant,
+      skin.fileBaseId,
+      skin.skinNum,
+      skin.imageSkinNum,
+      skin.baseImageSkinNum,
+      skin.id
+    ]
+    : [
+      skin.rawVariant,
+      skin.rawSkin,
+      skin.fileBaseId,
+      skin.skinNum,
+      skin.imageSkinNum,
+      skin.baseImageSkinNum,
+      skin.skinId,
+      skin.id,
+      ...(Array.isArray(skin.targetSkinNums) ? skin.targetSkinNums : [])
+    ];
+  for (const rawValue of rawValues) {
+    const fullSkinId = toFullSkinId(rawValue);
+    if (fullSkinId) return fullSkinId;
+  }
+  return 0;
+};
+
+const triggerRoseSwiftplayApply = async (champions = []) => {
+  if (state.roseFinalizationCommitted || state.roseFinalizationApplyStarted) return false;
+  // A Swiftplay hover can first produce an ordinary one-skin apply. Rose's
+  // Searching event is authoritative and must replace it with both tracked
+  // selections, so wait for that build instead of treating overlayRunning as
+  // a reason to skip the multi-skin overlay.
+  const waitStartedAt = Date.now();
+  while (state.importingQueue && Date.now() - waitStartedAt < 120000) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (state.importingQueue || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted) {
+    state.roseFinalizationSignature = "";
+    return false;
+  }
+  state.roseFinalizationCommitted = true;
+  state.roseFinalizationApplyStarted = true;
+  await startRoseEarlyMonitor("Swiftplay Searching");
+  let applied = false;
+  try {
+    await ensureSkinLibraryLoaded();
+    const resolvedKeys = [];
+    for (const selection of champions) {
+      const championId = Number(selection?.championId || 0);
+      const skinId = Number(selection?.skinId || 0);
+      if (!championId || !skinId || skinId === championId * 1000) continue;
+
+      let baseSkinId = skinId;
+      try {
+        const catalog = await fetchLcuChampionSkinData(championId);
+        baseSkinId = Number(catalog?.baseSkinByChroma?.get(skinId) || skinId);
+      } catch (error) {
+        window.riftAtlas.appendOverlayLog(`[Rose/Swiftplay] LCU no resolvio base de ${skinId}; busco el paquete numerico exacto. ${error.message || error}`).catch(() => { });
+      }
+
+      const skin = await getOrRegisterLeagueSkinPackage(championId, skinId, baseSkinId, String(skinId));
+      if (!skin) {
+        window.riftAtlas.appendOverlayLog(`[Rose/Swiftplay] Falta LeagueSkins para champion=${championId} skin=${skinId} base=${baseSkinId}.`).catch(() => { });
+        continue;
+      }
+      const key = getSkinKey(skin);
+      queueSkinKey(key, { sessionSource: "pengu", preserveExistingChampion: true });
+      resolvedKeys.push(key);
+    }
+
+    if (!resolvedKeys.length) {
+      throw new Error("No se resolvio ninguna skin no-base de Swiftplay en LeagueSkins.");
+    }
+    saveQueuedSkins();
+    renderSkinLibrary();
+    renderSelectionTray();
+    window.riftAtlas.appendOverlayLog(`[Rose/Swiftplay] Compilando ${resolvedKeys.length} seleccion(es) antes de encontrar partida.`).catch(() => { });
+    applied = Boolean(await applyQueuedSkins(resolvedKeys, {
+      skipPreflight: true,
+      source: "swiftplay-searching"
+    }));
+    return applied;
+  } finally {
+    if (!applied) {
+      state.roseFinalizationCommitted = false;
+      state.roseFinalizationSignature = "";
+      await stopRoseEarlyMonitor("swiftplay-no-apply");
+    }
+    state.roseFinalizationApplyStarted = false;
+  }
+};
+
+const getOverlayBaseSkinId = (skin = {}, championId = 0) => {
+  const numericChampionId = Number(championId || getSkinSyncChampionNumber(skin) || 0);
+  const rawSkinId = Number(skin.rawSkin || skin.skinId || 0);
+  if (rawSkinId >= 1000) return rawSkinId;
+  if (Number.isFinite(rawSkinId) && rawSkinId >= 0 && numericChampionId) {
+    return (numericChampionId * 1000) + rawSkinId;
+  }
+  return getOverlayTargetSkinId(skin, numericChampionId);
+};
+
+const isRoseOwnedSkinId = (skinId = 0) => {
+  const id = Number(skinId || 0);
+  if (!Number.isFinite(id) || id <= 0) return false;
+  // Rose's is_owned(): champion default/base skin is always owned, even if the
+  // inventory endpoint does not include it.
+  return id % 1000 === 0 || state.penguOwnedSkinIds.has(id);
+};
+
+const getOverlayForceSkinId = (skin = {}, payload = {}, championId = 0) => {
+  const numericChampionId = Number(championId || getSkinSyncChampionNumber(skin) || 0);
+  const championBaseId = numericChampionId ? numericChampionId * 1000 : 0;
+  const targetSkinId = getOverlayTargetSkinId(skin, numericChampionId);
+  const payloadChromaId = Number(payload.chromaId || payload.selectedChromaId || 0);
+  const baseSkinId = Number(payload.resolvedBaseSkinId || getOverlayBaseSkinId(skin, numericChampionId) || 0);
+  const payloadBaseSkinId = Number(payload.baseSkinId || 0);
+  const isChromaPayload = payload.type === "chroma-selection" || (
+    payloadChromaId > 0 &&
+    payloadChromaId !== championBaseId &&
+    payloadChromaId !== targetSkinId
+  );
+
+  if (isChromaPayload && payloadChromaId > 0) {
+    if (isRoseOwnedSkinId(payloadChromaId) || isRoseOwnedSkinId(baseSkinId)) {
+      return payloadChromaId;
+    }
+    return championBaseId;
+  }
+
+  if (targetSkinId > 0 && isRoseOwnedSkinId(targetSkinId)) {
+    return targetSkinId;
+  }
+
+  // Rose: unowned skins inject over the champion base WAD in client.
+  if (targetSkinId > 0 && !isRoseOwnedSkinId(targetSkinId)) {
+    return championBaseId;
+  }
+
+  if (payloadBaseSkinId > championBaseId && !isRoseOwnedSkinId(payloadBaseSkinId)) {
+    return championBaseId;
+  }
+
+  return targetSkinId || championBaseId;
+};
+
+const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
+  const payloadChampionId = Number(payload.championId || payload.champion?.id || 0);
+  const skinChampionId = Number(getSkinSyncChampionNumber(skin) || 0);
+  if (payloadChampionId && skinChampionId && payloadChampionId !== skinChampionId) {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] skip force-skin overlay: payloadChampionId=${payloadChampionId} skinChampionId=${skinChampionId} mod=${skin.name || skin.skin || skin.path || "desconocido"}`).catch(() => { });
+    return;
+  }
+  const championId = Number(payloadChampionId || skinChampionId || 0);
+  const actualSelection = lastPenguLcuSelection?.championId === championId
+    ? Number(lastPenguLcuSelection.selectedSkinId || 0)
+    : 0;
+  const selectedSkinId = Number(actualSelection || payload.actualLcuSkinId || 0);
+  if (!championId) return true;
+
+  const targetSkinId = getOverlayTargetSkinId(skin, championId);
+  const desiredSkinId = getOverlayForceSkinId(skin, payload, championId);
+  const ownedTarget = targetSkinId > 0 && isRoseOwnedSkinId(targetSkinId);
+
+  if (!desiredSkinId || selectedSkinId === desiredSkinId) return true;
+  window.riftAtlas.appendOverlayLog(`[Diagnostico] force-skin estilo Rose: championId=${championId} selected=${selectedSkinId || "?"} target=${targetSkinId || "?"} owned=${ownedTarget ? "si" : "no"} ownedReady=${state.penguOwnedSkinsReady ? "si" : "no"} desired=${desiredSkinId}`).catch(() => { });
+  const forcingUnownedBase = !ownedTarget && desiredSkinId !== targetSkinId;
+  if (forcingUnownedBase) {
+    // Exact Rose ordering: skip the forced base echo immediately before the
+    // direct LCU write, not when the user merely selects the unowned skin.
+    window.riftAtlas.sendPenguMessage?.({
+      type: "skip-base-skin",
+      championId,
+      baseSkinId: desiredSkinId,
+      targetSkinId,
+      skinName: payload.resolvedSkinName || payload.skin || payload.originalName || "",
+      durationMs: 15000,
+    }).catch(() => null);
+  }
+  let result;
+  if (window.riftAtlas.forceLcuSkinSelection) {
+    result = await window.riftAtlas.forceLcuSkinSelection(championId, desiredSkinId)
+      .catch((error) => ({
+        forceOk: false,
+        requestAccepted: false,
+        verifiedSkinId: 0,
+        forceError: error?.message || String(error),
+      }));
+  } else {
+    // Legacy Electron fallback. Tauri uses the authenticated Rust command above
+    // and does not depend on the Pengu websocket for LCU writes.
+    const forceRequestId = `force-${championId}-${desiredSkinId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const confirmation = new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        pendingPenguForceSkinRequests.delete(forceRequestId);
+        resolve({ forceOk: false, forceError: `Timeout esperando confirmacion LCU para ${desiredSkinId}.` });
+      }, 12000);
+      pendingPenguForceSkinRequests.set(forceRequestId, {
+        resolve: (confirmationResult) => {
+          clearTimeout(timeout);
+          resolve(confirmationResult);
+        }
+      });
+    });
+    const sendResult = await window.riftAtlas.sendPenguMessage?.({
+      type: "force-skin",
+      championId,
+      selectedSkinId: desiredSkinId,
+      targetSkinId,
+      owned: ownedTarget,
+      forceRequestId,
+      reason: ownedTarget ? "owned-skin-overlay" : "unowned-overlay-base-skin"
+    }).catch((error) => ({ sent: false, error: error?.message || String(error) }));
+    const messageSent = sendResult?.sent === true || Number(sendResult?.sent || 0) > 0;
+    if (!messageSent) {
+      pendingPenguForceSkinRequests.get(forceRequestId)?.resolve?.({
+        forceOk: false,
+        forceError: sendResult?.error || "Pengu no esta conectado; no se pudo enviar el cambio de skin."
+      });
+    }
+    result = await confirmation;
+    pendingPenguForceSkinRequests.delete(forceRequestId);
+  }
+  if (!result?.forceOk || Number(result.verifiedSkinId || 0) !== desiredSkinId) {
+    const requestAccepted = result?.requestAccepted === true;
+    if (forcingUnownedBase && !requestAccepted) {
+      window.riftAtlas.sendPenguMessage?.({ type: "skip-base-skin-clear" }).catch(() => null);
+    }
+    const actual = Number(result?.verifiedSkinId || 0) || "?";
+    const detail = result?.forceError || `LCU conserva ${actual}`;
+    window.riftAtlas.appendOverlayLog(`[Rose] force-skin NO confirmado: desired=${desiredSkinId} actual=${actual} accepted=${result?.requestAccepted === true ? "si" : "no"} error=${detail}`).catch(() => { });
+    if (requestAccepted) {
+      lastPenguLcuSelection = { championId, selectedSkinId: desiredSkinId, at: Date.now() };
+      window.riftAtlas.appendOverlayLog(`[Rose] LCU acepto ${desiredSkinId}; mantengo skip-base y continuo como Rose aunque la verificacion tarde.`).catch(() => { });
+    }
+    // Rose treats an LCU force failure as a warning. The overlay injection still
+    // runs with League's current selection instead of being cancelled here.
+    window.riftAtlas.appendOverlayLog("[Rose] Se continua la inyeccion pese al fallo al forzar la skin (comportamiento Rose).").catch(() => { });
+    return false;
+  }
+  lastPenguLcuSelection = { championId, selectedSkinId: desiredSkinId, at: Date.now() };
+  window.riftAtlas.appendOverlayLog(`[Rose] force-skin confirmado por LCU: ${desiredSkinId} via ${result.forceMethod || "desconocido"}.`).catch(() => { });
+  return true;
+};
+
+const shouldPreforceUnownedBaseForFinalization = (skin = {}, payload = {}) => {
+  if (String(state.penguGameflowPhase || "") !== "FINALIZATION") return false;
+  const championId = Number(
+    payload.championId ||
+    payload.champion?.id ||
+    getSkinSyncChampionNumber(skin) ||
+    0
+  );
+  if (!championId) return false;
+  const targetSkinId = getOverlayTargetSkinId(skin, championId);
+  const desiredSkinId = getOverlayForceSkinId(skin, payload, championId);
+  return targetSkinId > 0 &&
+    desiredSkinId === championId * 1000 &&
+    targetSkinId !== desiredSkinId &&
+    !isRoseOwnedSkinId(targetSkinId);
+};
+
+const preforceUnownedBaseForFinalization = async (skin = {}, payload = {}, reason = "selection") => {
+  if (!shouldPreforceUnownedBaseForFinalization(skin, payload)) return false;
+  const championId = Number(payload.championId || payload.champion?.id || getSkinSyncChampionNumber(skin) || 0);
+  const targetSkinId = getOverlayTargetSkinId(skin, championId);
+  const desiredSkinId = getOverlayForceSkinId(skin, payload, championId);
+  const signature = `${championId}:${targetSkinId}:${desiredSkinId}`;
+  const now = Date.now();
+  if (signature === lastRosePreforceSignature && now - lastRosePreforceAt < 5000) return false;
+  lastRosePreforceSignature = signature;
+  lastRosePreforceAt = now;
+  window.riftAtlas.appendOverlayLog(
+    `[RosePreforce] FINALIZATION preforce ${desiredSkinId} para target no owned ${targetSkinId} (${reason}).`
+  ).catch(() => { });
+  await startRoseEarlyMonitor(`preforce-${reason}`);
+  await maybeForceLeagueSkinForOverlay(skin, payload);
+  return true;
+};
+
+const getPenguSupportModKeys = (selectedKey = "", activeChampionId = 0) =>
+  [...state.queuedSkins].filter((queuedKey) => {
+    if (queuedKey === selectedKey) return false;
+    const queuedSkin = getSkinByKey(queuedKey);
+    if (!queuedSkin) return true;
+    if (queuedSkin.custom && !isDownloadedLeagueSkinsPath(queuedKey)) {
+      const modChampionId = getSkinSyncChampionNumber(queuedSkin);
+      // Una sola skin por campeon, como Rose. Los mods sin campeon y las
+      // skins de otros jugadores/party pueden acompanar la seleccion.
+      return !modChampionId || !activeChampionId || modChampionId !== activeChampionId;
+    }
+    return !getQueueChampionKey(queuedSkin);
+  });
+
+const getSelectedRoseExtraMods = async () => {
+  try {
+    const selectedResult = await window.riftAtlas.modStorageGetSelectedMods?.();
+    const selectedMods = selectedResult?.selectedMods || {};
+    return Object.entries(selectedMods)
+      .filter(([category, modInfo]) => category !== "skins" && modInfo?.mod_path)
+      .map(([category, modInfo]) => ({
+        path: modInfo.mod_path,
+        name: modInfo.mod_name || modInfo.mod_id || "",
+        category
+      }));
+  } catch (error) {
+    window.riftAtlas.appendOverlayLog(`[Rose] No pude cargar mods extra seleccionados: ${error.message || error}`).catch(() => { });
+    return [];
+  }
+};
 
 const applyPenguSelectedSkin = async (key = "") => {
   if (!key) return false;
   const now = Date.now();
+  state.penguApplyLockedKey = key;
+  state.penguApplyLockedAt = now;
+  if (key === penguBackgroundApplyInFlightKey) {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: reutilizo apply en vuelo para ${key}`).catch(() => { });
+    return penguBackgroundApplyPromise;
+  }
   if (key === penguBackgroundApplyKey && now - penguBackgroundApplyAt < 12000) {
-    return true;
+    return penguBackgroundApplyPromise;
   }
 
   penguBackgroundApplyKey = key;
@@ -828,32 +2160,147 @@ const applyPenguSelectedSkin = async (key = "") => {
   penguBackgroundApplyPromise = penguBackgroundApplyPromise
     .catch(() => null)
     .then(async () => {
+      // Saltar si ya se pidio una skin mas nueva mientras esperabamos
+      if (key !== penguBackgroundApplyKey) return false;
+      penguBackgroundApplyInFlightKey = key;
+
       const skin = getSkinByKey(key);
       if (!skin?.path) {
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: skin sin path. key=${key} skin=`, skin).catch(() => { });
         throw new Error("La skin seleccionada no tiene archivo local.");
       }
 
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: overlayRunning=${state.overlayRunning} customOverlayPath=${!!state.customOverlayPath} ltkSidecar=${!!state.ltkOverlaySidecarPath} ltkDll=${!!state.ltkOverlayDllPath}`).catch(() => { });
+
       if (state.overlayRunning) {
-        await window.riftAtlas.stopOverlay();
-        state.importingQueue = false;
-        state.overlayRunning = false;
-        setOverlayPanelStatus({
-          label: "Sin overlay",
-          message: "Overlay anterior detenido para aplicar la skin elegida."
-        });
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] Reemplazando overlay activo sin detener monitor temprano (estilo Rose/chroma).`).catch(() => { });
       }
 
-      await applyQueuedSkins([key]);
-      return true;
+      // Re-verificar por si llegaron mas peticiones mientras preparabamos la inyeccion
+      if (key !== penguBackgroundApplyKey) return false;
+
+      const earlySkin = getSkinByKey(key);
+      const authoritativePayload = roseAuthoritativeSelection.payload || lastPenguSkinSyncPayload || {};
+      const lateResolved = await resolveRoseAuthoritativeSkinEntry(authoritativePayload, earlySkin);
+      const penguSkin = lateResolved.skin || earlySkin;
+      const lateAuthoritativePayload = lateResolved.payload || authoritativePayload;
+      if (!penguSkin?.path) {
+        throw new Error("No pude resolver la skin autoritativa para inyectar.");
+      }
+      if (getSkinKey(penguSkin) !== key) {
+        window.riftAtlas.appendOverlayLog(
+          `[RoseResolver] sustituyo key temprano=${key} por key final=${getSkinKey(penguSkin)}.`
+        ).catch(() => { });
+      }
+      const activeChampionId = Number(roseAuthoritativeSelection.championId || 0) ||
+        getChampionIdFromSkinSyncPayload(lateAuthoritativePayload) ||
+        getSkinSyncChampionNumber(penguSkin);
+      const finalSkinKey = getSkinKey(penguSkin);
+      const supportKeys = getPenguSupportModKeys(finalSkinKey, activeChampionId);
+      const supportEntries = supportKeys.map(getSkinByKey).filter(Boolean);
+      const selectedIsCustomSkin = Boolean(penguSkin.custom && !isDownloadedLeagueSkinsPath(getSkinKey(penguSkin)));
+      const customTargetSkinId = getOverlayTargetSkinId(penguSkin, activeChampionId);
+      const customTargetOwned = customTargetSkinId > 0 && isRoseOwnedSkinId(customTargetSkinId);
+      let customBasePackage = null;
+      if (selectedIsCustomSkin && customTargetSkinId > 0 && !customTargetOwned) {
+        const customBaseSkinId = getOverlayBaseSkinId(penguSkin, activeChampionId) || customTargetSkinId;
+        customBasePackage = await getOrRegisterLeagueSkinPackage(
+          activeChampionId,
+          customBaseSkinId,
+          customBaseSkinId,
+          penguSkin.skin || penguSkin.name || ""
+        ).catch((error) => {
+          window.riftAtlas.appendOverlayLog(`[Rose] No pude resolver la skin base para el mod propio: ${error.message || error}`).catch(() => { });
+          return null;
+        });
+        if (!customBasePackage) {
+          throw new Error(`El mod propio apunta a la skin no owned ${customTargetSkinId}, pero falta su paquete base en LeagueSkins.`);
+        }
+        window.riftAtlas.appendOverlayLog(`[Rose] Mod propio para skin no owned ${customTargetSkinId}: se incluye paquete base ${getSkinKey(customBasePackage)}.`).catch(() => { });
+      }
+      for (const supportEntry of supportEntries) {
+        await maybeForceLeagueSkinForOverlay(supportEntry, lateAuthoritativePayload);
+      }
+      await maybeForceLeagueSkinForOverlay(penguSkin, lateAuthoritativePayload);
+      if (key !== penguBackgroundApplyKey) {
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: cancelado por seleccion mas nueva ${penguBackgroundApplyKey}`).catch(() => { });
+        return false;
+      }
+
+      // Rose forces the owned target/base skin before starting its persistent
+      // game monitor. This keeps the PATCH inside ChampSelect instead of racing
+      // the transition to InProgress.
+      await startRoseEarlyMonitor(`apply-${key}`);
+
+      // Rose always includes the selected LeagueSkins package. Ownership only
+      // determines whether LCU keeps the target skin/chroma or is forced to base.
+      const championIdForOwnedCheck = getSkinSyncChampionNumber(penguSkin) || activeChampionId;
+      const targetSkinId = getOverlayTargetSkinId(penguSkin, championIdForOwnedCheck);
+      const isOwned = targetSkinId > 0 && isRoseOwnedSkinId(targetSkinId);
+      const isChromaSelection = lastPenguChromaSelection &&
+        lastPenguChromaSelection.championId === championIdForOwnedCheck &&
+        (Date.now() - lastPenguChromaSelection.at) < 120000;
+      if (isOwned) {
+        window.riftAtlas.appendOverlayLog(`[Rose] Skin owned (id=${targetSkinId}); LCU fuerza el target y LeagueSkins permanece en el overlay.`).catch(() => { });
+      }
+      if (isOwned && isChromaSelection) {
+        window.riftAtlas.appendOverlayLog(`[Rose] Chroma selected (id=${lastPenguChromaSelection.chromaId}) for owned base skin (id=${targetSkinId}) — running overlay for chroma texture.`).catch(() => { });
+      }
+
+      const selectedEntries = [customBasePackage, penguSkin, ...supportEntries].filter(Boolean);
+      const extraMods = await getSelectedRoseExtraMods();
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] Modo Rose: mkoverlay fresco y unico para ${selectedEntries.length} mod(s).`).catch(() => { });
+      if (!window.riftAtlas.runRoseOverlay) throw new Error("Runner RoseV2 no disponible; reinicia la aplicacion.");
+      const result = await window.riftAtlas.runRoseOverlay({
+        sidecarPath: state.ltkOverlaySidecarPath,
+        dllPath: state.ltkOverlayDllPath,
+        gamePath: state.leagueGamePath,
+        skinEntries: selectedEntries,
+        extraMods,
+        roseMode: true
+      });
+      return Boolean(result?.success);
+    })
+    .finally(async () => {
+      if (penguBackgroundApplyInFlightKey === key) {
+        penguBackgroundApplyInFlightKey = "";
+      }
+      if (!shouldKeepRoseEarlyMonitor()) {
+        await stopRoseEarlyMonitor("pengu-apply-finally");
+      }
     });
 
   return penguBackgroundApplyPromise;
 };
 
+const extractChampionIdFromSkinKey = (key = "") => {
+  const match = String(key).match(/[/\\]skins?[/\\](\d+)[/\\]/i);
+  return match ? Number(match[1]) : 0;
+};
+
+const shouldIgnorePenguSwitchDuringApply = (nextKey = "", payload = {}) => {
+  const lockedKey = penguBackgroundApplyInFlightKey || state.penguApplyLockedKey;
+  if (!nextKey || !lockedKey || nextKey === lockedKey) return false;
+  const lockedChampId = extractChampionIdFromSkinKey(lockedKey);
+  const nextChampId = extractChampionIdFromSkinKey(nextKey) || Number(payload.championId || 0);
+  if (lockedChampId && nextChampId && lockedChampId === nextChampId) return false;
+  const lockAge = Date.now() - Number(state.penguApplyLockedAt || 0);
+  const applyIsHot = Boolean(
+    penguBackgroundApplyInFlightKey ||
+    state.roseFinalizationApplyStarted ||
+    ["FINALIZATION", "GameStart", "InProgress", "Reconnect"].includes(String(state.penguGameflowPhase || ""))
+  );
+  if (!applyIsHot && lockAge > 45000) return false;
+  window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync ignorado durante apply estilo Rose: locked=${lockedKey} next=${nextKey} lockedChamp=${lockedChampId} nextChamp=${nextChampId} skin=${payload.skin || ""} selectedSkinId=${payload.selectedSkinId || payload.skinId || ""}`).catch(() => { });
+  return true;
+};
+
 async function handlePenguSkinApply(payload = {}) {
   const key = payload.key || payload.path;
+  window.riftAtlas.appendOverlayLog(`[Diagnostico] handlePenguSkinApply: key=${key}`).catch(() => { });
   const skin = getSkinByKey(key);
   if (!skin) {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] handlePenguSkinApply: skin NO encontrada en customMods/skinLibrary`).catch(() => { });
     await window.riftAtlas.sendPenguMessage?.({
       type: "skin-apply-result",
       ok: false,
@@ -863,7 +2310,13 @@ async function handlePenguSkinApply(payload = {}) {
     return;
   }
 
-  queueSkinKey(getSkinKey(skin));
+  const isPenguAutoApply = payload.type === "skin-sync" ||
+    payload.type === "chroma-selection" ||
+    payload.source === "rift-atlas-party" ||
+    payload.source === "LU-ChromaWheel";
+  queueSkinKey(getSkinKey(skin), {
+    sessionSource: isPenguAutoApply ? "pengu" : ""
+  });
   saveQueuedSkins();
   renderSkinLibrary();
   renderSelectionTray();
@@ -873,16 +2326,36 @@ async function handlePenguSkinApply(payload = {}) {
   let applyMessage = "";
   if (payload.apply !== false) {
     try {
+      setOverlayPanelStatus({
+        label: "Aplicando",
+        message: `Compilando overlay para ${getSkinVisibleName(skin)}...`
+      });
       applied = await applyPenguSelectedSkin(getSkinKey(skin));
-      applyMessage = applied ? "Skin aplicada en background desde champ select." : "";
+      if (applied) {
+        applyMessage = "Skin aplicada en background desde champ select.";
+      } else if (getSkinKey(skin) !== penguBackgroundApplyKey) {
+        applyMessage = "Solicitud reemplazada por una skin mas reciente.";
+      } else {
+        applyMessage = "No se pudo activar el overlay; revisa el panel de overlay para ver el error.";
+      }
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin resulto: applied=${applied}`).catch(() => { });
+      if (applied) {
+        setOverlayPanelStatus({
+          label: "Overlay activo",
+          message: "Overlay activo. Entra a partida para ver las skins.",
+          active: true
+        });
+        await refreshOverlayStatus();
+      }
     } catch (error) {
       applyMessage = error.message || "No pude aplicar la skin en background.";
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin ERROR: ${applyMessage}`).catch(() => { });
     }
   }
 
   await window.riftAtlas.sendPenguMessage?.({
     type: "skin-apply-result",
-    ok: !applyMessage || applied,
+    ok: !applyMessage || applied || getSkinKey(skin) !== penguBackgroundApplyKey,
     key: getSkinKey(skin),
     name: getSkinDisplayName(skin),
     queuedOnly: !applied,
@@ -890,10 +2363,82 @@ async function handlePenguSkinApply(payload = {}) {
     message: applyMessage
   }).catch(() => null);
   sendPenguSkinCatalog("skin-applied");
+  return applied;
 }
 
 let lastPenguSkinSyncKey = "";
 let lastPenguSkinSyncAt = 0;
+let lastPenguSkinSyncPayload = null;
+let lastPenguLcuSelection = null;
+let lastPenguChromaSelection = null;
+let lastPenguChromaPanel = null;
+let lastRosePreforceSignature = "";
+let lastRosePreforceAt = 0;
+let roseAuthoritativeSelection = {
+  revision: 0,
+  championId: 0,
+  baseSkinId: 0,
+  effectiveSkinId: 0,
+  chromaId: 0,
+  skinKey: "",
+  name: "",
+  payload: null,
+  updatedAt: 0,
+};
+let lastCustomModStateSignature = "";
+let lastCustomModStatePayload = null;
+
+const isUserCustomSkin = (skin = {}) =>
+  Boolean(skin?.custom && !isDownloadedLeagueSkinsPath(getSkinKey(skin)));
+
+const sendCustomModStatePayload = (payload = {}) => {
+  window.riftAtlas.sendPenguMessage?.({
+    ...payload,
+    timestamp: Date.now()
+  }).catch(() => null);
+};
+
+const publishCustomModState = (skin = null, payload = {}, options = {}) => {
+  const isActive = Boolean(skin && isUserCustomSkin(skin));
+  const championId = Number(payload.championId || getSkinSyncChampionNumber(skin || {}) || 0);
+  const skinId = Number(payload.requestedSkinId || payload.resolvedSkinId || getOverlayTargetSkinId(skin || {}, championId) || 0);
+  const modName = isActive ? getSkinVisibleName(skin) : "";
+  const signature = isActive ? `${getSkinKey(skin)}:${championId}:${skinId}:${modName}` : "inactive";
+  const message = {
+    type: "custom-mod-state",
+    source: "rift-atlas-app",
+    active: isActive,
+    modName,
+    championId: championId || undefined,
+    skinId: skinId || undefined,
+    modPath: isActive ? skin.path : undefined
+  };
+  lastCustomModStatePayload = message;
+  if (!options.force && signature === lastCustomModStateSignature) return;
+  lastCustomModStateSignature = signature;
+  sendCustomModStatePayload(message);
+};
+
+const replayCustomModState = () => {
+  if (!lastCustomModStatePayload) return;
+  sendCustomModStatePayload(lastCustomModStatePayload);
+};
+
+const clearRoseAuthoritativeSelection = () => {
+  roseAuthoritativeSelection = {
+    revision: roseAuthoritativeSelection.revision + 1,
+    championId: 0,
+    baseSkinId: 0,
+    effectiveSkinId: 0,
+    chromaId: 0,
+    skinKey: "",
+    name: "",
+    payload: null,
+    updatedAt: Date.now(),
+  };
+  publishCustomModState(null);
+};
+let lastPenguSkinId = 0;
 
 const normalizeSkinSyncText = (value = "") =>
   String(value || "")
@@ -919,6 +2464,371 @@ const tokenSimilarity = (left = "", right = "") => {
   return (2 * shared) / (leftTokens.size + rightTokens.size);
 };
 
+const levenshteinSimilarity = (left = "", right = "") => {
+  const a = normalizeSkinSyncText(left);
+  const b = normalizeSkinSyncText(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = previous[0];
+    previous[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const above = previous[j];
+      previous[j] = Math.min(
+        previous[j] + 1,
+        previous[j - 1] + 1,
+        diagonal + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      diagonal = above;
+    }
+  }
+  return 1 - (previous[b.length] / Math.max(a.length, b.length));
+};
+
+const getRoseSkinNameCandidates = (value = "") => {
+  const original = String(value || "").trim();
+  if (!original) return [];
+  // League appends localized chroma colours to the base skin name. Rose tests
+  // both the original value and a suffix-stripped variant before fuzzy matching.
+  const stripped = original
+    .replace(/\s*\([^)]*\)\s*$/u, "")
+    .replace(/\s*[–—]\s*["'‘’]{0,2}[^"'‘’]+["'‘’]{0,2}\s*$/u, "")
+    .trim();
+  return [...new Set([original, stripped].filter(Boolean))];
+};
+
+const getOrRegisterLeagueSkinPackage = async (championId, skinId, baseSkinId = skinId, skinName = "") => {
+  if (!championId || !skinId || skinId === championId * 1000 || !window.riftAtlas.resolveLeagueSkinPackage) return null;
+  const pkg = await window.riftAtlas.resolveLeagueSkinPackage(championId, skinId, baseSkinId);
+  if (!pkg?.path) return null;
+  let entry = state.skinLibrary.find((item) => getSkinKey(item) === pkg.path);
+  if (!entry) {
+    entry = {
+      ...pkg,
+      name: pkg.path.split(/[/\\]/).pop() || String(skinId),
+      champion: getChampionByNumericId(championId)?.name || String(championId),
+      championKey: String(championId),
+      skin: skinName || String(skinId),
+      skinId,
+      skinNum: skinId,
+      extension: String(pkg.path).toLowerCase().endsWith(".zip") ? ".zip" : ".fantome",
+      resolved: true,
+      numericSource: true
+    };
+    state.skinLibrary.push(entry);
+  }
+  return entry;
+};
+
+const resolveSkinSyncPayloadWithLcu = async (payload = {}) => {
+  const championId = getChampionIdFromSkinSyncPayload(payload);
+  if (!championId) return payload;
+  let skinMap;
+  try {
+    skinMap = await fetchLcuChampionSkinData(championId);
+  } catch (error) {
+    window.riftAtlas.appendOverlayLog(`[RoseLCU] No pude cargar skins para championId=${championId}: ${error.message || error}`).catch(() => { });
+    return payload;
+  }
+  if (!skinMap?.size) return payload;
+
+  const attachResolvedPackage = async (resolvedPayload) => {
+    const skinId = Number(resolvedPayload.resolvedSkinId || 0);
+    const baseSkinId = Number(resolvedPayload.resolvedBaseSkinId || skinId || 0);
+    if (!skinId) return resolvedPayload;
+    try {
+      const entry = await getOrRegisterLeagueSkinPackage(
+        championId,
+        skinId,
+        baseSkinId,
+        resolvedPayload.resolvedSkinName
+      );
+      return entry ? { ...resolvedPayload, resolvedPackagePath: getSkinKey(entry) } : resolvedPayload;
+    } catch (error) {
+      window.riftAtlas.appendOverlayLog(`[RoseResolver] ${error.message || error}`).catch(() => { });
+      return resolvedPayload;
+    }
+  };
+
+  const explicitChromaId = Number(payload.chromaId || payload.selectedChromaId || 0);
+  if (explicitChromaId && skinMap.has(String(explicitChromaId))) {
+    const resolvedBaseSkinId = Number(skinMap.baseSkinByChroma?.get(explicitChromaId) || payload.baseSkinId || 0);
+    return attachResolvedPackage({
+      ...payload,
+      resolvedSkinId: explicitChromaId,
+      resolvedBaseSkinId,
+      resolvedSkinName: skinMap.get(String(explicitChromaId)),
+      resolvedHasChromas: true,
+      resolutionSource: "lcu"
+    });
+  }
+
+  const requestedName = String(payload.skin || payload.originalName || "").trim();
+  if (!requestedName) return payload;
+  const minimumFullId = championId * 1000;
+  const candidates = [...skinMap.entries()]
+    .map(([id, name]) => ({ id: Number(id), name: String(name || "") }))
+    .filter((entry) => entry.id >= minimumFullId && entry.name)
+    .filter((entry, index, list) => list.findIndex((other) => other.id === entry.id) === index);
+  if (!candidates.length) return payload;
+
+  const requestedCandidates = getRoseSkinNameCandidates(requestedName);
+  const normalizedRequestedCandidates = requestedCandidates.map(normalizeSkinSyncText).filter(Boolean);
+  const isChromaEvent = payload.type === "chroma-selection";
+  const baseCandidates = isChromaEvent
+    ? candidates
+    : candidates.filter((entry) => !skinMap.baseSkinByChroma?.has(entry.id));
+  const pool = baseCandidates.length ? baseCandidates : candidates;
+
+  // Exact match always wins, including the suffix-stripped chroma form.
+  for (const requestedCandidate of normalizedRequestedCandidates) {
+    const exact = pool.find((candidate) =>
+      normalizeSkinSyncText(candidate.name) === requestedCandidate
+    );
+    if (exact) {
+      const resolvedBaseSkinId = Number(skinMap.baseSkinByChroma?.get(exact.id) || exact.id);
+      const resolvedHasChromas = [...(skinMap.baseSkinByChroma?.values?.() || [])]
+        .some((baseId) => Number(baseId) === resolvedBaseSkinId);
+      window.riftAtlas.appendOverlayLog(`[RoseLCU] "${requestedName}" -> skinId=${exact.id} name="${exact.name}" score=1.000 exact`).catch(() => { });
+      return attachResolvedPackage({
+        ...payload,
+        resolvedSkinId: exact.id,
+        resolvedBaseSkinId,
+        resolvedSkinName: exact.name,
+        resolvedHasChromas,
+        resolutionSource: "lcu-exact"
+      });
+    }
+  }
+
+  let best = null;
+  let bestScore = -1;
+  for (const candidate of pool) {
+    const normalizedCandidate = normalizeSkinSyncText(candidate.name);
+    const score = Math.max(
+      ...normalizedRequestedCandidates.map((requestedCandidate) =>
+        levenshteinSimilarity(requestedCandidate, normalizedCandidate)
+      )
+    );
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  if (!best) return payload;
+  window.riftAtlas.appendOverlayLog(`[RoseLCU] "${requestedName}" -> skinId=${best.id} name="${best.name}" score=${bestScore.toFixed(3)}`).catch(() => { });
+  const resolvedBaseSkinId = Number(skinMap.baseSkinByChroma?.get(best.id) || best.id);
+  const resolvedHasChromas = [...(skinMap.baseSkinByChroma?.values?.() || [])]
+    .some((baseId) => Number(baseId) === resolvedBaseSkinId);
+  return attachResolvedPackage({
+    ...payload,
+    resolvedSkinId: best.id,
+    resolvedBaseSkinId,
+    resolvedSkinName: best.name,
+    resolvedHasChromas,
+    resolutionSource: "lcu"
+  });
+};
+
+const canonicalizePenguSkinPayload = (payload = {}, skin = null) => {
+  const championId = Number(
+    getChampionIdFromSkinSyncPayload(payload) ||
+    getSkinSyncChampionNumber(skin || {}) ||
+    0
+  );
+  const requestedSkinId = Number(
+    payload.chromaId ||
+    payload.selectedChromaId ||
+    payload.resolvedSkinId ||
+    (skin ? getOverlayTargetSkinId(skin, championId) : 0) ||
+    0
+  );
+  const actualLcuSkinId = lastPenguLcuSelection?.championId === championId
+    ? Number(lastPenguLcuSelection.selectedSkinId || 0)
+    : 0;
+  return {
+    ...payload,
+    championId: championId || payload.championId,
+    requestedSkinId: requestedSkinId || undefined,
+    selectedSkinId: requestedSkinId || undefined,
+    resolvedSkinId: Number(payload.resolvedSkinId || requestedSkinId || 0) || undefined,
+    actualLcuSkinId: actualLcuSkinId || undefined,
+    canonical: true,
+  };
+};
+
+const commitRoseAuthoritativeSelection = (payload = {}, skin = null) => {
+  const canonical = canonicalizePenguSkinPayload(payload, skin);
+  const championId = Number(canonical.championId || 0);
+  const effectiveSkinId = Number(canonical.requestedSkinId || canonical.resolvedSkinId || 0);
+  const chromaId = Number(canonical.chromaId || canonical.selectedChromaId || 0);
+  const baseSkinId = Number(
+    canonical.resolvedBaseSkinId ||
+    canonical.baseSkinId ||
+    (skin ? getOverlayBaseSkinId(skin, championId) : 0) ||
+    effectiveSkinId
+  );
+  roseAuthoritativeSelection = {
+    revision: roseAuthoritativeSelection.revision + 1,
+    championId,
+    baseSkinId,
+    effectiveSkinId,
+    chromaId,
+    skinKey: skin ? getSkinKey(skin) : String(canonical.key || canonical.path || ""),
+    name: String(canonical.resolvedSkinName || canonical.chromaName || canonical.skin || canonical.originalName || ""),
+    payload: { ...canonical },
+    updatedAt: Date.now(),
+  };
+  lastPenguSkinSyncPayload = { ...canonical };
+  publishCustomModState(skin, canonical);
+  if (state.partyStatus === "connected") {
+    schedulePartySync(120);
+  }
+  return canonical;
+};
+
+const resolveRoseAuthoritativeSkinEntry = async (payload = {}, fallbackSkin = null) => {
+  let resolvedPayload = { ...(payload || {}) };
+  const originalSkinText = String(
+    resolvedPayload.skin ||
+    resolvedPayload.originalName ||
+    resolvedPayload.resolvedSkinName ||
+    ""
+  ).trim();
+
+  if (originalSkinText || Number(resolvedPayload.chromaId || resolvedPayload.selectedChromaId || 0)) {
+    resolvedPayload = await resolveSkinSyncPayloadWithLcu(resolvedPayload);
+  }
+
+  const championId = Number(
+    getChampionIdFromSkinSyncPayload(resolvedPayload) ||
+    getSkinSyncChampionNumber(fallbackSkin || {}) ||
+    0
+  );
+  const requestedSkinId = Number(
+    resolvedPayload.chromaId ||
+    resolvedPayload.selectedChromaId ||
+    resolvedPayload.resolvedSkinId ||
+    resolvedPayload.requestedSkinId ||
+    0
+  );
+  const resolvedBaseSkinId = Number(
+    resolvedPayload.resolvedBaseSkinId ||
+    resolvedPayload.baseSkinId ||
+    requestedSkinId ||
+    0
+  );
+  const champion = championId ? getChampionByNumericId(championId) : null;
+  const normalizedOriginalSkinText = normalizeSkinSyncText(originalSkinText);
+  const championOnlyPayload = Boolean(normalizedOriginalSkinText && champion) && (
+    normalizedOriginalSkinText === normalizeSkinSyncText(champion.name || "") ||
+    normalizedOriginalSkinText === normalizeSkinSyncText(champion.id || "")
+  );
+  const baseSkinId = championId ? championId * 1000 : 0;
+  const baseOnlyRequest = Boolean(championOnlyPayload && requestedSkinId && requestedSkinId === baseSkinId);
+
+  let skin = null;
+  if (resolvedPayload.resolvedPackagePath) {
+    skin = getSkinByKey(resolvedPayload.resolvedPackagePath);
+  }
+
+  if ((!skin || !isUserCustomSkin(skin)) && championId && requestedSkinId) {
+    const queuedCustomTarget = findQueuedCustomSkinForPenguPayload(resolvedPayload);
+    if (queuedCustomTarget) {
+      skin = queuedCustomTarget;
+      window.riftAtlas.appendOverlayLog(
+        `[RoseResolver] custom mod seleccionado gana antes que paquete base: ${getSkinKey(skin)}.`
+      ).catch(() => { });
+    }
+  }
+
+  if ((!skin || !isUserCustomSkin(skin)) && baseOnlyRequest) {
+    const queuedCustomChampion = findQueuedCustomModForChampionId(championId);
+    if (queuedCustomChampion) {
+      skin = queuedCustomChampion;
+      window.riftAtlas.appendOverlayLog(
+        `[RoseResolver] seleccion base/champion-only usa mod propio seleccionado para championId=${championId}: ${getSkinKey(skin)}.`
+      ).catch(() => { });
+    }
+  }
+
+  if (!skin && championId && requestedSkinId) {
+    skin = await getOrRegisterLeagueSkinPackage(
+      championId,
+      requestedSkinId,
+      resolvedBaseSkinId || requestedSkinId,
+      resolvedPayload.resolvedSkinName || originalSkinText
+    ).catch((error) => {
+      window.riftAtlas.appendOverlayLog(`[RoseResolver] paquete late-bound no disponible: ${error.message || error}`).catch(() => { });
+      return null;
+    });
+  }
+
+  if (!skin && baseOnlyRequest) {
+    const queuedCustomBaseMod = findQueuedCustomSkinForPenguPayload(resolvedPayload);
+    if (queuedCustomBaseMod) {
+      skin = queuedCustomBaseMod;
+      window.riftAtlas.appendOverlayLog(
+        `[RoseResolver] seleccion base/champion-only usa mod propio seleccionado para skinId=${requestedSkinId}: ${getSkinKey(skin)}.`
+      ).catch(() => { });
+    }
+  }
+  if (!skin && baseOnlyRequest) {
+    window.riftAtlas.appendOverlayLog(
+      `[RoseResolver] seleccion base/champion-only detectada; no reutilizo fallback anterior para championId=${championId}.`
+    ).catch(() => { });
+    return { skin: null, payload: resolvedPayload };
+  }
+
+  if (!skin) {
+    skin = findQueuedCustomSkinForPenguPayload(resolvedPayload) ||
+      findSkinFromPenguSync(resolvedPayload) ||
+      fallbackSkin ||
+      null;
+  }
+
+  if (skin) {
+    resolvedPayload = canonicalizePenguSkinPayload(resolvedPayload, skin);
+    window.riftAtlas.appendOverlayLog(
+      `[RoseResolver] late-bound injection: championId=${resolvedPayload.championId || "?"} requested=${resolvedPayload.requestedSkinId || requestedSkinId || "?"} actualLcu=${resolvedPayload.actualLcuSkinId || lastPenguLcuSelection?.selectedSkinId || "?"} key=${getSkinKey(skin)}`
+    ).catch(() => { });
+  }
+
+  return { skin, payload: resolvedPayload };
+};
+
+const publishCanonicalPenguSkinState = (payload = {}) => {
+  const championId = Number(payload.championId || 0);
+  const isChromaSelection = payload.type === "chroma-selection" ||
+    Number(payload.chromaId || payload.selectedChromaId || 0) > 0;
+  // Rose keeps skin-state authoritative for the carousel/base skin and publishes
+  // the selected chroma separately via chroma-state. If we publish the chroma id
+  // here, FormsWheel/ChromaWheel replace their base context with that chroma and
+  // the next open shows a "stuck" one-item/current chroma state.
+  const skinId = Number(
+    (isChromaSelection ? (payload.resolvedBaseSkinId || payload.baseSkinId) : 0) ||
+    payload.requestedSkinId ||
+    payload.resolvedSkinId ||
+    payload.chromaId ||
+    0
+  );
+  if (!championId || !skinId) return;
+  window.riftAtlas.sendPenguMessage?.({
+    type: "skin-state",
+    source: "rift-atlas-app",
+    canonical: true,
+    championId,
+    skinId,
+    selectedChromaId: isChromaSelection
+      ? Number(payload.chromaId || payload.selectedChromaId || payload.requestedSkinId || 0) || null
+      : null,
+    name: payload.resolvedSkinName || payload.chromaName || payload.skin || payload.originalName || null,
+    hasChromas: payload.resolvedHasChromas === true,
+    owned: isRoseOwnedSkinId(skinId),
+  }).catch(() => null);
+};
+
 const getSkinSyncChampionNumber = (skin = {}) => {
   const raw = Number(skin.rawChampion);
   if (Number.isFinite(raw) && raw > 0) return raw;
@@ -932,14 +2842,14 @@ const getSkinCatalogChampionNumber = (skin = {}) => getSkinSyncChampionNumber(sk
 const getSkinSyncIdCandidates = (skin = {}, championIdOverride = 0) => {
   const championId = Number(championIdOverride || getSkinSyncChampionNumber(skin) || 0);
   const values = [
-    skin.selectedSkinId,
-    skin.skinId,
-    skin.id,
     skin.rawSkin,
     skin.rawVariant,
+    skin.fileBaseId,
     skin.skinNum,
     skin.imageSkinNum,
     skin.baseImageSkinNum,
+    skin.skinId,
+    skin.id,
     skin.metaName
   ].map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0);
 
@@ -964,14 +2874,202 @@ const getSelectedSkinNumCandidates = (selectedSkinId = 0, championId = 0) => {
   return Number.isFinite(num) ? [num] : [];
 };
 
-const findSkinFromPenguSync = (payload = {}) => {
-  const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
-  const chromaId = Number(payload.chromaId || payload.selectedChromaId || 0);
-  const championId = Number(payload.championId || payload.champion?.id || 0);
-  const candidates = [...state.customMods, ...state.skinLibrary].filter((skin) => getSkinKey(skin) && skin.path);
-  const selectedIds = [...new Set([chromaId, selectedSkinId].filter((value) => Number.isFinite(value) && value > 0))];
+const getChampionIdFromSkinSyncPayload = (payload = {}) => {
+  const explicitChampionId = Number(payload.championId || payload.champion?.id || 0);
+  if (Number.isFinite(explicitChampionId) && explicitChampionId > 0) return explicitChampionId;
+  const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || payload.baseSkinId || 0);
+  if (Number.isFinite(selectedSkinId) && selectedSkinId > 0) return Math.floor(selectedSkinId / 1000);
+  const skinText = normalizeSkinSyncText(payload.skin || payload.originalName || "");
+  if (!skinText) return 0;
+  const syntheticMatch = skinText.match(/\bchampion\s+(\d+)\s+skin\s+\d+\b/);
+  if (syntheticMatch?.[1]) return Number(syntheticMatch[1]);
+  const champion = state.champions.find((entry) =>
+    skinText === normalizeSkinSyncText(entry.name) ||
+    skinText === normalizeSkinSyncText(entry.id)
+  );
+  const key = Number(champion?.key);
+  return Number.isFinite(key) ? key : 0;
+};
 
-  if (selectedIds.length) {
+const isBaseSkinSyncPayload = (payload = {}) => {
+  const championId = getChampionIdFromSkinSyncPayload(payload);
+  const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || payload.baseSkinId || 0);
+  return championId > 0 && selectedSkinId === championId * 1000;
+};
+
+const shouldIgnoreBaseSyncAfterChroma = (payload = {}) => {
+  if (payload.type === "chroma-selection") return false;
+  if (!lastPenguChromaSelection) return false;
+  if (Date.now() - lastPenguChromaSelection.at > 120000) {
+    lastPenguChromaSelection = null;
+    return false;
+  }
+  const championId = getChampionIdFromSkinSyncPayload(payload);
+  if (!championId || championId !== lastPenguChromaSelection.championId) return false;
+  const explicitSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
+  const stickyBaseSkinId = Number(lastPenguChromaSelection.baseSkinId || 0);
+  // An explicit selection of the base skin means the user really left the
+  // chroma. A name-only DOM echo does not: League emits those immediately after
+  // a chroma click and Rose keeps selected_chroma_id authoritative.
+  if (explicitSkinId && stickyBaseSkinId && explicitSkinId === stickyBaseSkinId) {
+    lastPenguChromaSelection = null;
+    return false;
+  }
+  if (lastPenguChromaSelection.skinKey && payload.skin) {
+    const chromaSkin = getSkinByKey(lastPenguChromaSelection.skinKey);
+    if (!chromaSkin) return isBaseSkinSyncPayload(payload);
+    const payloadText = normalizeSkinSyncText(payload.skin || payload.originalName || "");
+    const names = [
+      chromaSkin?.skin,
+      chromaSkin?.name,
+      chromaSkin?.variant,
+      getSkinDisplayName(chromaSkin)
+    ].map(normalizeSkinSyncText).filter(Boolean);
+    if (payloadText && names.length) {
+      const matchesStickyChromaBase = names.some((name) =>
+        name.includes(payloadText) || payloadText.includes(name)
+      );
+      if (!matchesStickyChromaBase) return false;
+      // The DOM payload often has no selectedSkinId (as in the Neeko log). Its
+      // matching base name is still a stale echo and must not replace the
+      // explicit chroma-selection event.
+      return true;
+    }
+  }
+  return isBaseSkinSyncPayload(payload);
+};
+
+const shouldHoldBaseSyncForChromaPanel = (payload = {}) => {
+  if (payload.type === "chroma-selection") return false;
+  if (!lastPenguChromaPanel) return false;
+  const age = Date.now() - lastPenguChromaPanel.at;
+  if (age > 15000) {
+    lastPenguChromaPanel = null;
+    return false;
+  }
+  const championId = getChampionIdFromSkinSyncPayload(payload);
+  if (championId && lastPenguChromaPanel.championId && championId !== lastPenguChromaPanel.championId) {
+    return false;
+  }
+  return lastPenguChromaPanel.open && isBaseSkinSyncPayload(payload);
+};
+
+const findQueuedCustomModForChampionId = (championId = 0) => {
+  const numericChampionId = Number(championId || 0);
+  if (!numericChampionId) return null;
+  return state.customMods.find((skin) => {
+      const key = getSkinKey(skin);
+      if (!state.queuedSkins.has(key)) return false;
+      if (isDownloadedLeagueSkinsPath(key)) return false;
+      const skinChampionId = getSkinSyncChampionNumber(skin);
+      return skinChampionId && skinChampionId === numericChampionId;
+    }) || null;
+};
+
+const findQueuedCustomSkinForPenguPayload = (payload = {}) => {
+  const championId = getChampionIdFromSkinSyncPayload(payload);
+  const targetSkinId = Number(
+    payload.resolvedSkinId ||
+    payload.chromaId ||
+    payload.selectedChromaId ||
+    payload.selectedSkinId ||
+    payload.skinId ||
+    payload.baseSkinId ||
+    0
+  );
+  if (!championId || !targetSkinId) return null;
+  return state.customMods.find((skin) => {
+    const key = getSkinKey(skin);
+    if (!state.queuedSkins.has(key) || isDownloadedLeagueSkinsPath(key)) return false;
+    if (getSkinSyncChampionNumber(skin) !== championId) return false;
+    return getOverlayTargetSkinId(skin, championId) === targetSkinId;
+  }) || null;
+};
+
+const findSkinFromPenguSync = (payload = {}) => {
+  const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || payload.baseSkinId || 0);
+  const chromaId = Number(payload.chromaId || payload.selectedChromaId || 0);
+  const baseSkinId = Number(payload.baseSkinId || 0);
+  const championId = getChampionIdFromSkinSyncPayload(payload);
+
+  const queuedCustomMods = state.customMods.filter((skin) => state.queuedSkins.has(getSkinKey(skin)));
+  const candidates = [...queuedCustomMods, ...state.skinLibrary]
+    .filter((skin) => getSkinKey(skin) && skin.path)
+    .filter((skin, index, array) => array.findIndex((entry) => getSkinKey(entry) === getSkinKey(skin)) === index);
+  if (payload.resolvedPackagePath) {
+    const directPackage = candidates.find((entry) => getSkinKey(entry) === payload.resolvedPackagePath);
+    if (directPackage) return directPackage;
+  }
+  const resolvedSkinId = Number(payload.resolvedSkinId || 0);
+  const selectedIds = [...new Set([resolvedSkinId, chromaId, selectedSkinId, baseSkinId].filter((value) => Number.isFinite(value) && value > 0))];
+  const skinText = payload.skin || payload.originalName || "";
+  const normalizedSkinText = normalizeSkinSyncText(skinText);
+  // DOM-only payloads often omit selectedSkinId. Once LCU resolved the name,
+  // use that ID to recognize the champion base skin; otherwise a queued paid
+  // skin of the same champion can win by name/queue bias (for example "Briar"
+  // incorrectly resolving to 233020).
+  const effectiveSelectedSkinId = selectedSkinId || resolvedSkinId;
+  const isDefaultSelection = effectiveSelectedSkinId > 0 &&
+    effectiveSelectedSkinId % 1000 === 0 &&
+    chromaId === 0 &&
+    resolvedSkinId <= effectiveSelectedSkinId;
+  const champion = championId ? getChampionByNumericId(championId) : null;
+  const textChampion = normalizedSkinText
+    ? state.champions.find((entry) =>
+      normalizedSkinText === normalizeSkinSyncText(entry.name) ||
+      normalizedSkinText === normalizeSkinSyncText(entry.id)
+    )
+    : null;
+  const championOnlyText = Boolean(normalizedSkinText) && (
+    normalizedSkinText === normalizeSkinSyncText((champion || textChampion)?.name || "") ||
+    normalizedSkinText === normalizeSkinSyncText((champion || textChampion)?.id || "")
+  );
+
+  if (!championId && championOnlyText && textChampion) {
+    const queuedTextChampionMatch = findQueuedCustomSkinForPenguPayload({
+      ...payload,
+      championId: Number(textChampion.key)
+    });
+    if (queuedTextChampionMatch) return queuedTextChampionMatch;
+    return null;
+  }
+
+  if (championOnlyText && isDefaultSelection) {
+    const queuedChampionMatch = findQueuedCustomSkinForPenguPayload({
+      ...payload,
+      championId: championId || Number(textChampion?.key || 0)
+    });
+    if (queuedChampionMatch) {
+      window.riftAtlas.appendOverlayLog(`[RoseSuspend] skin base detectada; usando mod propio en cola para championId=${championId || Number(textChampion?.key || 0)}: ${getSkinKey(queuedChampionMatch)}`).catch(() => { });
+      return queuedChampionMatch;
+    }
+    return null;
+  }
+
+  // A custom mod behaves like Rose's selected_custom_mod: it wins only while
+  // the exact skin it targets is the live/resolved selection.
+  const queuedCustomTargetMatch = findQueuedCustomSkinForPenguPayload(payload);
+  if (queuedCustomTargetMatch) return queuedCustomTargetMatch;
+
+  const payloadNameScore = (entry) => {
+    if (!normalizedSkinText) return 1;
+    const names = [
+      entry.skin,
+      entry.name,
+      getSkinDisplayName(entry),
+      entry.variant ? `${entry.skin} ${entry.variant}` : "",
+      entry.variant ? `${entry.name} ${entry.variant}` : ""
+    ];
+    return Math.max(...names.map((name) => {
+      const normalizedName = normalizeSkinSyncText(name);
+      if (!normalizedName) return 0;
+      if (normalizedName === normalizedSkinText) return 1;
+      if (normalizedName.includes(normalizedSkinText) || normalizedSkinText.includes(normalizedName)) return 0.92;
+      return tokenSimilarity(normalizedSkinText, normalizedName);
+    }));
+  };
+
+  if (selectedIds.length && !isDefaultSelection) {
     const idMatches = candidates.filter((skin) => {
       const skinChampionId = getSkinSyncChampionNumber(skin);
       if (championId && skinChampionId && skinChampionId !== championId) return false;
@@ -982,25 +3080,67 @@ const findSkinFromPenguSync = (payload = {}) => {
           .some((num) => idCandidates.has(num));
       });
     });
-    const byId = idMatches.find((skin) => !state.queuedSkins.has(getSkinKey(skin))) || idMatches[0];
+    // El DOM y el endpoint de champ select no cambian atomicamente. Si el ID
+    // todavia apunta a Beeko pero el nombre ya dice Embrujada, no aceptar el
+    // match viejo: continuar con la resolucion por nombre al estilo Rose.
+    // However, if the ID match is EXACT (fileBaseId matches the resolved ID),
+    // the LCU-resolved ID is authoritative — bypass the name filter. The skin
+    // name in the library may not be resolved yet if the user doesn't own it.
+    const coherentIdMatches = normalizedSkinText && !championOnlyText
+      ? idMatches.filter((entry) => {
+        if (payloadNameScore(entry) >= 0.85) return true;
+        window.riftAtlas.appendOverlayLog(
+          `[RoseResolver] descarto match por ID incoherente: id=${selectedSkinId || chromaId || resolvedSkinId || "?"} nombre="${skinText}" candidato="${entry.skin || entry.name || getSkinKey(entry)}"`
+        ).catch(() => { });
+        return false;
+      })
+      : idMatches;
+    if (coherentIdMatches.length > 1) {
+      coherentIdMatches.sort((a, b) => {
+        const aPackageId = Number(a.fileBaseId || 0);
+        const bPackageId = Number(b.fileBaseId || 0);
+        const preferredId = resolvedSkinId || chromaId || selectedSkinId;
+        const aExactPackage = aPackageId === preferredId ? 1 : 0;
+        const bExactPackage = bPackageId === preferredId ? 1 : 0;
+        if (aExactPackage !== bExactPackage) return bExactPackage - aExactPackage;
+        const aVariant = Number(a.rawVariant || 0);
+        const bVariant = Number(b.rawVariant || 0);
+        const aIsChroma = chromaId && aVariant === chromaId ? 1 : 0;
+        const bIsChroma = chromaId && bVariant === chromaId ? 1 : 0;
+        return bIsChroma - aIsChroma;
+      });
+    }
+    const byId = coherentIdMatches.find((skin) => !state.queuedSkins.has(getSkinKey(skin))) || coherentIdMatches[0];
     if (byId) return byId;
   }
 
-  const skinText = payload.skin || payload.originalName || "";
-  const normalizedSkinText = normalizeSkinSyncText(skinText);
-  if (!normalizedSkinText) return null;
+  if (!normalizedSkinText) {
+    const queuedPathMatch = [...state.queuedSkins].find((path) => {
+      const fn = path.split(/[/\\]/).pop().toLowerCase().replace(/\.(fantome|zip|wad|rse)$/, "");
+      const tokens = getSkinSyncTokens(fn);
+      if (!tokens.length) return false;
+      return championId > 0 && tokens.some((t) => t.includes(`champion${championId}`) || championId.toString().includes(t));
+    });
+    if (queuedPathMatch) {
+      const skin = getSkinByKey(queuedPathMatch);
+      if (skin) return skin;
+      return { path: queuedPathMatch, name: queuedPathMatch.split(/[/\\]/).pop() };
+    }
+    return null;
+  }
 
   let best = null;
   let bestScore = 0;
-  candidates.forEach((skin) => {
-    const skinChampionId = getSkinSyncChampionNumber(skin);
+
+  const matchAgainst = (entry) => {
+    const skinChampionId = getSkinSyncChampionNumber(entry);
     if (championId && skinChampionId && skinChampionId !== championId) return;
     const names = [
-      skin.skin,
-      skin.name,
-      getSkinDisplayName(skin),
-      skin.variant ? `${skin.skin} ${skin.variant}` : "",
-      skin.variant ? `${skin.name} ${skin.variant}` : ""
+      entry.skin,
+      entry.name,
+      getSkinDisplayName(entry),
+      entry.variant ? `${entry.skin} ${entry.variant}` : "",
+      entry.variant ? `${entry.name} ${entry.variant}` : ""
     ];
     const score = Math.max(...names.map((name) => {
       const normalizedName = normalizeSkinSyncText(name);
@@ -1009,26 +3149,233 @@ const findSkinFromPenguSync = (payload = {}) => {
       if (normalizedName.includes(normalizedSkinText) || normalizedSkinText.includes(normalizedName)) return 0.92;
       return tokenSimilarity(normalizedSkinText, normalizedName);
     }));
-    const scoreWithQueueBias = score + (state.queuedSkins.has(getSkinKey(skin)) ? 0 : 0.08);
+    const scoreWithQueueBias = score + (state.queuedSkins.has(getSkinKey(entry)) ? 0.08 : 0);
     if (scoreWithQueueBias > bestScore) {
       bestScore = scoreWithQueueBias;
-      best = skin;
+      best = entry;
     }
-  });
+  };
 
-  return bestScore >= 0.9 ? best : null;
+  candidates.forEach(matchAgainst);
+
+  if (bestScore < 0.85) {
+    const queuedPaths = [...state.queuedSkins].filter((path) => !getSkinByKey(path));
+    for (const path of queuedPaths) {
+      const fn = path.split(/[/\\]/).pop().toLowerCase().replace(/\.(fantome|zip|wad|rse)$/, "");
+      const normalizedFn = normalizeSkinSyncText(fn);
+      if (normalizedSkinText.includes(normalizedFn) || normalizedFn.includes(normalizedSkinText)) {
+        const entry = getSkinByKey(path) || { path, name: fn, skin: fn, champion: "Custom" };
+        matchAgainst(entry);
+      }
+    }
+  }
+
+  return bestScore >= 0.85 ? best : null;
+};
+
+const hasContradictoryChampionOnlyPayload = (payload = {}) => {
+  const championId = Number(payload.championId || payload.champion?.id || 0);
+  const skinText = normalizeSkinSyncText(payload.skin || payload.originalName || "");
+  if (!championId || !skinText) return false;
+  const payloadChampion = getChampionByNumericId(championId);
+  if (payloadChampion && (
+    skinText === normalizeSkinSyncText(payloadChampion.name) ||
+    skinText === normalizeSkinSyncText(payloadChampion.id)
+  )) {
+    return false;
+  }
+  const namedChampion = state.champions.find((champion) =>
+    skinText === normalizeSkinSyncText(champion.name) ||
+    skinText === normalizeSkinSyncText(champion.id)
+  );
+  return Boolean(namedChampion && Number(namedChampion.key) !== championId);
+};
+
+let autoApplyQueuedFromPenguTimer = null;
+const scheduleAutoApplyQueuedFromPengu = (reason = "queue-selected") => {
+  clearTimeout(autoApplyQueuedFromPenguTimer);
+  autoApplyQueuedFromPenguTimer = setTimeout(async () => {
+    autoApplyQueuedFromPenguTimer = null;
+    if (!lastPenguSkinSyncPayload || state.importingQueue) return;
+    const skin = findQueuedCustomSkinForPenguPayload(lastPenguSkinSyncPayload);
+    if (!skin) return;
+    window.riftAtlas.appendOverlayLog(`[Rose] Mod actualizado (${reason}); queda preparado para la unica inyeccion de FINALIZATION.`).catch(() => { });
+  }, 150);
+};
+
+const shouldDeferPenguApplyToFinalization = () =>
+  ["ChampSelect", "FINALIZATION"].includes(String(state.penguGameflowPhase || ""));
+
+const queuePenguSelectionForFinalization = async (payload, key) => {
+  const deferred = shouldDeferPenguApplyToFinalization();
+  const earlySkin = getSkinByKey(key);
+  const resolved = await resolveRoseAuthoritativeSkinEntry(payload, earlySkin);
+  const skin = resolved.skin || earlySkin;
+  const finalKey = skin ? getSkinKey(skin) : key;
+  const preparedPayload = commitRoseAuthoritativeSelection(resolved.payload || payload, skin);
+  publishCanonicalPenguSkinState(preparedPayload);
+  window.riftAtlas.appendOverlayLog(
+    `[Rose] estado canonico: championId=${preparedPayload.championId || "?"} requestedSkinId=${preparedPayload.requestedSkinId || "?"} actualLcuSkinId=${preparedPayload.actualLcuSkinId || lastPenguLcuSelection?.selectedSkinId || "?"} name=${preparedPayload.resolvedSkinName || preparedPayload.skin || "?"}.`
+  ).catch(() => { });
+  if (deferred) {
+    window.riftAtlas.appendOverlayLog(
+      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; inyeccion diferida al ticker local monotonic de ${ROSE_INJECTION_THRESHOLD_MS}ms.`
+    ).catch(() => { });
+    await preforceUnownedBaseForFinalization(skin, preparedPayload, "selection-update");
+  }
+  return handlePenguSkinApply({ ...preparedPayload, key: finalKey, apply: !deferred });
 };
 
 async function handlePenguSkinSync(payload = {}) {
+  const syncLogSignature = `${payload.type || ""}:${payload.championId || ""}:${payload.selectedSkinId || payload.skinId || ""}:${payload.skin || ""}:${payload.chromaId || payload.selectedChromaId || ""}`;
+  const syncLogNow = Date.now();
+  if (syncLogSignature !== lastPenguSyncLogSignature || syncLogNow - lastPenguSyncLogAt > 5000) {
+    lastPenguSyncLogSignature = syncLogSignature;
+    lastPenguSyncLogAt = syncLogNow;
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] handlePenguSkinSync recibio payload: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin} type=${payload.type}`).catch(() => { });
+  }
+
+  // Rose FlowController gate: only process after champion lock or in FINALIZATION.
+  // Always remember the latest payload (like Rose saves ui_last_text) but don't
+  // process it until the champion is locked.
+  const previousSkinSyncPayload = lastPenguSkinSyncPayload;
+  if (payload.skin || payload.championId || payload.selectedSkinId || payload.skinId) {
+    lastPenguSkinSyncPayload = { ...payload };
+  }
+  if (payload.type === "skin-sync" && !state.penguChampionLocked && state.penguGameflowPhase !== "FINALIZATION") {
+    return;
+  }
+
+  if (
+    payload.type === "skin-sync" &&
+    payload.skin &&
+    !state.roseFinalizationApplyStarted &&
+    !state.roseFinalizationCommitted
+  ) {
+    const incomingChampionId = getChampionIdFromSkinSyncPayload(payload);
+    const currentChampionId = getChampionIdFromSkinSyncPayload(previousSkinSyncPayload || {});
+    const incomingName = normalizeSkinSyncText(payload.skin || payload.originalName || "");
+    const currentName = normalizeSkinSyncText(
+      previousSkinSyncPayload?.resolvedSkinName ||
+      previousSkinSyncPayload?.skin ||
+      previousSkinSyncPayload?.originalName ||
+      ""
+    );
+    const repeatsCanonicalSelection = Boolean(
+      previousSkinSyncPayload?.canonical &&
+      incomingName &&
+      currentName &&
+      incomingName === currentName &&
+      (!incomingChampionId || !currentChampionId || incomingChampionId === currentChampionId)
+    );
+    if (repeatsCanonicalSelection) {
+      // Keep the richer canonical snapshot. Critically, never clear the latest
+      // raw payload here: FINALIZATION may fire while LCU resolution is still in
+      // flight and Rose always retains its latest ui_last_text equivalent.
+      lastPenguSkinSyncPayload = previousSkinSyncPayload;
+      // Core can repeat the same DOM name every few seconds. Rose treats this as
+      // the same cached selection; resolving it through LCU again only delays
+      // the threshold and can make the force happen after ChampSelect closes.
+      return;
+    }
+  }
+
+  // Core already stabilizes DOM changes. Resolving immediately avoids carrying
+  // an unresolved name into FINALIZATION and removes the old ID/name race.
+  if (payload.type === "chroma-selection") {
+    const championId = getChampionIdFromSkinSyncPayload(payload);
+    const chromaId = Number(payload.chromaId || payload.selectedChromaId || payload.selectedSkinId || payload.skinId || 0);
+    if (championId && chromaId) {
+      lastPenguChromaSelection = {
+        championId,
+        chromaId,
+        baseSkinId: Number(payload.baseSkinId || 0),
+        at: Date.now()
+      };
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] chroma sticky activo: championId=${championId} chromaId=${chromaId}`).catch(() => { });
+    }
+  } else if (shouldIgnoreBaseSyncAfterChroma(payload)) {
+    lastPenguSkinSyncPayload = previousSkinSyncPayload;
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync base ignorado porque hay chroma reciente: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin || ""}`).catch(() => { });
+    return;
+  } else if (shouldHoldBaseSyncForChromaPanel(payload)) {
+    lastPenguSkinSyncPayload = previousSkinSyncPayload;
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync base ignorado porque el panel de chromas esta abierto: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin || ""}`).catch(() => { });
+    return;
+  } else if (isBaseSkinSyncPayload(payload)) {
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    if (shouldIgnoreBaseSyncAfterChroma(payload) || shouldHoldBaseSyncForChromaPanel(payload)) {
+      lastPenguSkinSyncPayload = previousSkinSyncPayload;
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync base cancelado tras espera de chroma: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin || ""}`).catch(() => { });
+      return;
+    }
+  }
+  if (hasContradictoryChampionOnlyPayload(payload)) {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync ignorado por championId/nombre contradictorios: championId=${payload.championId} skin=${payload.skin}`).catch(() => { });
+    return;
+  }
   const directKey = payload.key || payload.path;
   if (directKey && getSkinByKey(directKey)) {
-    await handlePenguSkinApply({ ...payload, key: directKey });
+    const directSignature = `${directKey}:${payload.chromaId || ""}:${payload.selectedSkinId || ""}`;
+    const directNow = Date.now();
+    if (directSignature === lastPenguSkinSyncKey && directNow - lastPenguSkinSyncAt < 30000) {
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] handlePenguSkinSync: directKey deduped key=${directKey}`).catch(() => { });
+      return;
+    }
+    lastPenguSkinSyncKey = directSignature;
+    lastPenguSkinSyncAt = directNow;
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] handlePenguSkinSync: usando directKey=${directKey}`).catch(() => { });
+    await queuePenguSelectionForFinalization(payload, directKey);
     return;
   }
 
   if (!payload.skin && !Number(payload.chromaId || payload.selectedChromaId || payload.selectedSkinId || payload.skinId || 0)) return;
-  const skin = findSkinFromPenguSync(payload);
+  if (!state.skinLibrary.length) {
+    await ensureSkinLibraryLoaded().catch((error) => {
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] LeagueSkins no listo durante skin-sync: ${error.message}`).catch(() => { });
+    });
+  }
+  payload = await resolveSkinSyncPayloadWithLcu(payload);
+  if (payload.resolvedSkinId) {
+    lastPenguSkinSyncPayload = { ...payload };
+  }
+  let skin = findSkinFromPenguSync(payload);
+  window.riftAtlas.appendOverlayLog(`[Diagnostico] findSkinFromPenguSync resultado: ${skin ? "encontrada: " + getSkinKey(skin) : "null"}`).catch(() => { });
+  if (!skin && payload.skin) {
+    const payloadText = normalizeSkinSyncText(payload.skin);
+    for (const path of state.queuedSkins) {
+      const queuedSkin = getSkinByKey(path);
+      if (queuedSkin && !queuedSkin.custom && !state.queuedSkins.has(getSkinKey(queuedSkin))) continue;
+      const fn = path.split(/[/\\]/).pop().toLowerCase().replace(/\.(fantome|zip|wad|rse)$/, "");
+      const normalizedFn = normalizeSkinSyncText(fn);
+      if (normalizedFn.includes(payloadText) || payloadText.includes(normalizedFn)) {
+        skin = queuedSkin;
+        if (!skin) {
+          skin = { path, name: fn, skin: payload.skin, champion: "Custom" };
+          if (!state.customMods.some((m) => m.path === path)) {
+            state.customMods = [...state.customMods, skin];
+          }
+        }
+        break;
+      }
+    }
+  }
   if (!skin) {
+    const pendingChampionId = Number(payload.championId || payload.champion?.id || 0);
+    const pendingChampion = pendingChampionId ? getChampionByNumericId(pendingChampionId) : null;
+    const pendingSkinText = normalizeSkinSyncText(payload.skin || payload.originalName || "");
+    const pendingSelectedSkinId = Number(payload.selectedSkinId || payload.skinId || payload.baseSkinId || 0);
+    const pendingIsDefaultSelection = pendingSelectedSkinId > 0 && pendingSelectedSkinId % 1000 === 0 && !Number(payload.chromaId || payload.selectedChromaId || 0);
+    const pendingChampionOnly = pendingSkinText && (
+      pendingSkinText === normalizeSkinSyncText(pendingChampion?.name || "") ||
+      pendingSkinText === normalizeSkinSyncText(pendingChampion?.id || "")
+    );
+    if (pendingChampionOnly && pendingIsDefaultSelection) {
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] Esperando nombre de skin especifico para ${payload.skin}.`).catch(() => { });
+      return;
+    }
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] NO se encontro skin para: ${payload.skin || payload.selectedSkinId || payload.chromaId || "desconocida"}`).catch(() => { });
+    clearRoseAuthoritativeSelection();
     await window.riftAtlas.sendPenguMessage?.({
       type: "skin-apply-result",
       ok: false,
@@ -1039,20 +3386,52 @@ async function handlePenguSkinSync(payload = {}) {
   }
 
   const key = getSkinKey(skin);
-  const signature = `${key}:${payload.chromaId || ""}:${payload.selectedSkinId || ""}:${payload.skin || ""}`;
+  if (payload.type === "chroma-selection" && lastPenguChromaSelection) {
+    lastPenguChromaSelection.skinKey = key;
+  }
+  if (shouldIgnorePenguSwitchDuringApply(key, payload)) return;
+  const signature = `${key}:${payload.chromaId || ""}:${payload.selectedSkinId || ""}`;
   const now = Date.now();
   if (signature === lastPenguSkinSyncKey && now - lastPenguSkinSyncAt < 30000) return;
   lastPenguSkinSyncKey = signature;
   lastPenguSkinSyncAt = now;
-  await handlePenguSkinApply({ ...payload, key });
+  await queuePenguSelectionForFinalization(payload, key);
 }
+
+const updateCustomModsQueueState = () => {
+  if (!els.customModsList) return;
+  const selectedMods = state.customMods.filter((item) => state.queuedSkins.has(getSkinKey(item)));
+  const selectedCount = selectedMods.length;
+  if (els.customModsLabel) {
+    els.customModsLabel.textContent = state.customMods.length
+      ? selectedCount
+        ? `${state.customMods.length} mod(s) propios cargados. En seleccion: ${selectedMods.slice(0, 3).map(getSkinVisibleName).join(", ")}${selectedCount > 3 ? ` +${selectedCount - 3}` : ""}.`
+        : `${state.customMods.length} mod(s) propios cargados. Ningun mod propio seleccionado.`
+      : "Agrega .fantome, .zip, .rse, .wad o .wad.client tuyos. Sirve para skins, fonts, mapas y otros mods locales.";
+  }
+  els.customModsList.querySelectorAll(".custom-mod-row").forEach((row) => {
+    const queued = state.queuedSkins.has(row.dataset.path);
+    row.classList.toggle("queued", queued);
+    const badge = row.querySelector(".custom-mod-selection-badge");
+    if (badge) badge.hidden = !queued;
+    const queueButton = row.querySelector(".custom-mod-queue");
+    if (queueButton) {
+      queueButton.classList.toggle("secondary-button", queued);
+      queueButton.classList.toggle("docs-link", !queued);
+      queueButton.textContent = queued ? "Quitar" : "Seleccionar";
+    }
+  });
+};
 
 const renderCustomMods = () => {
   if (!els.customModsList) return;
-  const selectedCount = state.customMods.filter((item) => state.queuedSkins.has(getSkinKey(item))).length;
+  const selectedMods = state.customMods.filter((item) => state.queuedSkins.has(getSkinKey(item)));
+  const selectedCount = selectedMods.length;
   if (els.customModsLabel) {
     els.customModsLabel.textContent = state.customMods.length
-      ? `${state.customMods.length} mod(s) propios cargados. ${selectedCount} seleccionados.`
+      ? selectedCount
+        ? `${state.customMods.length} mod(s) propios cargados. En seleccion: ${selectedMods.slice(0, 3).map(getSkinVisibleName).join(", ")}${selectedCount > 3 ? ` +${selectedCount - 3}` : ""}.`
+        : `${state.customMods.length} mod(s) propios cargados. Ningun mod propio seleccionado.`
       : "Agrega .fantome, .zip, .rse, .wad o .wad.client tuyos. Sirve para skins, fonts, mapas y otros mods locales.";
   }
 
@@ -1060,7 +3439,7 @@ const renderCustomMods = () => {
     els.customModsList.innerHTML = `
       <div class="empty-state compact">
         <h2>Sin mods propios</h2>
-        <p>Agrega paquetes locales que no formen parte de LeagueSkins.</p>
+        <p>Agrega paquetes locales para activarlos desde Rift Atlas y Pengu.</p>
       </div>
     `;
     return;
@@ -1068,18 +3447,26 @@ const renderCustomMods = () => {
 
   els.customModsList.innerHTML = state.customMods
     .map((item) => {
-      const key = getSkinKey(item);
+      const resolved = applySkinMetadata(item);
+      const key = getSkinKey(resolved);
       const queued = state.queuedSkins.has(key);
+      const favorite = state.favoriteSkins.has(key);
+      const preview = getSkinLoadingImage(resolved) || getSkinDefaultLoadingImage(resolved);
       return `
         <article class="custom-mod-row ${queued ? "queued" : ""}" data-path="${escapeHtml(key)}">
-          <span class="mod-extension">${escapeHtml(item.extension.replace(".", ""))}</span>
+          <span class="mod-extension">${escapeHtml(getDisplayExtension(resolved))}</span>
+          <span class="custom-mod-thumb ${preview ? "" : "missing-art"}">${preview ? `<img src="${escapeHtml(preview)}" alt="${escapeHtml(getSkinDisplayName(resolved))}" loading="lazy" />` : escapeHtml(getDisplayExtension(resolved))}</span>
           <div>
-            <strong>${escapeHtml(item.name || item.skin)}</strong>
-            <small>${escapeHtml(item.relativePath || item.path)}</small>
+            <strong>${escapeHtml(getSkinVisibleName(resolved))}</strong>
+            <small>${escapeHtml(resolved.champion || "Mod propio")} - ${escapeHtml(getSkinSource(resolved))}${resolved.metadataEdited ? " - editado" : ""}${resolved.previewInferred ? " - preview inferida" : ""}</small>
+            <small>${escapeHtml(resolved.relativePath || resolved.path)}</small>
           </div>
-          <span>${formatBytes(item.size)}</span>
+          <span class="custom-mod-selection-badge" ${queued ? "" : "hidden"}>En seleccion</span>
+          <span>${formatBytes(resolved.size)}</span>
           <button class="${queued ? "secondary-button" : "docs-link"} custom-mod-queue" type="button" data-path="${escapeHtml(key)}">${queued ? "Quitar" : "Seleccionar"}</button>
-          <button class="secondary-button custom-mod-reveal" type="button" data-path="${escapeHtml(item.path)}">Abrir</button>
+          <button class="secondary-button custom-mod-favorite" type="button" data-path="${escapeHtml(key)}">${favorite ? "Favorita" : "Fav"}</button>
+          <button class="secondary-button custom-mod-edit" type="button" data-path="${escapeHtml(key)}">Editar</button>
+          <button class="secondary-button custom-mod-reveal" type="button" data-path="${escapeHtml(resolved.path)}">Abrir</button>
           <button class="secondary-button custom-mod-remove" type="button" data-path="${escapeHtml(key)}">Eliminar</button>
         </article>
       `;
@@ -1087,13 +3474,15 @@ const renderCustomMods = () => {
     .join("");
 
   els.customModsList.querySelectorAll(".custom-mod-queue").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
       if (state.queuedSkins.has(button.dataset.path)) {
         removeQueuedSkinKey(button.dataset.path);
       } else {
         queueSkinKey(button.dataset.path);
       }
       saveQueuedSkins();
+      scheduleAutoApplyQueuedFromPengu("custom-mod-selected");
       renderCustomMods();
     });
   });
@@ -1107,15 +3496,62 @@ const renderCustomMods = () => {
   });
 
   els.customModsList.querySelectorAll(".custom-mod-reveal").forEach((button) => {
-    button.addEventListener("click", () => window.riftAtlas.revealModPath(button.dataset.path));
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
+      window.riftAtlas.revealModPath(button.dataset.path);
+    });
+  });
+
+  els.customModsList.querySelectorAll(".custom-mod-favorite").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
+      if (state.favoriteSkins.has(button.dataset.path)) state.favoriteSkins.delete(button.dataset.path);
+      else state.favoriteSkins.add(button.dataset.path);
+      state.selectedSkinKey = button.dataset.path;
+      saveFavoriteSkins();
+      renderCustomMods();
+      renderSkinProfile();
+      sendPenguSkinCatalog("favorite-updated");
+    });
+  });
+
+  els.customModsList.querySelectorAll(".custom-mod-edit").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
+      state.selectedSkinKey = button.dataset.path;
+      openSkinMetadataModal(button.dataset.path);
+    });
   });
 
   els.customModsList.querySelectorAll(".custom-mod-remove").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.customMods = state.customMods.filter((item) => getSkinKey(item) !== button.dataset.path);
-      removeQueuedSkinKey(button.dataset.path);
+    button.addEventListener("click", async (event) => {
+      stopButtonEvent(event);
+      const key = button.dataset.path;
+      button.disabled = true;
+      button.textContent = "Eliminando...";
+      let deletedOnDisk = false;
+      try {
+        const result = await window.riftAtlas.deleteUserModFile?.(key);
+        deletedOnDisk = Boolean(result?.deleted);
+      } catch (error) {
+        if (els.customModsLabel) {
+          els.customModsLabel.textContent = error.message || "No pude borrar el archivo; lo quite de Rift Atlas.";
+        }
+      }
+      state.customMods = state.customMods.filter((item) => getSkinKey(item) !== key);
+      state.favoriteSkins.delete(key);
+      delete state.skinMetadata[key];
+      if (state.selectedSkinKey === key) state.selectedSkinKey = "";
+      removeQueuedSkinKey(key);
+      localStorage.setItem("riftAtlas:favoriteSkins", JSON.stringify([...state.favoriteSkins]));
+      localStorage.setItem("riftAtlas:skinMetadata", JSON.stringify(state.skinMetadata));
       saveCustomMods();
       saveQueuedSkins();
+      renderSkinProfile();
+      if (els.customModsLabel && deletedOnDisk) {
+        els.customModsLabel.textContent = "Mod eliminado de la carpeta de Rift Atlas.";
+      }
+      sendPenguSkinCatalog("custom-mod-removed");
     });
   });
 };
@@ -1138,6 +3574,7 @@ const renderSkinProfile = () => {
   const favorite = state.favoriteSkins.has(key);
   const art = getSkinLoadingImage(skin) || getSkinDefaultLoadingImage(skin);
   const fallbackArt = getSkinBaseLoadingImage(skin) || getSkinDefaultLoadingImage(skin);
+  const source = getSkinSource(skin);
   els.skinProfilePanel.innerHTML = `
     <article class="skin-profile-card">
       <div class="skin-profile-art ${art ? "" : "missing-art"}">
@@ -1145,18 +3582,24 @@ const renderSkinProfile = () => {
         <span>${escapeHtml(skin.extension?.replace(".", "") || "MOD")}</span>
       </div>
       <div class="skin-profile-copy">
-        <span>${escapeHtml(skin.custom ? "Mod propio" : "LeagueSkins")}</span>
-        <h3>${escapeHtml(skin.skin || skin.name)}</h3>
+        <span>${escapeHtml(source)}${skin.metadataEdited ? " - metadata editada" : ""}</span>
+        <h3>${escapeHtml(getSkinVisibleName(skin))}</h3>
         <p>${escapeHtml(skin.champion || "Mod propio")}</p>
         <dl>
           <div><dt>Tipo</dt><dd>${escapeHtml(skin.extension || "-")}</dd></div>
           <div><dt>Tamano</dt><dd>${formatBytes(skin.size)}</dd></div>
+          <div><dt>Autor</dt><dd>${escapeHtml(skin.author || "-")}</dd></div>
+          <div><dt>Version</dt><dd>${escapeHtml(skin.version || "-")}</dd></div>
+          <div><dt>Skin base</dt><dd>${escapeHtml(skin.targetBaseSkin || "-")}</dd></div>
+          <div><dt>Preview</dt><dd>${skin.previewInferred ? "Inferida" : art ? "Disponible" : "-"}</dd></div>
           <div><dt>Ruta</dt><dd title="${escapeHtml(skin.path)}">${escapeHtml(skin.relativePath || skin.path)}</dd></div>
         </dl>
       </div>
       <div class="skin-profile-actions">
         <button class="${queued ? "secondary-button" : "docs-link"} profile-queue" type="button">${queued ? "Quitar" : "Seleccionar"}</button>
         <button class="secondary-button profile-favorite" type="button">${favorite ? "Quitar favorita" : "Favorita"}</button>
+        <button class="secondary-button profile-open-mod-folder" type="button">Carpeta mod</button>
+        <button class="secondary-button profile-edit" type="button">Editar metadata</button>
         <button class="secondary-button profile-reveal" type="button">Abrir</button>
       </div>
     </article>
@@ -1175,31 +3618,110 @@ const renderSkinProfile = () => {
     if (state.queuedSkins.has(key)) removeQueuedSkinKey(key);
     else queueSkinKey(key);
     saveQueuedSkins();
+    renderCustomMods();
+    renderSkinProfile();
   });
   els.skinProfilePanel.querySelector(".profile-favorite")?.addEventListener("click", () => {
     if (state.favoriteSkins.has(key)) state.favoriteSkins.delete(key);
     else state.favoriteSkins.add(key);
     saveFavoriteSkins();
+    renderCustomMods();
     renderSkinProfile();
+    sendPenguSkinCatalog("favorite-updated");
+  });
+  els.skinProfilePanel.querySelector(".profile-edit")?.addEventListener("click", () => {
+    state.selectedSkinKey = key;
+    openSkinMetadataModal(key);
   });
   els.skinProfilePanel.querySelector(".profile-reveal")?.addEventListener("click", () => window.riftAtlas.revealModPath(skin.path));
+  els.skinProfilePanel.querySelector(".profile-open-mod-folder")?.addEventListener("click", async () => {
+    const skinId = getFullSkinIdForStorage(skin);
+    if (!skinId) {
+      if (els.customModsLabel) els.customModsLabel.textContent = "No pude resolver el ID de skin para crear la carpeta.";
+      return;
+    }
+    const result = await window.riftAtlas.openCustomSkinModFolder?.(skinId);
+    if (els.customModsLabel) {
+      els.customModsLabel.textContent = `Carpeta lista: ${result?.folderPath || `mods/skins/${skinId}`}`;
+    }
+  });
+};
+
+const closeSkinMetadataModal = () => {
+  if (els.skinMetadataModal) els.skinMetadataModal.hidden = true;
+};
+
+const openSkinMetadataModal = (key = "") => {
+  const skin = getSkinByKey(key);
+  if (!skin || !els.skinMetadataModal) return;
+  const meta = state.skinMetadata[key] || {};
+  els.metadataSkinKeyInput.value = key;
+  els.metadataNameInput.value = meta.name || skin.skin || skin.name || "";
+  els.metadataChampionInput.value = meta.champion || skin.champion || "";
+  els.metadataBaseInput.value = meta.baseSkin || skin.targetBaseSkin || "";
+  els.metadataAuthorInput.value = meta.author || skin.author || "";
+  els.metadataVersionInput.value = meta.version || skin.version || "";
+  els.metadataPreviewInput.value = meta.preview || skin.previewUrl || skin.imageUrl || "";
+  els.skinMetadataModal.hidden = false;
+};
+
+const inferPreviewForSkin = async (skin = {}) => {
+  const inferred = getSkinLoadingImage({ ...skin, previewUrl: "", imageUrl: "" }) ||
+    getSkinDefaultLoadingImage(skin) ||
+    getSkinDefaultSplashImage(skin);
+  if (!inferred) return "";
+  try {
+    const cached = await window.riftAtlas.cachePreview?.({ key: getSkinKey(skin), source: inferred });
+    return cached?.previewUrl || inferred;
+  } catch {
+    return inferred;
+  }
+};
+
+const saveMetadataForm = async () => {
+  const key = els.metadataSkinKeyInput?.value || "";
+  const skin = getSkinByKey(key);
+  if (!key || !skin) return;
+  const preview = els.metadataPreviewInput.value.trim();
+  state.skinMetadata[key] = {
+    name: els.metadataNameInput.value.trim(),
+    champion: els.metadataChampionInput.value.trim(),
+    baseSkin: els.metadataBaseInput.value.trim(),
+    author: els.metadataAuthorInput.value.trim(),
+    version: els.metadataVersionInput.value.trim(),
+    preview,
+    previewInferred: !preview,
+    updatedAt: new Date().toISOString()
+  };
+  saveSkinMetadata();
+  closeSkinMetadataModal();
+  renderSkinChampionOptions();
+  renderSkinLibrary();
+  renderCustomMods();
+  renderSkinProfile();
+  sendPenguSkinCatalog("metadata-updated");
+  if (roseAuthoritativeSelection.skinKey === key) {
+    publishCustomModState(getSkinByKey(key), roseAuthoritativeSelection.payload || {}, { force: true });
+  }
 };
 
 const getSelectionName = (items = []) => {
   if (!items.length) return "Seleccion vacia";
   const first = items[0];
-  if (items.length === 1) return first.skin || first.name || "1 mod";
-  return `${first.skin || first.name || "Mod"} + ${items.length - 1} mas`;
+  if (items.length === 1) return getSkinVisibleName(first) || "1 mod";
+  return `${getSkinVisibleName(first) || "Mod"} + ${items.length - 1} mas`;
 };
 
 let partyPeer = null;
 let partyConnections = new Map();
 let partyIsHost = false;
 let partyTransferSeq = 0;
-const PARTY_CHUNK_SIZE = 256 * 1024;
+const PARTY_CHUNK_SIZE = 64 * 1024;
 const PARTY_CHUNK_ACK_TIMEOUT_MS = 15000;
 const PARTY_CHUNK_MAX_ATTEMPTS = 3;
 const PARTY_AUTO_REQUEST_DELAY_MS = 450;
+const PARTY_UPLOAD_BYTES_PER_SECOND = 96 * 1024;
+const PARTY_UPLOAD_GAP_MS = 120;
 const partyIncomingTransfers = new Map();
 const partyTransferControls = new Map();
 const partyRequestedHashes = new Set();
@@ -1213,10 +3735,174 @@ let partySyncTimer = null;
 let penguAutoConnectInFlight = false;
 let penguAutoConnectTimer = null;
 let penguLastAutoConnectKey = "";
+let partyOwnToken = "";
+let partyOwnRoomId = "";
+let partyOwnKey = "";
+let partyOwnSummonerId = 0;
 
 const isPartyConnected = () => state.partyStatus === "connected";
 
 const getPartyDisplayName = () => els.partyNameInput?.value.trim() || localStorage.getItem("riftAtlas:partyName") || "Rift Atlas";
+
+const PARTY_TOKEN_PREFIX = "ROSE:";
+const PARTY_TOKEN_VERSION = 2;
+const PARTY_TOKEN_EXPIRY_SECONDS = 60 * 60;
+const partyTextEncoder = new TextEncoder();
+const partyTextDecoder = new TextDecoder();
+
+const partyBase64UrlEncode = (value) => {
+  const bytes = value instanceof Uint8Array ? value : partyTextEncoder.encode(String(value));
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+};
+
+const partyBase64UrlDecodeToBytes = (value = "") => {
+  const text = String(value || "");
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(text.length / 4) * 4, "=");
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+};
+
+const partyBase64UrlDecodeText = (value = "") => partyTextDecoder.decode(partyBase64UrlDecodeToBytes(value));
+
+const bytesToHex = (bytes) => [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+
+const randomPartyKeyBytes = () => {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return bytes;
+};
+
+const partyDeflateBytes = async (bytes) => {
+  if (typeof CompressionStream === "undefined") throw new Error("Este WebView no soporta compresion de tokens Rose.");
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+};
+
+const partyInflateBytes = async (bytes) => {
+  if (typeof DecompressionStream === "undefined") throw new Error("Este WebView no soporta tokens Rose comprimidos.");
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+};
+
+const setUint64BigEndian = (view, offset, value) => {
+  if (typeof view.setBigUint64 === "function") {
+    view.setBigUint64(offset, BigInt(value));
+    return;
+  }
+  const high = Math.floor(value / 0x100000000);
+  const low = value >>> 0;
+  view.setUint32(offset, high);
+  view.setUint32(offset + 4, low);
+};
+
+const getUint64BigEndian = (view, offset) => {
+  if (typeof view.getBigUint64 === "function") return Number(view.getBigUint64(offset));
+  return view.getUint32(offset) * 0x100000000 + view.getUint32(offset + 4);
+};
+
+const getStablePartySummonerId = () => {
+  const saved = Number(localStorage.getItem("riftAtlas:partySummonerId") || 0);
+  if (Number.isSafeInteger(saved) && saved > 0) return saved;
+  const bytes = new Uint32Array(2);
+  crypto.getRandomValues(bytes);
+  const generated = Number((BigInt(bytes[0]) << 21n) ^ BigInt(bytes[1] & 0x1fffff));
+  const id = Math.max(1, generated);
+  localStorage.setItem("riftAtlas:partySummonerId", String(id));
+  return id;
+};
+
+const getLocalPartyId = () => partyPeer?.id || String(partyOwnSummonerId || getStablePartySummonerId());
+
+const computeRosePartyRoomKey = async (summonerId, key) => {
+  const keyBytes = key instanceof Uint8Array ? key : partyBase64UrlDecodeToBytes(key);
+  const idBytes = partyTextEncoder.encode(String(summonerId));
+  const raw = new Uint8Array(idBytes.length + keyBytes.length);
+  raw.set(idBytes, 0);
+  raw.set(keyBytes, idBytes.length);
+  const digest = await crypto.subtle.digest("SHA-256", raw);
+  return bytesToHex(new Uint8Array(digest)).slice(0, 32);
+};
+
+const createRosePartyToken = async () => {
+  const summonerId = getStablePartySummonerId();
+  const keyBytes = randomPartyKeyBytes();
+  const timestamp = Math.floor(Date.now() / 1000);
+  const tokenData = new Uint8Array(45);
+  const view = new DataView(tokenData.buffer);
+  view.setUint8(0, PARTY_TOKEN_VERSION);
+  view.setUint32(1, timestamp);
+  setUint64BigEndian(view, 5, summonerId);
+  tokenData.set(keyBytes, 13);
+  const token = `${PARTY_TOKEN_PREFIX}${partyBase64UrlEncode(await partyDeflateBytes(tokenData))}`;
+  const key = partyBase64UrlEncode(keyBytes);
+  const roomId = await computeRosePartyRoomKey(summonerId, keyBytes);
+  return { token, roomId, summonerId, key };
+};
+
+const decodeRosePartyToken = async (token = "") => {
+  const rawToken = String(token || "").trim().replace(/\s+/g, "");
+  if (!rawToken.toUpperCase().startsWith(PARTY_TOKEN_PREFIX)) return null;
+  const encodedPayload = rawToken.slice(PARTY_TOKEN_PREFIX.length);
+  try {
+    const data = await partyInflateBytes(partyBase64UrlDecodeToBytes(encodedPayload));
+    if (data.length < 45) throw new Error("Token data too short");
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const version = view.getUint8(0);
+    let timestamp = 0;
+    let summonerId = 0;
+    let keyBytes = null;
+    if (version === 1) {
+      if (data.length < 57) throw new Error("Token data too short");
+      timestamp = view.getUint32(1);
+      summonerId = getUint64BigEndian(view, 5);
+      keyBytes = data.slice(25, 57);
+    } else if (version === PARTY_TOKEN_VERSION) {
+      timestamp = view.getUint32(1);
+      summonerId = getUint64BigEndian(view, 5);
+      keyBytes = data.slice(13, 45);
+    } else {
+      throw new Error("Version no soportada.");
+    }
+    if ((Date.now() / 1000) > timestamp + PARTY_TOKEN_EXPIRY_SECONDS) {
+      throw new Error("Token expirado. Pedi uno nuevo.");
+    }
+    const key = partyBase64UrlEncode(keyBytes);
+    return {
+      token: rawToken,
+      roomId: await computeRosePartyRoomKey(summonerId, keyBytes),
+      summonerId,
+      key
+    };
+  } catch (binaryError) {
+    if (binaryError?.message === "Token expirado. Pedi uno nuevo.") throw binaryError;
+  }
+  let data;
+  try {
+    data = JSON.parse(partyBase64UrlDecodeText(encodedPayload));
+  } catch {
+    throw new Error("Token invalido.");
+  }
+  const version = Number(data.v || 0);
+  const timestamp = Number(data.t || 0);
+  const summonerId = Number(data.s || 0);
+  const key = String(data.k || "");
+  if (version !== PARTY_TOKEN_VERSION || !timestamp || !summonerId || !key) {
+    throw new Error("Token invalido.");
+  }
+  if ((Date.now() / 1000) > timestamp + PARTY_TOKEN_EXPIRY_SECONDS) {
+    throw new Error("Token expirado. Pedi uno nuevo.");
+  }
+  return {
+    token: rawToken,
+    roomId: await computeRosePartyRoomKey(summonerId, key),
+    summonerId,
+    key
+  };
+};
 
 const generatePartyRoomId = () => {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -1238,6 +3924,65 @@ const hashPenguPartyRoom = (value = "") => {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36).toUpperCase().padStart(6, "0");
+};
+
+const getPenguPartyNumericId = (value = "") => {
+  let hash = 2166136261;
+  const text = String(value || "local");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+};
+
+let penguPartyStateBroadcastTimer = null;
+
+const getPenguPartySkinSelection = (member = {}) => {
+  const firstSkin = (member.activeSkins || [])[0];
+  if (!firstSkin) return null;
+  return {
+    champion_id: Number(firstSkin.championId || firstSkin.rawChampion || 0),
+    skin_id: Number(firstSkin.skinId || firstSkin.id || 0),
+    chroma_id: Number(firstSkin.chromaId || 0) || null,
+    skin_name: firstSkin.name || firstSkin.fileName || firstSkin.skin || ""
+  };
+};
+
+const getPenguPartyStatePayload = () => {
+  const connected = ["connected", "connecting"].includes(state.partyStatus);
+  const localId = getLocalPartyId();
+  const localMemberId = partyOwnSummonerId || getStablePartySummonerId();
+  return {
+    source: "rift-atlas-app",
+    type: "party-state",
+    enabled: connected,
+    my_token: partyOwnToken || state.partyLink || "",
+    my_summoner_id: localMemberId,
+    my_summoner_name: getPartyDisplayName(),
+    peers: getAllPartyMembers()
+      .filter((member) => member.id && member.id !== localId)
+      .map((member) => ({
+        summoner_id: getPenguPartyNumericId(member.id),
+        summoner_name: member.name || "Jugador",
+        connected: Boolean(member.connected),
+        connection_state: member.connected ? "connected" : "disconnected",
+        in_lobby: true,
+        skin_selection: getPenguPartySkinSelection(member)
+      }))
+  };
+};
+
+const broadcastPenguPartyState = () => {
+  window.riftAtlas.sendPenguMessage?.(getPenguPartyStatePayload()).catch(() => null);
+};
+
+const schedulePenguPartyStateBroadcast = (delay = 100) => {
+  clearTimeout(penguPartyStateBroadcastTimer);
+  penguPartyStateBroadcastTimer = setTimeout(() => {
+    penguPartyStateBroadcastTimer = null;
+    broadcastPenguPartyState();
+  }, delay);
 };
 
 const getPenguLobbyMembers = (payload = state.penguLobby || {}) =>
@@ -1299,13 +4044,16 @@ const schedulePenguAutoParty = (delay = 700) => {
 };
 
 function getMissingRemotePartyFiles() {
-  if (state.partyStatus !== "connected" || !state.partyRoom || !partyPeer) return [];
+  if (state.partyStatus !== "connected" || !state.partyRoom) return [];
+  const localId = getLocalPartyId();
   const missingByKey = new Map();
   getAllPartyMembers()
-    .filter((member) => member.id !== partyPeer.id)
+    .filter((member) => member.id !== localId)
     .flatMap((member) => (member.activeSkins || []).map((file) => ({ ...file, ownerId: member.id, ownerName: member.name || "Jugador" })))
     .forEach((file) => {
       const key = getPartyTransferKey(file);
+      const current = partyTransferStatus.get(key);
+      if (["sin-local", "error", "cancelado"].includes(current?.status)) return;
       if (!key || getLocalPartyFile(file)) return;
       missingByKey.set(key, file);
     });
@@ -1314,26 +4062,48 @@ function getMissingRemotePartyFiles() {
 
 const getPartySkinFiles = () => {
   const syncedLocalKeys = new Set(partySyncedQueuedSkins.values());
-  return [...state.queuedSkins]
+  const canonicalKey = roseAuthoritativeSelection.skinKey && getSkinByKey(roseAuthoritativeSelection.skinKey)
+    ? roseAuthoritativeSelection.skinKey
+    : "";
+  const keys = [
+    canonicalKey,
+    ...state.queuedSkins
+  ].filter(Boolean);
+  return [...new Set(keys)]
     .filter((key) => !syncedLocalKeys.has(key))
     .map(getSkinByKey)
     .filter(Boolean)
-    .map((skin) => ({
-      key: getSkinKey(skin),
-      name: skin.skin || skin.name || "Mod",
-      champion: skin.champion || "Mod propio",
-      fileName: String(skin.relativePath || skin.path || skin.name || "archivo").split(/[\\/]/).pop(),
-      size: skin.size || 0,
-      source: skin.custom ? "Mod propio" : "LeagueSkins",
-      localPath: skin.path || "",
-      extension: skin.extension || "",
-      mtimeMs: skin.mtimeMs || 0
-    }));
+    .map((skin) => {
+      const championId = getSkinSyncChampionNumber(skin);
+      const skinId = getOverlayTargetSkinId(skin, championId);
+      const isCustom = Boolean(skin.custom && !isDownloadedLeagueSkinsPath(getSkinKey(skin)));
+      return {
+        key: getSkinKey(skin),
+        name: getSkinVisibleName(skin),
+        champion: skin.champion || "Mod propio",
+        championId,
+        skinId,
+        champion_id: championId,
+        skin_id: skinId,
+        isCustom,
+        is_custom: isCustom,
+        fileName: String(skin.relativePath || skin.path || skin.name || "archivo").split(/[\\/]/).pop(),
+        size: skin.size || 0,
+        source: isCustom ? "Custom local" : "LeagueSkins",
+        localPath: skin.path || "",
+        extension: skin.extension || "",
+        mtimeMs: skin.mtimeMs || 0
+      };
+    });
 };
 
 const getPartySharedKeys = () => {
   const syncedLocalKeys = new Set(partySyncedQueuedSkins.values());
-  return [...state.queuedSkins].filter((key) => !syncedLocalKeys.has(key) && Boolean(getSkinByKey(key)));
+  const canonicalKey = roseAuthoritativeSelection.skinKey && getSkinByKey(roseAuthoritativeSelection.skinKey)
+    ? roseAuthoritativeSelection.skinKey
+    : "";
+  return [...new Set([canonicalKey, ...state.queuedSkins])]
+    .filter((key) => key && !syncedLocalKeys.has(key) && Boolean(getSkinByKey(key)));
 };
 
 const getPartyApplyKeys = () => {
@@ -1343,25 +4113,64 @@ const getPartyApplyKeys = () => {
     if (activeRemoteKeys.has(remoteKey) && getSkinByKey(localKey)) keys.add(localKey);
   });
   getAllPartyFiles()
-    .filter((file) => file.ownerId !== partyPeer?.id)
+    .filter((file) => file.ownerId !== getLocalPartyId())
     .forEach((file) => {
       const localFile = getLocalPartyFile(file);
       if (localFile?.path) keys.add(localFile.path);
-    });
+  });
   return [...keys];
 };
 
+const getPartyPeerExtraMods = () => {
+  if (state.partyStatus !== "connected") return [];
+  const localId = getLocalPartyId();
+  const seen = new Set();
+  return getAllPartyFiles()
+    .filter((file) => file.ownerId !== localId)
+    .map((file) => {
+      const localFile = getLocalPartyFile(file);
+      const localPath = localFile?.path || "";
+      if (!localPath) return null;
+      const normalized = localPath.replace(/\//g, "\\").toLowerCase();
+      if (seen.has(normalized)) return null;
+      seen.add(normalized);
+      return {
+        path: localPath,
+        name: `${file.ownerName || "Party"} - ${file.name || file.fileName || localFile.skin || localFile.name || "skin"}`,
+        category: "party",
+        champion: file.champion || localFile.champion || "",
+        skin: file.name || file.fileName || localFile.skin || localFile.name || ""
+      };
+    })
+    .filter(Boolean);
+};
+
+const getShortPartyHash = (hash = "") => String(hash || "").slice(0, 16);
+
 const getPartySkinFilesWithInfo = async () =>
   Promise.all(getPartySkinFiles().map(async (skin) => {
+    if (!skin.isCustom) {
+      return {
+        ...skin,
+        key: `league:${skin.championId || 0}:${skin.skinId || 0}`,
+        hash: "",
+        custom_mod_hash: "",
+        is_custom: false,
+        isCustom: false
+      };
+    }
+
     try {
       const cacheKey = `${skin.localPath}|${skin.size || 0}|${skin.mtimeMs || 0}`;
       const cached = partyFileInfoCache.get(cacheKey);
       if (cached) {
-        return { ...skin, fileName: cached.fileName, size: cached.size, hash: cached.hash, mimeType: cached.mimeType };
+        const shortHash = getShortPartyHash(cached.hash);
+        return { ...skin, fileName: cached.fileName, size: cached.size, hash: shortHash, custom_mod_hash: shortHash, mimeType: cached.mimeType };
       }
       const info = await window.riftAtlas.getPartyFileInfo(skin.localPath);
       partyFileInfoCache.set(cacheKey, info);
-      return { ...skin, fileName: info.fileName, size: info.size, hash: info.hash, mimeType: info.mimeType };
+      const shortHash = getShortPartyHash(info.hash);
+      return { ...skin, fileName: info.fileName, size: info.size, hash: shortHash, custom_mod_hash: shortHash, mimeType: info.mimeType };
     } catch (error) {
       setPartyTransferStatus(getPartyTransferKey(skin), {
         fileName: skin.fileName || skin.name,
@@ -1372,35 +4181,64 @@ const getPartySkinFilesWithInfo = async () =>
       return { ...skin, unavailable: true, error: error.message };
     }
   }))
-    .then((skins) => skins.filter((skin) => !skin.unavailable && skin.hash));
+    .then((skins) => skins.filter((skin) => !skin.unavailable && (!skin.isCustom || skin.hash)));
 
-const getPartyTransferKey = (skin = {}, fallback = "") => skin.hash || skin.key || skin.fileName || fallback;
+const getPartyTransferKey = (skin = {}, fallback = "") =>
+  skin.hash ||
+  skin.custom_mod_hash ||
+  (skin.skinId || skin.skin_id ? `league:${skin.championId || skin.champion_id || 0}:${skin.skinId || skin.skin_id || 0}` : "") ||
+  skin.key ||
+  skin.fileName ||
+  fallback;
 
-const getLocalPartyFile = (remoteSkin = {}) =>
-  [...state.customMods, ...state.skinLibrary].find((skin) => {
-    const sameHash = remoteSkin.hash && skin.partyHash === remoteSkin.hash;
-    const sameName = !remoteSkin.hash && remoteSkin.fileName && String(skin.path || "").endsWith(remoteSkin.fileName);
-    const sameKey = remoteSkin.key && getSkinKey(skin) === remoteSkin.key;
-    const sameSize = !remoteSkin.size || !skin.size || Number(skin.size) === Number(remoteSkin.size);
-    return sameHash || sameKey || (sameName && sameSize);
+const findLocalLeagueSkinForParty = (remoteSkin = {}) => {
+  const remoteChampionId = Number(remoteSkin.championId || remoteSkin.champion_id || 0);
+  const remoteSkinId = Number(remoteSkin.skinId || remoteSkin.skin_id || 0);
+  if (!remoteSkinId) return null;
+  const championMatches = state.skinLibrary.filter((skin) => {
+    const championId = getSkinSyncChampionNumber(skin);
+    return !remoteChampionId || !championId || championId === remoteChampionId;
   });
+  // Party shares the full numeric League skin/chroma ID. Prefer the actual
+  // package target; broad candidate matching can otherwise select a sibling
+  // chroma because every entry also carries its common base ID.
+  const local = championMatches.find((skin) =>
+    getOverlayTargetSkinId(skin, remoteChampionId || getSkinSyncChampionNumber(skin)) === remoteSkinId
+  ) || championMatches.find((skin) =>
+    Number(skin.fileBaseId || skin.skinId || 0) === remoteSkinId
+  );
+  return local ? applySkinMetadata(local) : null;
+};
+
+const getLocalPartyFile = (remoteSkin = {}) => {
+  const remoteHash = getShortPartyHash(remoteSkin.hash || remoteSkin.custom_mod_hash);
+  if (!remoteSkin.isCustom && !remoteSkin.is_custom) {
+    const localLeagueSkin = findLocalLeagueSkinForParty(remoteSkin);
+    if (localLeagueSkin) return localLeagueSkin;
+  }
+
+  return state.customMods.find((skin) => {
+    const sameHash = remoteHash && skin.partyHash === remoteHash;
+    const sameKey = remoteSkin.key && getSkinKey(skin) === remoteSkin.key;
+    return sameHash || sameKey;
+  });
+};
 
 const findLocalPartyFileByHash = async (remoteSkin = {}) => {
-  if (!remoteSkin.hash) return getLocalPartyFile(remoteSkin);
-  const localByKnownHash = getLocalPartyFile(remoteSkin);
-  if (localByKnownHash?.partyHash === remoteSkin.hash) return localByKnownHash;
+  if (!remoteSkin.isCustom && !remoteSkin.is_custom) return findLocalLeagueSkinForParty(remoteSkin);
 
-  const candidates = [...state.customMods, ...state.skinLibrary].filter((skin) => {
-    const sameName = remoteSkin.fileName && String(skin.path || "").endsWith(remoteSkin.fileName);
-    const sameSize = !remoteSkin.size || !skin.size || Number(skin.size) === Number(remoteSkin.size);
-    return skin.path && sameName && sameSize;
-  });
+  const remoteHash = getShortPartyHash(remoteSkin.hash || remoteSkin.custom_mod_hash);
+  if (!remoteHash) return getLocalPartyFile(remoteSkin);
+  const localByKnownHash = getLocalPartyFile(remoteSkin);
+  if (localByKnownHash?.partyHash === remoteHash) return localByKnownHash;
+
+  const candidates = state.customMods.filter((skin) => skin.path);
 
   for (const candidate of candidates) {
     try {
       const info = await window.riftAtlas.getPartyFileInfo(candidate.path);
-      if (info.hash === remoteSkin.hash) {
-        candidate.partyHash = remoteSkin.hash;
+      if (getShortPartyHash(info.hash) === remoteHash) {
+        candidate.partyHash = remoteHash;
         return candidate;
       }
     } catch {
@@ -1414,7 +4252,8 @@ const findLocalPartyFileByHash = async (remoteSkin = {}) => {
 const queueLocalPartyFile = (localFile, remoteSkin = {}) => {
   const key = getSkinKey(localFile);
   if (!key) return false;
-  if (remoteSkin.hash) localFile.partyHash = remoteSkin.hash;
+  const remoteHash = getShortPartyHash(remoteSkin.hash || remoteSkin.custom_mod_hash);
+  if (remoteHash) localFile.partyHash = remoteHash;
   const alreadyQueued = state.queuedSkins.has(key);
   if (alreadyQueued) return true;
   trackPartySyncedQueue(remoteSkin, key);
@@ -1469,11 +4308,11 @@ const getLocalPartyReadyState = () => {
 };
 
 const getLocalPartyMember = () => ({
-  id: partyPeer?.id || "local",
+  id: getLocalPartyId(),
   name: getPartyDisplayName(),
   activeSkins: getPartySkinFiles(),
   isHost: partyIsHost,
-  connected: Boolean(partyPeer),
+  connected: state.partyStatus === "connected",
   ready: getLocalPartyReadyState().ready,
   pendingTransfers: getLocalPartyReadyState().pending
 });
@@ -1494,7 +4333,7 @@ const getAllPartyMembers = () => {
 const getRemotePartyTransferKeys = () =>
   new Set(
     getAllPartyMembers()
-      .filter((member) => member.id !== partyPeer?.id)
+      .filter((member) => member.id !== getLocalPartyId())
       .flatMap((member) => member.activeSkins || [])
       .map((file) => getPartyTransferKey(file))
       .filter(Boolean)
@@ -1573,9 +4412,9 @@ const hasLocalPartyFile = (remoteSkin = {}) => {
 };
 
 const sendPartyReadyUpdate = () => {
-  if (!partyPeer || state.partyStatus !== "connected") return;
+  if (state.partyStatus !== "connected") return;
   const readyState = getLocalPartyReadyState();
-  updatePartyMemberReady(partyPeer.id, readyState);
+  updatePartyMemberReady(getLocalPartyId(), readyState);
   partyConnections.forEach((connection) => {
     if (connection.open) {
       connection.send({ type: "ready-update", data: readyState });
@@ -1623,12 +4462,50 @@ const getPartyTransferControl = (transferId) => {
   return partyTransferControls.get(transferId);
 };
 
-const waitForPartyTransferResume = async (transferId) => {
+const isLeagueInProgress = () => state.penguGameflowPhase === "InProgress";
+
+const pausePartyTransfersForGame = () => {
+  partyTransferControls.forEach((control) => {
+    control.paused = true;
+  });
+  partyTransferStatus.forEach((transfer, key) => {
+    if (!["solicitando", "recibiendo", "descargando", "enviando", "pendiente"].includes(transfer.status)) return;
+    setPartyTransferStatus(key, {
+      status: "pausado",
+      error: "Pausado mientras estas en partida para no subir el ping."
+    });
+  });
+};
+
+const resumePartyTransfersAfterGame = () => {
+  partyTransferControls.forEach((control) => {
+    control.paused = false;
+  });
+  if (state.partyStatus === "connected") {
+    schedulePartySync(750);
+    setTimeout(() => requestMissingRoomFiles(), 1000);
+  }
+};
+
+const waitForPartyNetworkWindow = async (transferId) => {
   const control = getPartyTransferControl(transferId);
-  while (control?.paused && !control.canceled) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
+  while (!control?.canceled && (control?.paused || isLeagueInProgress())) {
+    await new Promise((resolve) => setTimeout(resolve, isLeagueInProgress() ? 1000 : 250));
   }
   if (control?.canceled) throw new Error("Transferencia cancelada.");
+};
+
+const throttlePartyUpload = async (bytesSent, startedAt) => {
+  const minElapsed = (bytesSent / PARTY_UPLOAD_BYTES_PER_SECOND) * 1000;
+  const elapsed = Date.now() - startedAt;
+  const waitMs = Math.max(PARTY_UPLOAD_GAP_MS, minElapsed - elapsed);
+  if (waitMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+};
+
+const waitForPartyTransferResume = async (transferId) => {
+  await waitForPartyNetworkWindow(transferId);
 };
 
 const sendPartyTransferControlMessage = (transfer = {}, type) => {
@@ -1685,7 +4562,7 @@ const findPartyFileByKey = (key = "") =>
   getAllPartyFiles().find((file) => getPartyTransferKey(file) === key || file.key === key || file.fileName === key);
 
 const relayPartyFileMessage = (targetPeerId, sourcePeerId, message = {}) => {
-  if (!partyIsHost || !targetPeerId || targetPeerId === partyPeer?.id) return false;
+  if (!partyIsHost || !targetPeerId || targetPeerId === getLocalPartyId()) return false;
   const targetConnection = partyConnections.get(targetPeerId);
   if (!targetConnection?.open) return false;
   const { targetPeerId: _targetPeerId, ...forwarded } = message;
@@ -1719,17 +4596,26 @@ const sendPartyFile = async (connection, transferId, skin = {}, relayPeerId = ""
     });
     connection.send({ type: "file-accept", id: transferId, metadata: info, skin, relayPeerId });
     const totalChunks = Math.ceil(info.size / PARTY_CHUNK_SIZE);
+    const uploadStartedAt = Date.now();
+    let uploadedBytes = 0;
     for (let sequence = 0; sequence < totalChunks; sequence += 1) {
-      await waitForPartyTransferResume(transferId);
+      if (isLeagueInProgress()) {
+        setPartyTransferStatus(transferKey, {
+          status: "pausado",
+          error: "Pausado mientras estas en partida para no subir el ping."
+        });
+      }
+      await waitForPartyNetworkWindow(transferId);
       const data = await window.riftAtlas.readPartyFileChunk({
         filePath: localPath,
         offset: sequence * PARTY_CHUNK_SIZE,
         length: PARTY_CHUNK_SIZE
       });
       for (let attempt = 1; attempt <= PARTY_CHUNK_MAX_ATTEMPTS; attempt += 1) {
-        await waitForPartyTransferResume(transferId);
+        await waitForPartyNetworkWindow(transferId);
         const ackPromise = waitForPartyChunkAck(connection.peer, transferId, sequence);
         connection.send({ type: "file-chunk", id: transferId, sequence, totalChunks, data, relayPeerId });
+        uploadedBytes += data?.byteLength || data?.length || PARTY_CHUNK_SIZE;
         setPartyTransferStatus(transferKey, {
           status: "enviando",
           progress: Math.round(((sequence + 1) / Math.max(totalChunks, 1)) * 100),
@@ -1743,6 +4629,7 @@ const sendPartyFile = async (connection, transferId, skin = {}, relayPeerId = ""
           await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
         }
       }
+      await throttlePartyUpload(uploadedBytes, uploadStartedAt);
     }
     connection.send({ type: "file-complete", id: transferId, relayPeerId });
     setPartyTransferStatus(transferKey, { status: "enviado", progress: 100 });
@@ -1756,9 +4643,8 @@ const sendPartyFile = async (connection, transferId, skin = {}, relayPeerId = ""
 };
 
 const requestPartyFile = async (peerId, skin = {}) => {
-  if (await ensurePartySkinSelectedLocally(skin)) return;
   const transferKey = getPartyTransferKey(skin);
-  if (hasLocalPartyFile(skin)) {
+  if (await ensurePartySkinSelectedLocally(skin) || hasLocalPartyFile(skin)) {
     setPartyTransferStatus(transferKey, {
       fileName: skin.fileName || skin.name,
       champion: skin.champion || "",
@@ -1768,53 +4654,21 @@ const requestPartyFile = async (peerId, skin = {}) => {
     });
     return;
   }
-  if (!skin.hash) {
-    setPartyTransferStatus(transferKey, {
-      fileName: skin.fileName || skin.name,
-      champion: skin.champion || "",
-      owner: skin.ownerName || peerId,
-      status: "error",
-      error: "El archivo remoto no publico hash; no se puede pedir."
-    });
-    return;
-  }
-  const current = partyTransferStatus.get(transferKey);
-  if (["solicitando", "recibiendo", "descargando"].includes(current?.status)) return;
-  const connection = partyConnections.get(peerId) ||
-    [...partyConnections.values()].find((candidate) => candidate.open);
-  if (!connection?.open) {
-    setPartyTransferStatus(transferKey, {
-      fileName: skin.fileName || skin.name,
-      champion: skin.champion || "",
-      owner: skin.ownerName || peerId,
-      status: "error",
-      error: `No hay conexion abierta con ${skin.ownerName || peerId || "el duenio"}.`
-    });
-    return;
-  }
-  partyRequestedHashes.add(skin.hash);
-  const targetPeerId = connection.peer === peerId ? "" : peerId;
-  const transferId = `transfer-${Date.now()}-${partyTransferSeq += 1}`;
-  connection.send({
-    type: "file-request",
-    id: transferId,
-    skin,
-    targetPeerId
-  });
+
   setPartyTransferStatus(transferKey, {
     fileName: skin.fileName || skin.name,
     champion: skin.champion || "",
     owner: skin.ownerName || peerId,
-    status: "solicitando",
+    status: "sin-local",
     progress: 0,
-    transferId,
-    peerId: connection.peer,
-    direction: "download",
-    hash: skin.hash,
-    skin
+    hash: getShortPartyHash(skin.hash || skin.custom_mod_hash),
+    skin,
+    error: skin.isCustom || skin.is_custom
+      ? "Custom mod no encontrado localmente. Rift Atlas no transfiere archivos por PartyMode."
+      : "Skin de LeagueSkins no encontrada localmente. Sincroniza LeagueSkins."
   });
   if (els.partyConnectionLabel) {
-    els.partyConnectionLabel.textContent = `conectado, descargando P2P: ${skin.fileName || skin.name}`;
+    els.partyConnectionLabel.textContent = `Party: ${skin.fileName || skin.name} no esta disponible localmente.`;
   }
 };
 
@@ -1843,7 +4697,7 @@ const requestMissingPartyFiles = (peerId, skins = []) => {
   skins.forEach((skin, index) => {
     const transferKey = getPartyTransferKey(skin);
     const current = partyTransferStatus.get(transferKey);
-    if (["pendiente", "solicitando", "recibiendo", "descargando", "local", "pausado", "cancelado", "error"].includes(current?.status)) return;
+    if (["pendiente", "local", "sin-local", "cancelado", "error"].includes(current?.status)) return;
     setPartyTransferStatus(transferKey, {
       fileName: skin.fileName || skin.name,
       champion: skin.champion || "",
@@ -1862,15 +4716,25 @@ const requestMissingPartyFiles = (peerId, skins = []) => {
 };
 
 const requestMissingRoomFiles = () => {
-  if (!state.partyRoom || !partyPeer) return;
+  if (!state.partyRoom) return;
+  const localId = getLocalPartyId();
   getAllPartyMembers()
-    .filter((member) => member.id !== partyPeer.id)
+    .filter((member) => member.id !== localId)
     .forEach((member) => requestMissingPartyFiles(member.id, member.activeSkins || []));
 };
 
 const handlePartyFileMessage = async (peerId, message = {}) => {
   const connection = partyConnections.get(peerId);
   if (!connection) return true;
+  if (message.type === "file-request") {
+    connection.send({
+      type: "file-error",
+      id: message.id,
+      skin: message.skin,
+      error: "Rift Atlas PartyMode no transfiere archivos; usa LeagueSkins local o el mismo custom mod instalado."
+    });
+    return true;
+  }
   if (message.relayPeerId && partyIsHost) {
     if (relayPartyFileMessage(message.relayPeerId, peerId, message)) return true;
     connection.send({
@@ -1885,7 +4749,7 @@ const handlePartyFileMessage = async (peerId, message = {}) => {
     if (message.targetPeerId && relayPartyFileMessage(message.targetPeerId, peerId, message)) {
       return true;
     }
-    if (message.targetPeerId && message.targetPeerId !== partyPeer?.id) {
+    if (message.targetPeerId && message.targetPeerId !== getLocalPartyId()) {
       connection.send({
         type: "file-error",
         id: message.id,
@@ -2058,7 +4922,7 @@ const renderPartyFileProfile = () => {
   const localFile = getLocalPartyFile(selected);
   const transfer = partyTransferStatus.get(getPartyTransferKey(selected));
   const status = localFile ? "Disponible local" : transfer?.status || "Pendiente";
-  const isOwnPartyFile = selected.ownerId === partyPeer?.id;
+  const isOwnPartyFile = selected.ownerId === getLocalPartyId();
   const selectableKey = isOwnPartyFile ? (localFile?.path || selected.key || "") : "";
   const canSelect = Boolean(isOwnPartyFile && selectableKey);
   const isSelected = Boolean(selectableKey && state.queuedSkins.has(selectableKey));
@@ -2111,10 +4975,6 @@ const renderSkinsP2PSection = () => {
   if (els.skinsP2PLabel) {
     els.skinsP2PLabel.textContent = `${uniqueFiles.length} archivo(s) anunciados. ${localCount} local(es), ${pendingCount} pendiente(s).`;
   }
-  if (els.skinsP2PApplyButton) {
-    const readiness = getPartyReadiness();
-    els.skinsP2PApplyButton.disabled = !readiness.allReady || state.importingQueue || getPartyApplyKeys().length === 0;
-  }
 
   if (!uniqueFiles.length) {
     els.skinsP2PList.innerHTML = `
@@ -2129,7 +4989,7 @@ const renderSkinsP2PSection = () => {
   const renderTransferControlButtons = (key, transfer = null, localFile = null) => {
     const status = transfer?.status || "";
     if (localFile) return "";
-    if (["recibiendo", "enviando", "solicitando", "pendiente"].includes(status)) {
+    if (["recibiendo", "enviando", "solicitando"].includes(status)) {
       return `
         <button class="secondary-button skins-p2p-pause" type="button" data-key="${escapeHtml(key)}" ${transfer?.transferId ? "" : "disabled"}>Pausar</button>
         <button class="secondary-button skins-p2p-cancel" type="button" data-key="${escapeHtml(key)}" ${transfer?.transferId ? "" : "disabled"}>Cancelar</button>
@@ -2141,7 +5001,7 @@ const renderSkinsP2PSection = () => {
         <button class="secondary-button skins-p2p-cancel" type="button" data-key="${escapeHtml(key)}">Cancelar</button>
       `;
     }
-    return `<button class="secondary-button skins-p2p-request" type="button" data-key="${escapeHtml(key)}">Pedir</button>`;
+    return `<button class="secondary-button skins-p2p-request" type="button" data-key="${escapeHtml(key)}">Buscar local</button>`;
   };
 
   els.skinsP2PList.innerHTML = uniqueFiles
@@ -2163,7 +5023,7 @@ const renderSkinsP2PSection = () => {
             <span>${escapeHtml(file.hash ? file.hash.slice(0, 10) : "sin hash")}</span>
           </div>
           ${renderTransferControlButtons(key, transfer, localFile)}
-          <button class="docs-link skins-p2p-select" type="button" data-path="${escapeHtml(selectableKey)}" disabled>${localFile ? "Seleccionado" : "Esperando"}</button>
+          <button class="docs-link skins-p2p-select" type="button" data-path="${escapeHtml(selectableKey)}" disabled>${localFile ? "Seleccionado" : "No local"}</button>
         </article>
       `;
     })
@@ -2203,6 +5063,7 @@ const renderSkinsP2PSection = () => {
 const renderParty = () => {
   if (!els.partyStatusPill) return;
   renderPenguBridgeStatus();
+  schedulePenguPartyStateBroadcast();
   const { connected, members, localReady, readyMembers, allReady } = getPartyReadiness();
   const files = getAllPartyFiles();
   els.partyStatusPill.textContent = connected ? (allReady ? "Todos listos" : "Sincronizando") : "Desconectado";
@@ -2213,7 +5074,7 @@ const renderParty = () => {
       : "Desconectado.";
   }
   if (els.partyFilesLabel) {
-    els.partyFilesLabel.textContent = `archivos p2p: ${files.length ? files.map((file) => file.fileName || file.name).join(", ") : "ninguno"}`;
+    els.partyFilesLabel.textContent = `skins party: ${files.length ? files.map((file) => file.fileName || file.name).join(", ") : "ninguna"}`;
   }
   if (els.partyReadySummary) {
     els.partyReadySummary.textContent = connected
@@ -2227,16 +5088,25 @@ const renderParty = () => {
       ? state.overlayRunning
         ? "Deten el overlay activo antes de usar Aplicar party."
         : `${readyMembers}/${members.length} miembro(s) listos. ${state.partyAutoApply ? "Auto-ejecutar esta activado." : "Auto-ejecutar apagado."}`
-      : "Crea o entra a una party para sincronizar archivos.";
+      : "Enable Party Mode para generar tu token.";
   }
   if (els.partyShareLinkLabel) {
-    els.partyShareLinkLabel.textContent = state.partyLink || "Crea una party para generar un link.";
+    const tokenText = state.partyLink || "Enable Party Mode para generar tu token.";
+    if ("value" in els.partyShareLinkLabel) {
+      els.partyShareLinkLabel.value = tokenText;
+    } else {
+      els.partyShareLinkLabel.textContent = tokenText;
+    }
   }
-  if (els.createPartyButton) els.createPartyButton.disabled = connected;
-  if (els.joinPartyButton) els.joinPartyButton.disabled = connected;
+  if (els.createPartyButton) {
+    els.createPartyButton.disabled = state.partyStatus === "connecting";
+    els.createPartyButton.textContent = connected ? "Disable Party Mode" : "Enable Party Mode";
+    els.createPartyButton.classList.toggle("disable", connected);
+  }
+  if (els.joinPartyButton) els.joinPartyButton.disabled = !connected || state.partyStatus === "connecting";
   if (els.leavePartyButton) els.leavePartyButton.disabled = !connected;
   if (els.copyPartyLinkButton) els.copyPartyLinkButton.disabled = !state.partyLink;
-  if (els.applyPartyButton) els.applyPartyButton.disabled = !allReady || state.importingQueue || getPartyApplyKeys().length === 0;
+  if (els.applyPartyButton) els.applyPartyButton.disabled = !allReady || state.importingQueue || (getPartySharedKeys().length === 0 && getPartyPeerExtraMods().length === 0);
   if (els.partyAutoApplyCheckbox) els.partyAutoApplyCheckbox.checked = state.partyAutoApply;
   if (els.partyTransferList) {
     const transfers = [...partyTransferStatus.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 5);
@@ -2248,7 +5118,7 @@ const renderParty = () => {
               <small>${escapeHtml(item.status || "pendiente")}${item.error ? ` - ${escapeHtml(item.error)}` : ""}</small>
             </div>
             <span>${Math.round(item.progress || 0)}%</span>
-            ${["recibiendo", "enviando", "solicitando", "pendiente"].includes(item.status) ? `<button class="secondary-button party-transfer-pause" type="button" data-key="${escapeHtml(item.key)}" ${item.transferId ? "" : "disabled"}>Pausar</button><button class="secondary-button party-transfer-cancel" type="button" data-key="${escapeHtml(item.key)}" ${item.transferId ? "" : "disabled"}>Cancelar</button>` : ""}
+            ${["recibiendo", "enviando", "solicitando"].includes(item.status) ? `<button class="secondary-button party-transfer-pause" type="button" data-key="${escapeHtml(item.key)}" ${item.transferId ? "" : "disabled"}>Pausar</button><button class="secondary-button party-transfer-cancel" type="button" data-key="${escapeHtml(item.key)}" ${item.transferId ? "" : "disabled"}>Cancelar</button>` : ""}
             ${item.status === "pausado" ? `<button class="docs-link party-transfer-resume" type="button" data-key="${escapeHtml(item.key)}">Reanudar</button><button class="secondary-button party-transfer-cancel" type="button" data-key="${escapeHtml(item.key)}">Cancelar</button>` : ""}
           </div>
         `).join("")
@@ -2270,8 +5140,8 @@ const renderParty = () => {
   if (!members.length) {
     els.partyMembersList.innerHTML = `
       <div class="empty-state compact">
-        <h2>Sin party</h2>
-        <p>Crea una sala o entra con un codigo para ver archivos P2P.</p>
+        <h2>No friends connected yet</h2>
+        <p>Enable Party Mode y agrega un token para empezar.</p>
       </div>
     `;
     return;
@@ -2381,11 +5251,11 @@ const attachPartyConnection = (connection) => {
 };
 
 const syncPartySkins = async () => {
-  if (!partyPeer || state.partyStatus !== "connected") return;
+  if (state.partyStatus !== "connected") return;
   partyAutoApplyTriggered = false;
   const skins = await getPartySkinFilesWithInfo();
   if (state.partyRoom) {
-    updatePartyMemberSkins(partyPeer.id, skins);
+    updatePartyMemberSkins(getLocalPartyId(), skins);
     if (partyIsHost) {
       state.partyRoom.host = { ...state.partyRoom.host, activeSkins: skins };
       broadcastPartyRoom();
@@ -2397,18 +5267,19 @@ const syncPartySkins = async () => {
     }
   });
   sendPartyReadyUpdate();
+  broadcastPenguPartyState();
   renderParty();
 };
 
 const clearLocalP2PState = async () => {
   const p2pPaths = new Set(
     state.customMods
-      .filter((mod) => mod.source === "p2p")
+      .filter(isRiftAtlasP2PMod)
       .map((mod) => mod.path)
       .filter(Boolean)
   );
   if (p2pPaths.size) {
-    state.customMods = state.customMods.filter((mod) => mod.source !== "p2p");
+    state.customMods = state.customMods.filter((mod) => !isRiftAtlasP2PMod(mod));
     p2pPaths.forEach((modPath) => state.queuedSkins.delete(modPath));
     saveCustomMods();
     saveQueuedSkins();
@@ -2416,7 +5287,8 @@ const clearLocalP2PState = async () => {
   await window.riftAtlas.clearPartyP2PFiles?.().catch(() => null);
 };
 
-const leaveParty = async () => {
+const leaveParty = async (options = {}) => {
+  const keepRoseToken = Boolean(options.keepRoseToken);
   clearTimeout(partySyncTimer);
   partySyncTimer = null;
   partyConnections.forEach((connection) => connection.close());
@@ -2427,7 +5299,13 @@ const leaveParty = async () => {
   partyPeer = null;
   partyIsHost = false;
   state.partyRoom = null;
-  state.partyLink = "";
+  if (!keepRoseToken) {
+    partyOwnToken = "";
+    partyOwnRoomId = "";
+    partyOwnKey = "";
+    partyOwnSummonerId = 0;
+  }
+  state.partyLink = keepRoseToken ? partyOwnToken : "";
   state.partyStatus = "disconnected";
   state.selectedPartyFile = null;
   partyTransferStatus.clear();
@@ -2447,12 +5325,21 @@ const createParty = async (options = {}) => {
   if (!window.Peer) {
     throw new Error("PeerJS no esta cargado.");
   }
-  if (!options.roomId) {
+  const isManualRoseParty = !options.roomId;
+  if (isManualRoseParty) {
     state.penguAutoPartyRoom = "";
     penguLastAutoConnectKey = "";
   }
   await leaveParty();
-  const roomId = normalizePartyCode(options.roomId || generatePartyRoomId());
+  let roomId = normalizePartyCode(options.roomId || generatePartyRoomId());
+  if (isManualRoseParty) {
+    const roseParty = await createRosePartyToken();
+    partyOwnToken = roseParty.token;
+    partyOwnRoomId = roseParty.roomId;
+    partyOwnKey = roseParty.key;
+    partyOwnSummonerId = roseParty.summonerId;
+    roomId = roseParty.roomId;
+  }
   const displayName = options.displayName || getPartyDisplayName();
   if (els.partyNameInput && options.displayName) els.partyNameInput.value = options.displayName;
   localStorage.setItem("riftAtlas:partyName", displayName);
@@ -2460,6 +5347,19 @@ const createParty = async (options = {}) => {
   state.partyStatus = "connecting";
   renderParty();
   partyPeer = new window.Peer(roomId, { debug: 1 });
+  let resolveOpen = () => {};
+  let rejectOpen = () => {};
+  const openPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timeout conectando Party Mode.")), 15000);
+    resolveOpen = (value) => {
+      clearTimeout(timeout);
+      resolve(value);
+    };
+    rejectOpen = (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    };
+  });
   partyPeer.on("open", (id) => {
     state.partyRoom = {
       id,
@@ -2467,11 +5367,12 @@ const createParty = async (options = {}) => {
       host: { ...getLocalPartyMember(), id, isHost: true, connected: true },
       members: []
     };
-    state.partyLink = `rift-atlas-party:${id}`;
+    state.partyLink = partyOwnToken || `rift-atlas-party:${id}`;
     state.partyStatus = "connected";
     renderParty();
     syncPartySkins();
     sendPartyReadyUpdate();
+    resolveOpen(id);
   });
   partyPeer.on("connection", (connection) => {
     attachPartyConnection(connection);
@@ -2488,6 +5389,7 @@ const createParty = async (options = {}) => {
       }
       connection.send({ type: "room-info", data: state.partyRoom });
       sendPartyReadyUpdate();
+      syncPartySkins();
       broadcastPartyRoom();
       renderParty();
     });
@@ -2496,30 +5398,51 @@ const createParty = async (options = {}) => {
     state.partyStatus = "disconnected";
     if (els.partyConnectionLabel) els.partyConnectionLabel.textContent = `Error party: ${error.message || error}`;
     renderParty();
+    rejectOpen(error instanceof Error ? error : new Error(String(error)));
   });
+  await openPromise;
 };
 
 const joinParty = async (options = {}) => {
   if (!window.Peer) {
     throw new Error("PeerJS no esta cargado.");
   }
+  const rawToken = String(options.roomId || els.partyLinkInput?.value || "").trim();
+  const roseTarget = await decodeRosePartyToken(rawToken);
+  const isRoseTarget = Boolean(roseTarget);
+  if (isRoseTarget && partyOwnSummonerId && roseTarget.summonerId === partyOwnSummonerId) {
+    throw new Error("No podes agregar tu propio token.");
+  }
   if (!options.roomId) {
     state.penguAutoPartyRoom = "";
     penguLastAutoConnectKey = "";
   }
-  const roomId = normalizePartyCode(options.roomId || els.partyLinkInput?.value);
-  if (!roomId) throw new Error("Pega un link o codigo de party.");
-  await leaveParty();
+  const roomId = isRoseTarget ? roseTarget.roomId : normalizePartyCode(rawToken);
+  if (!roomId) throw new Error("Pega un party token.");
+  await leaveParty({ keepRoseToken: isRoseTarget && Boolean(partyOwnToken) });
   const displayName = options.displayName || getPartyDisplayName();
   if (els.partyNameInput && options.displayName) els.partyNameInput.value = options.displayName;
-  if (els.partyLinkInput && options.roomId) els.partyLinkInput.value = `rift-atlas-party:${roomId}`;
+  if (els.partyLinkInput && options.roomId) els.partyLinkInput.value = isRoseTarget ? rawToken : `rift-atlas-party:${roomId}`;
   localStorage.setItem("riftAtlas:partyName", displayName);
   partyIsHost = false;
+  state.partyLink = partyOwnToken || (isRoseTarget ? rawToken : `rift-atlas-party:${roomId}`);
   state.partyStatus = "connecting";
-  state.partyLink = `rift-atlas-party:${roomId}`;
   renderParty();
   const peerId = `${roomId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   partyPeer = new window.Peer(peerId, { debug: 1 });
+  let resolveConnection = () => {};
+  let rejectConnection = () => {};
+  const connectionPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timeout conectando con el token.")), 15000);
+    resolveConnection = (value) => {
+      clearTimeout(timeout);
+      resolve(value);
+    };
+    rejectConnection = (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    };
+  });
   partyPeer.on("open", () => {
     const connection = partyPeer.connect(roomId, {
       reliable: true,
@@ -2534,6 +5457,10 @@ const joinParty = async (options = {}) => {
         sendPartyReadyUpdate();
       });
       renderParty();
+      resolveConnection(connection);
+    });
+    connection.on("error", (error) => {
+      rejectConnection(error instanceof Error ? error : new Error("Error conectando con el token."));
     });
   });
   partyPeer.on("connection", attachPartyConnection);
@@ -2541,7 +5468,63 @@ const joinParty = async (options = {}) => {
     state.partyStatus = "disconnected";
     if (els.partyConnectionLabel) els.partyConnectionLabel.textContent = `Error party: ${error.message || error}`;
     renderParty();
+    rejectConnection(error instanceof Error ? error : new Error(String(error)));
   });
+  await connectionPromise;
+};
+
+const handlePenguPartyModeMessage = async (payload = {}) => {
+  if (!payload?.type || !payload.type.startsWith("party-")) return false;
+
+  const respond = (message = {}) =>
+    window.riftAtlas.sendPenguMessage?.({ source: "rift-atlas-app", ...message }).catch(() => null);
+
+  if (payload.type === "party-get-state") {
+    broadcastPenguPartyState();
+    return true;
+  }
+
+  if (payload.type === "party-enable") {
+    try {
+      if (!["connected", "connecting"].includes(state.partyStatus)) {
+        await createParty();
+      }
+      await respond({ type: "party-enabled", success: true, token: state.partyLink || "" });
+      broadcastPenguPartyState();
+    } catch (error) {
+      await respond({ type: "party-enabled", success: false, error: error.message || "No pude activar Party Mode." });
+    }
+    return true;
+  }
+
+  if (payload.type === "party-disable") {
+    await leaveParty();
+    await respond({ type: "party-disabled", success: true });
+    broadcastPenguPartyState();
+    return true;
+  }
+
+  if (payload.type === "party-add-peer") {
+    try {
+      const token = String(payload.token || "").trim();
+      if (!token) throw new Error("Token vacio.");
+      if (!isPartyConnected() || !partyOwnToken) throw new Error("Party mode not enabled");
+      await joinParty({ roomId: token });
+      await respond({ type: "party-peer-added", success: true });
+      broadcastPenguPartyState();
+    } catch (error) {
+      await respond({ type: "party-peer-added", success: false, error: error.message || "No pude conectar la party." });
+    }
+    return true;
+  }
+
+  if (payload.type === "party-remove-peer") {
+    await respond({ type: "party-peer-removed", success: true });
+    broadcastPenguPartyState();
+    return true;
+  }
+
+  return false;
 };
 
 const handlePenguAutoParty = async () => {
@@ -2639,8 +5622,10 @@ const renderOverlayHistory = () => {
       const entry = state.overlayHistory.find((item) => item.id === button.dataset.id);
       if (!entry) return;
       state.queuedSkins = new Set(normalizeQueuedSkinKeys(entry.skinKeys));
+      restoreKnownLocalMods();
       saveQueuedSkins();
       els.importStatusLabel.textContent = `Historial "${entry.name}" cargado.`;
+      renderSkinLibrary();
     });
   });
 };
@@ -2686,7 +5671,7 @@ const renderSelectionTray = () => {
     bar.querySelector(".selection-selected-count").textContent = `${selectedCount} skin${selectedCount === 1 ? "" : "s"} seleccionada${selectedCount === 1 ? "" : "s"}`;
     bar.querySelector(".selection-selected-hint").textContent = selectedCount
       ? hasMissingSkins
-          ? "Algunas skins no se cargaron en la biblioteca."
+        ? "Algunas skins no se cargaron en la biblioteca."
         : activeP2PCount
           ? "Las skins P2P locales se pueden quitar de la cola manualmente."
           : "Aparecen en champ select cuando Pengu detecta el campeon."
@@ -2743,7 +5728,7 @@ const renderSelectionTray = () => {
       const skin = getSkinByKey(key);
       const icon = skin ? getChampionIconByKey(skin.rawChampion, skin.champion) : "";
       const champion = skin ? skin.champion : "Desconocida";
-      const name = skin ? skin.skin : key.split(/[/\\]/).pop() || "Skin en cola";
+      const name = skin ? getSkinVisibleName(skin) : key.split(/[/\\]/).pop() || "Skin en cola";
       return `
         <button class="selection-chip" type="button" data-path="${escapeHtml(key)}">
           ${icon ? `<img src="${icon}" alt="${escapeHtml(champion)}" />` : ""}
@@ -2759,6 +5744,28 @@ const renderSelectionTray = () => {
       saveQueuedSkins();
     });
   });
+};
+
+const renderBaseOverlayStatus = () => {
+  const ready = Boolean(state.customOverlayPath);
+  const customKeys = state.customOverlayKeys || [];
+  const queuedCount = state.queuedSkins.size;
+  const outdated = ready && customKeys.length > 0 && (
+    customKeys.length !== queuedCount ||
+    !customKeys.every((k) => state.queuedSkins.has(k))
+  );
+  let label;
+  if (outdated) {
+    label = "Deseactualizado (reconstruir)";
+  } else if (ready) {
+    label = `Listo (${customKeys.length} mods)`;
+  } else if (queuedCount > 0) {
+    label = "Pendiente (se construye automaticamente)";
+  } else {
+    label = "No construido";
+  }
+  if (els.baseOverlayStatusLabel) els.baseOverlayStatusLabel.textContent = label;
+  if (els.baseOverlayStatusLabelAlt) els.baseOverlayStatusLabelAlt.textContent = label;
 };
 
 const renderPresets = () => {
@@ -2788,10 +5795,12 @@ const renderPresets = () => {
     .map((preset) => {
       const missing = preset.skinKeys.filter((key) => !getSkinByKey(key)).length;
       return `
-        <article class="preset-row ${preset.id === state.activePresetId ? "active" : ""}" data-id="${escapeHtml(preset.id)}">
+        <article class="preset-row ${preset.id === state.activePresetId ? "active" : ""}" data-id="${escapeHtml(preset.id)}" style="--preset-color:${escapeHtml(preset.color || "#c89b3c")}">
+          <span class="preset-icon">${escapeHtml(preset.icon || "RA")}</span>
           <div>
             <strong>${escapeHtml(preset.name)}</strong>
-            <small>${preset.skinKeys.length} skin(s)${missing ? ` - ${missing} no cargadas ahora` : ""}</small>
+            <small>${preset.skinKeys.length} skin(s)${missing ? ` - ${missing} no cargadas ahora` : ""}${preset.autoApply ? " - autoaplicar" : ""}</small>
+            <small>${escapeHtml(preset.enginePath || "Engine actual al ejecutar")}</small>
           </div>
           <button class="secondary-button preset-select-button" type="button" data-id="${escapeHtml(preset.id)}">Usar</button>
         </article>
@@ -2803,12 +5812,16 @@ const renderPresets = () => {
     button.addEventListener("click", () => {
       state.activePresetId = button.dataset.id;
       savePresets();
+      if (els.presetStatusLabel) {
+        const preset = getActivePreset();
+        els.presetStatusLabel.textContent = preset?.autoApply ? `Perfil "${preset.name}" activo con autoaplicar.` : `Perfil "${preset?.name || ""}" activo.`;
+      }
     });
   });
 };
 
 const setLtkOverlaySidecarPath = (p) => {
-  const value = p && /(^|[\\/])ltk-manager\.exe$/i.test(p) && !/ltk manager/i.test(p) ? p : "";
+  const value = p && /(^|[\\/])(ltk-manager|mod-tools)\.exe$/i.test(p) && !/ltk manager/i.test(p) ? p : "";
   state.ltkOverlaySidecarPath = value;
   localStorage.setItem("riftAtlas:ltkOverlaySidecarPath", state.ltkOverlaySidecarPath);
   if (els.ltkOverlaySidecarLabel) els.ltkOverlaySidecarLabel.textContent = state.ltkOverlaySidecarPath || "No configurado";
@@ -2825,10 +5838,37 @@ const setLtkOverlayDllPath = (p) => {
   }
 };
 
+const getEngineBinaryFromPath = (filePath = "") => {
+  const name = getNameFromPath(filePath).toLowerCase();
+  if (name === "mod-tools.exe") return "mod-tools.exe";
+  if (name === "ltk-manager.exe") return "ltk-manager.exe";
+  return "";
+};
+
+const enginePathMatchesMode = (filePath = "", mode = state.engineBinaryName) =>
+  getEngineBinaryFromPath(filePath) === (mode === "mod-tools.exe" ? "mod-tools.exe" : "ltk-manager.exe");
+
+const setEngineBinaryName = (value, { detect = false } = {}) => {
+  const next = value === "mod-tools.exe" ? "mod-tools.exe" : "ltk-manager.exe";
+  state.engineBinaryName = next;
+  localStorage.setItem("riftAtlas:engineBinaryName", next);
+  if (els.engineBinarySelector) els.engineBinarySelector.value = next;
+  els.engineModeButtons?.forEach((button) => {
+    const active = button.dataset.engineBinary === next;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  if (state.ltkOverlaySidecarPath && !enginePathMatchesMode(state.ltkOverlaySidecarPath, next)) {
+    setLtkOverlaySidecarPath("");
+  }
+  if (detect) autoConfigureOverlay({ silent: true });
+};
+
 const loadLtkOverlayPaths = () => {
   setLtkOverlaySidecarPath(state.ltkOverlaySidecarPath);
   setLtkOverlayDllPath(state.ltkOverlayDllPath);
   if (els.downloadLeaguePathLabel) els.downloadLeaguePathLabel.textContent = state.leagueGamePath || "No configurado";
+  setEngineBinaryName(state.engineBinaryName);
 };
 
 
@@ -2884,6 +5924,7 @@ const setDownloadButtonsState = () => {
   const engineBusy = state.activeDownloadType === "engine";
   const leagueSkinsBusy = state.activeDownloadType === "league-skins";
   const penguBusy = state.activeDownloadType === "pengu-loader";
+  const penguUninstallBusy = state.activeDownloadType === "pengu-uninstall";
 
   if (els.downloadCslolButton) {
     els.downloadCslolButton.disabled = busy;
@@ -2909,6 +5950,10 @@ const setDownloadButtonsState = () => {
     els.launchPenguLoaderButton.disabled = busy;
     els.launchPenguLoaderButton.textContent = "Activar Pengu Loader";
   }
+  if (els.uninstallPenguLoaderButton) {
+    els.uninstallPenguLoaderButton.disabled = busy;
+    els.uninstallPenguLoaderButton.textContent = penguUninstallBusy ? "Desinstalando..." : "Desinstalar Pengu";
+  }
 };
 
 const beginDownload = (type) => {
@@ -2916,7 +5961,8 @@ const beginDownload = (type) => {
     const labels = {
       engine: "engine",
       "league-skins": "LeagueSkins",
-      "pengu-loader": "Pengu Loader"
+      "pengu-loader": "Pengu Loader",
+      "pengu-uninstall": "desinstalacion de Pengu"
     };
     const label = labels[state.activeDownloadType] || state.activeDownloadType;
     const message = `Ya hay una descarga activa (${label}). Espera a que termine.`;
@@ -2973,7 +6019,9 @@ const loadPenguLoaderStatus = async () => {
       els.overlayLaunchPenguButton.disabled = false;
       els.overlayLaunchPenguButton.textContent = status.active ? "Reaplicar Pengu" : "Activar Pengu";
     }
-    if (els.overlayDeactivatePenguButton) els.overlayDeactivatePenguButton.disabled = !status.active && !status.proxyInstalled;
+    if (els.overlayDeactivatePenguButton) {
+      els.overlayDeactivatePenguButton.disabled = !status.active && !status.proxyInstalled && !status.ifeoActive && !status.running;
+    }
     if (status.active) {
       const pathText = status.leagueClientPath || status.executablePath;
       setPenguText(pathText
@@ -3016,13 +6064,13 @@ const activatePenguFromUi = async () => {
       ? `No pude activar Pengu Loader: ${result.error}`
       : result?.waitingForLeague
         ? (result.message || "Abri League Client; Rift Atlas activara Pengu cuando detecte el lockfile.")
-      : result?.proxyInstalled === false
-        ? `Pengu Loader no quedo activo: ${result.proxyError || "falta d3d9.dll en League."}`
-        : result?.restartedClient
-          ? "Pengu Loader activado. League Client se reinicio para cargar Rift Atlas."
-          : result?.needsClientRestart
-            ? "Pengu Loader activado. Cierra y abre League Client si no aparece RA."
-            : "Pengu Loader activado. Abre League Client para ver RA.";
+        : result?.proxyInstalled === false
+          ? `Pengu Loader no quedo activo: ${result.proxyError || "falta d3d9.dll en League."}`
+          : result?.restartedClient
+            ? "Pengu Loader activado. League Client se reinicio para cargar Rift Atlas."
+            : result?.needsClientRestart
+              ? "Pengu Loader activado. Cierra y abre League Client si no aparece RA."
+              : "Pengu Loader activado. Abre League Client para ver RA.";
     if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
     if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
   } catch (error) {
@@ -3062,9 +6110,34 @@ const deactivatePenguFromUi = async () => {
   }
 };
 
-const hideFirstDllModal = ({ remember = false } = {}) => {
+const uninstallPenguFromUi = async () => {
+  if (!window.confirm("Desinstalar Pengu Loader de Rift Atlas? Esto desactiva Pengu y borra la copia local de la carpeta de instalacion.")) {
+    return;
+  }
+  if (!beginDownload("pengu-uninstall")) return;
+  try {
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = "Desinstalando Pengu Loader...";
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = "Pengu Loader: desinstalando...";
+    const result = await window.riftAtlas.uninstallPenguLoader?.();
+    await loadPenguLoaderStatus();
+    const failedCount = Array.isArray(result?.failedPaths) ? result.failedPaths.length : 0;
+    const message = failedCount > 0
+      ? `Pengu parcialmente desinstalado. ${failedCount} ruta(s) no se pudieron borrar.`
+      : "Pengu Loader desinstalado de Rift Atlas.";
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
+  } catch (error) {
+    const message = error.message || "No pude desinstalar Pengu Loader.";
+    if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+    if (els.overlayPenguStatusLabel) els.overlayPenguStatusLabel.textContent = `Pengu Loader: ${message}`;
+  } finally {
+    finishDownload();
+    await loadPenguLoaderStatus();
+  }
+};
+
+const hideFirstDllModal = () => {
   if (els.firstDllModal) els.firstDllModal.hidden = true;
-  if (remember) localStorage.setItem("riftAtlas:firstDllNoticeShown", "1");
   window.riftAtlasTutorial?.resumeAfterModal?.();
   setTimeout(() => scheduleTutorialAutostart(), 250);
 };
@@ -3074,15 +6147,16 @@ const showFirstDllModal = async (status = null) => {
   window.riftAtlasTutorial?.pauseForModal?.();
   const dllStatus = status || await window.riftAtlas.getEngineDllStatus?.().catch(() => null);
   if (els.firstDllPathLabel) {
-    els.firstDllPathLabel.textContent = dllStatus?.dllPath || "AppData\\Roaming\\Rift Atlas\\engine\\cslol-dll.dll";
+    els.firstDllPathLabel.textContent = dllStatus?.dllPath || "Carpeta de instalacion\\engine\\tools\\cslol-dll.dll";
   }
   els.firstDllModal.hidden = false;
 };
 
 const checkFirstDllNotice = async () => {
-  if (!window.riftAtlas.getEngineDllStatus || localStorage.getItem("riftAtlas:firstDllNoticeShown") === "1") return;
+  if (!window.riftAtlas.getEngineDllStatus) return;
   const status = await window.riftAtlas.getEngineDllStatus().catch(() => null);
-  if (!status || status.exists) return;
+  const dllExists = Boolean(status?.exists ?? status?.installed);
+  if (!status || !status.engineInstalled || dllExists) return;
   await showFirstDllModal(status);
 };
 
@@ -3107,8 +6181,9 @@ const renderUpdateStatus = (result = null, { hiddenByUser = false } = {}) => {
 
   if (result.hasUpdate && !hiddenByUser) {
     els.updateStatusLabel.textContent = `Nueva version ${result.latestVersion}`;
-    els.updateDetailsLabel.textContent = `Actual: ${result.currentVersion}. ${result.assetName ? `Lista para descargar: ${result.assetName}.` : "El release no tiene instalador automatico."}`;
+    els.updateDetailsLabel.textContent = `Actual: ${result.currentVersion}. ${result.hasAutoUpdate ? `Lista para instalar: ${result.assetName}.` : "El release no tiene latest.json de Tauri; se abrira GitHub para instalar manual."}`;
     setUpdatePanelVisible({ hasUpdate: true });
+    if (els.updateDownloadButton) els.updateDownloadButton.textContent = result.hasAutoUpdate ? "Actualizar" : "Abrir release";
     if (els.updateHideCheckbox) els.updateHideCheckbox.checked = false;
     return;
   }
@@ -3147,7 +6222,7 @@ const checkForUpdates = async ({ manual = false } = {}) => {
 
 const downloadAvailableUpdate = async () => {
   const update = state.availableUpdate;
-  if (!update?.downloadUrl || !window.riftAtlas.downloadUpdate) {
+  if (!update?.hasAutoUpdate || !update?.downloadUrl || !window.riftAtlas.downloadUpdate) {
     if (update?.releaseUrl) await window.riftAtlas.openExternal(update.releaseUrl);
     return;
   }
@@ -3190,6 +6265,7 @@ const autoConfigureOverlay = async ({ silent = false } = {}) => {
   try {
     const result = await window.riftAtlas.autoConfigureOverlay({
       enginePath: state.ltkOverlaySidecarPath,
+      engineBinary: state.engineBinaryName,
       dllPath: state.ltkOverlayDllPath,
       leagueGamePath: state.leagueGamePath,
       ltkPath: ""
@@ -3217,27 +6293,33 @@ const autoConfigureOverlay = async ({ silent = false } = {}) => {
   }
 };
 
-const downloadCslolTools = async () => {
+const downloadCslolTools = async (engineBinary = state.engineBinaryName) => {
   if (!beginDownload("engine")) return;
+  const selectedEngineBinary = engineBinary === "mod-tools.exe" ? "mod-tools.exe" : "ltk-manager.exe";
+  setEngineBinaryName(selectedEngineBinary);
+  const engineLabel = selectedEngineBinary === "mod-tools.exe" ? "mod-tools" : "LTK";
   if (els.downloadProgressLabel) {
-    els.downloadProgressLabel.textContent = "Iniciando descarga del engine...";
+    els.downloadProgressLabel.textContent = `Iniciando descarga de ${engineLabel}...`;
   }
   if (els.importStatusLabel) {
-    setConfigStatus("Descargando engine...");
+    setConfigStatus(`Descargando ${engineLabel}...`);
   }
 
   try {
-    const result = await window.riftAtlas.downloadCslolTools();
+    const result = await window.riftAtlas.downloadCslolTools({ engineBinary: selectedEngineBinary });
     if (result.enginePath) setLtkOverlaySidecarPath(result.enginePath);
     if (result.dllPath) setLtkOverlayDllPath(result.dllPath);
+    const manualDllMessage = "Engine instalado. DLL no anadida: selecciona cslol-dll.dll y Rift Atlas la copiara a engine/tools.";
     if (els.downloadProgressLabel) {
-      els.downloadProgressLabel.textContent = result.dllInstallMessage
-        ? `Engine ${result.version} descargado. ${result.dllInstallMessage}`
-        : `Engine ${result.version} descargado.`;
+      els.downloadProgressLabel.textContent = result.manualDllRequired
+        ? manualDllMessage
+        : (result.dllInstallMessage
+          ? `Engine ${result.version} descargado. ${result.dllInstallMessage}`
+          : `Engine ${result.version} descargado.`);
     }
     setConfigStatus(result.dllPath
       ? (result.dllInstallMessage || `Engine ${result.version} listo.`)
-      : `Engine ${result.version} listo. Selecciona cslol-dll.dll para copiarlo a la carpeta engine.`);
+      : manualDllMessage);
     if (!result.dllPath) {
       const dllStatus = await window.riftAtlas.getEngineDllStatus?.().catch(() => null);
       await showFirstDllModal(dllStatus || { exists: false });
@@ -3251,12 +6333,12 @@ const downloadCslolTools = async () => {
 };
 
 const loadDownloadedLeagueSkins = async () => {
-  if (!els.downloadLeagueSkinsButton || state.importingQueue) return;
+  if ((!els.downloadLeagueSkinsButton && !els.downloadLeagueSkinsButtonDownload) || state.importingQueue) return;
   if (!beginDownload("league-skins")) return;
   if (els.downloadProgressLabel) {
     els.downloadProgressLabel.textContent = "Iniciando descarga de LeagueSkins...";
   }
-  els.skinLibraryLabel.textContent = "Descargando LeagueSkins desde GitHub...";
+  if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = "Descargando LeagueSkins desde GitHub...";
 
   try {
     const result = await window.riftAtlas.downloadLeagueSkins();
@@ -3264,9 +6346,9 @@ const loadDownloadedLeagueSkins = async () => {
     if (els.downloadProgressLabel) {
       els.downloadProgressLabel.textContent = `LeagueSkins descargado e indexado: ${result.skins?.length || 0} paquete(s).`;
     }
-    els.importStatusLabel.textContent = `LeagueSkins ${result.branch} descargado e indexado.`;
+    if (els.importStatusLabel) els.importStatusLabel.textContent = `LeagueSkins ${result.branch} descargado e indexado.`;
   } catch (error) {
-    els.skinLibraryLabel.textContent = `Error descargando LeagueSkins: ${error.message}`;
+    if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = `Error descargando LeagueSkins: ${error.message}`;
     if (els.downloadProgressLabel) {
       els.downloadProgressLabel.textContent = `Error descargando LeagueSkins: ${error.message}`;
     }
@@ -3298,19 +6380,74 @@ const downloadPenguLoader = async () => {
   }
 };
 
+let firstRunBootstrapPromise = null;
+let firstRunBootstrapResult = null;
+const startFirstRunBootstrap = () => {
+  if (firstRunBootstrapPromise) return firstRunBootstrapPromise;
+  if (!window.riftAtlas.bootstrapFirstRun) return Promise.resolve(null);
+
+  firstRunBootstrapPromise = (async () => {
+    state.activeDownloadType = "first-run-bootstrap";
+    setDownloadButtonsState();
+    setEngineBinaryName("mod-tools.exe");
+    if (els.downloadProgressLabel) {
+      els.downloadProgressLabel.textContent = "Verificando componentes instalados...";
+    }
+    setConfigStatus("Verificando componentes instalados...");
+
+    try {
+      const result = await window.riftAtlas.bootstrapFirstRun();
+      if (result?.enginePath) setLtkOverlaySidecarPath(result.enginePath);
+      if (result?.leagueSkinsPath) {
+        state.skinLibrary = [];
+        await loadDownloadedLeagueSkinsFromDisk({ silent: true }).catch(() => false);
+      }
+      await loadPenguLoaderStatus();
+      await autoConfigureOverlay({ silent: true });
+      await checkFirstDllNotice();
+
+      const errors = Array.isArray(result?.errors) ? result.errors.filter(Boolean) : [];
+      const message = result?.complete
+        ? (result.injectionReady
+          ? (result.skipped
+            ? "Componentes iniciales verificados. Rift Atlas esta listo para inyectar."
+            : "Primera instalacion lista: mod-tools, LeagueSkins y Pengu Loader descargados.")
+          : "Descargas iniciales listas. Falta agregar cslol-dll.dll para habilitar la inyeccion.")
+        : `Preparacion inicial incompleta${errors.length ? `: ${errors.join(" | ")}` : ". Se reintentara al iniciar."}`;
+      if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+      setConfigStatus(message);
+      firstRunBootstrapResult = result;
+      return result;
+    } catch (error) {
+      const message = `No pude completar la preparacion inicial: ${error.message || error}. Se reintentara al iniciar.`;
+      if (els.downloadProgressLabel) els.downloadProgressLabel.textContent = message;
+      setConfigStatus(message);
+      firstRunBootstrapResult = { complete: false, errors: [error.message || String(error)] };
+      return firstRunBootstrapResult;
+    } finally {
+      if (state.activeDownloadType === "first-run-bootstrap") finishDownload();
+    }
+  })();
+
+  return firstRunBootstrapPromise;
+};
+
 let loadingLocalLeagueSkins = false;
+let championsReadyPromise = null;
+let skinLibraryReadyPromise = null;
+let userModsReadyPromise = null;
 
 const loadDownloadedLeagueSkinsFromDisk = async ({ silent = false } = {}) => {
   if (loadingLocalLeagueSkins || state.skinLibrary.length || !window.riftAtlas.indexDownloadedLeagueSkins) return false;
   loadingLocalLeagueSkins = true;
   if (!silent) {
-    els.skinLibraryLabel.textContent = "Buscando LeagueSkins descargado...";
+    if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = "Buscando LeagueSkins descargado...";
   }
 
   try {
     const result = await window.riftAtlas.indexDownloadedLeagueSkins();
     if (!result?.skins?.length) {
-      if (!silent) els.skinLibraryLabel.textContent = "LeagueSkins descargado no tiene paquetes compatibles.";
+      if (!silent && els.skinLibraryLabel) els.skinLibraryLabel.textContent = "LeagueSkins descargado no tiene paquetes compatibles.";
       return false;
     }
     setSkinLibrary(result);
@@ -3320,7 +6457,7 @@ const loadDownloadedLeagueSkinsFromDisk = async ({ silent = false } = {}) => {
     return true;
   } catch (error) {
     if (!silent) {
-      els.skinLibraryLabel.textContent = error.message || "No pude cargar LeagueSkins descargado.";
+      if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = error.message || "No pude cargar LeagueSkins descargado.";
     }
     return false;
   } finally {
@@ -3349,7 +6486,7 @@ const loadSavedSkinLibrary = async () => {
   }
 
   for (const folderPath of candidates) {
-    els.skinLibraryLabel.textContent = "Indexando LeagueSkins guardado...";
+    if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = "Indexando LeagueSkins guardado...";
     try {
       setSkinLibrary(await window.riftAtlas.indexSkinLibrary(folderPath));
       return;
@@ -3360,7 +6497,43 @@ const loadSavedSkinLibrary = async () => {
 
   localStorage.removeItem("riftAtlas:skinLibraryPath");
   state.skinLibraryPath = "";
-  els.skinLibraryLabel.textContent = "Selecciona o descarga LeagueSkins para gestionar tu biblioteca.";
+  if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = "Selecciona o descarga LeagueSkins para gestionar tu biblioteca.";
+};
+
+const ensureChampionsLoaded = async () => {
+  if (state.champions.length) return true;
+  if (!championsReadyPromise) {
+    championsReadyPromise = loadChampions().finally(() => {
+      championsReadyPromise = null;
+    });
+  }
+  await championsReadyPromise;
+  return state.champions.length > 0;
+};
+
+const ensureSkinLibraryLoaded = async () => {
+  await ensureChampionsLoaded();
+  if (state.skinLibrary.length) return true;
+  if (!skinLibraryReadyPromise) {
+    skinLibraryReadyPromise = loadSavedSkinLibrary().finally(() => {
+      skinLibraryReadyPromise = null;
+    });
+  }
+  await skinLibraryReadyPromise;
+  return state.skinLibrary.length > 0;
+};
+
+const ensureUserModsLoaded = async () => {
+  await ensureChampionsLoaded().catch(() => false);
+  if (!userModsReadyPromise) {
+    userModsReadyPromise = syncUserModsFolder("startup", { silent: true })
+      .catch(() => null)
+      .finally(() => {
+        userModsReadyPromise = null;
+      });
+  }
+  await userModsReadyPromise;
+  return state.customMods.length > 0;
 };
 
 const championMatches = (champion) => {
@@ -3384,7 +6557,7 @@ const createChampionCard = (champion) => {
   return node;
 };
 
-const renderChampionGrid = () => {
+const renderChampionGrid = ({ revealSelected = false, resetScroll = false } = {}) => {
   const champions = getFilteredChampions();
   els.countLabel.textContent = champions.length.toString();
   els.championGrid.replaceChildren(...champions.map(createChampionCard));
@@ -3394,6 +6567,15 @@ const renderChampionGrid = () => {
     empty.className = "empty-state";
     empty.textContent = "No encontre campeones con ese filtro.";
     els.championGrid.replaceChildren(empty);
+    els.championGrid.scrollTop = 0;
+    return;
+  }
+
+  const activeCard = state.selectedId ? els.championGrid.querySelector(`.champion-card[data-id="${CSS.escape(state.selectedId)}"]`) : null;
+  if (activeCard && revealSelected) {
+    activeCard.scrollIntoView({ block: "nearest", inline: "nearest" });
+  } else if (resetScroll) {
+    els.championGrid.scrollTop = 0;
   }
 };
 
@@ -3417,7 +6599,7 @@ const renderTierGrid = () => {
       const championName = champion?.name || row.champion;
       const championImage = champion ? `${CDN}/cdn/${state.version}/img/champion/${champion.image.full}` : "";
       return `
-        <button class="tier-row" type="button" data-champion-id="${champion?.id || ""}">
+        <div class="tier-row" data-champion-id="${champion?.id || ""}">
           <span class="tier-rank">${row.rank}</span>
           ${championImage ? `<img src="${championImage}" alt="${escapeHtml(championName)}" />` : ""}
           <span class="tier-name">${escapeHtml(championName)}</span>
@@ -3426,17 +6608,18 @@ const renderTierGrid = () => {
           <span>${row.pickrate.toFixed(1)}%</span>
           <span>${row.banrate.toFixed(1)}%</span>
           <span>${row.games ? row.games.toLocaleString("es-AR") : "-"}</span>
-        </button>
+        </div>
       `;
     })
     .join("");
 
-  els.tierGrid.querySelectorAll(".tier-row").forEach((card) => {
-    card.addEventListener("click", () => {
-      if (card.dataset.championId) {
-        setView("champions");
-        selectChampion(card.dataset.championId).catch(showError);
-      }
+  els.tierGrid.querySelectorAll(".tier-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const id = row.dataset.championId;
+      if (!id) return;
+      els.tierGrid.querySelectorAll(".tier-row.selected").forEach((r) => r.classList.remove("selected"));
+      row.classList.add("selected");
+      selectChampion(id, { scrollTo: false }).catch(showError);
     });
   });
 };
@@ -3491,7 +6674,8 @@ const renderDetail = (champion) => {
   const spells = champion.spells.map((spell, index) => ({ ...spell, key: ["Q", "W", "E", "R"][index] }));
 
   els.championDetail.innerHTML = `
-    <div class="splash" style="background-image: url('${splash}')">
+    <div class="splash">
+      <img class="splash-bg" src="${splash}" alt="" aria-hidden="true" />
       <div class="splash-content">
         <div class="tags">${champion.tags.map((tag) => `<span class="tag">${tag}</span>`).join("")}</div>
         <h2>${champion.name}</h2>
@@ -3533,15 +6717,24 @@ const renderDetail = (champion) => {
 
 };
 
-const selectChampion = async (id) => {
+const selectChampion = async (id, { scrollTo = true } = {}) => {
   state.selectedId = id;
-  renderChampionGrid();
+  renderChampionGrid({ revealSelected: scrollTo });
   const response = await fetch(`${CDN}/cdn/${state.version}/data/es_AR/champion/${id}.json`);
   if (!response.ok) {
     throw new Error("No se pudo cargar el detalle del campeon.");
   }
   const payload = await response.json();
   renderDetail(payload.data[id]);
+};
+
+let modsTabScanInterval = null;
+
+const scanModsFolderIfNeeded = async () => {
+  if (!document.querySelector("#modsView.active")) return;
+  try {
+    await syncUserModsFolder("tab-focus", { silent: true });
+  } catch (_) { /* ignore */ }
 };
 
 const setView = (view) => {
@@ -3552,197 +6745,20 @@ const setView = (view) => {
     panel.classList.toggle("active", panel.id === `${view}View`);
   });
   els.championToolbar.hidden = view !== "champions";
+
+  if (view === "mods") {
+    scanModsFolderIfNeeded();
+    if (!modsTabScanInterval) {
+      modsTabScanInterval = setInterval(scanModsFolderIfNeeded, 8000);
+    }
+  } else if (modsTabScanInterval) {
+    clearInterval(modsTabScanInterval);
+    modsTabScanInterval = null;
+  }
 };
 
 const closeIntroSidebar = () => {
   els.sidebar?.classList.remove("is-open");
-};
-
-const renderPlayerLoading = () => {
-  if (!els.playerResults) return;
-  els.playerResults.innerHTML = `
-    <div class="empty-state">
-      <h2>Consultando Riot API</h2>
-      <p>Buscando perfil, clasificatorias, partida activa y ultimas partidas.</p>
-    </div>
-  `;
-};
-
-const renderPlayerError = (error) => {
-  if (!els.playerResults) return;
-  els.playerResults.innerHTML = `
-    <div class="empty-state">
-      <h2>No pude cargar el jugador</h2>
-      <p>${escapeHtml(error.message)}</p>
-    </div>
-  `;
-};
-
-const renderPlayer = (data) => {
-  if (!els.playerResults) return;
-  const profileIcon = `${CDN}/cdn/${state.version}/img/profileicon/${data.summoner.profileIconId}.png`;
-  els.playerResults.innerHTML = renderPlayerHTML(data, profileIcon);
-};
-
-const setApiKeyStatus = (hasKey, message = "") => {
-  if (!els.apiKeyLabel || !els.apiKeyHint) return;
-  els.apiKeyLabel.textContent = hasKey ? "API lista" : "Sin key";
-  els.apiKeyLabel.classList.toggle("ready", hasKey);
-  els.apiKeyHint.textContent = message || (hasKey ? "API key activa para esta sesion." : "La clave queda solo en memoria hasta cerrar la app. No se guarda en disco.");
-};
-
-const renderRanked = (ranked) => {
-  if (!ranked.length) {
-    return '<div class="rank-card"><strong>Sin clasificatorias</strong><span>No hay entradas ranked para esta region.</span></div>';
-  }
-
-  return ranked
-    .map(
-      (entry) => `
-        <div class="rank-card">
-          <strong>${escapeHtml(entry.queueType.replaceAll("_", " "))}</strong>
-          <span>${escapeHtml(entry.tier)} ${escapeHtml(entry.rank)} - ${entry.leaguePoints} LP</span>
-          <span>${entry.wins}V / ${entry.losses}D</span>
-        </div>
-      `
-    )
-    .join("");
-};
-
-const renderActiveGame = (activeGame) => {
-  if (!activeGame) {
-    return '<div class="live-card"><strong>No esta en partida</strong><span>Riot no reporta una partida activa ahora mismo.</span></div>';
-  }
-
-  return `
-    <div class="live-card">
-      <strong>${escapeHtml(QUEUES[activeGame.gameQueueConfigId] || activeGame.gameMode || "Partida activa")}</strong>
-      <span>${activeGame.participants.length} jugadores - ${formatDuration(activeGame.gameLength)}</span>
-    </div>
-  `;
-};
-
-const renderParticipant = (participant, highlightPuuid = "") => {
-  const isHighlight = participant.puuid === highlightPuuid;
-  return `
-    <div class="team-player ${isHighlight ? "highlight" : ""}">
-      <img src="${getChampionSquare(participant.championId, participant.championName)}" alt="${escapeHtml(participant.championName)}" />
-      <div>
-        <strong>${escapeHtml(participant.riotIdGameName)}${participant.riotIdTagLine ? `#${escapeHtml(participant.riotIdTagLine)}` : ""}</strong>
-        <span>${escapeHtml(POSITION_LABELS[participant.teamPosition] || participant.teamPosition)} · ${escapeHtml(participant.championName)} · ${participant.kills}/${participant.deaths}/${participant.assists}</span>
-      </div>
-    </div>
-  `;
-};
-
-const renderTeamList = (title, participants, highlightPuuid) => `
-  <div class="team-list">
-    <h4>${title}</h4>
-    ${participants.map((participant) => renderParticipant(participant, highlightPuuid)).join("")}
-  </div>
-`;
-
-const renderItems = (items = []) => {
-  if (!items.length) {
-    return '<span class="muted-text">Sin items</span>';
-  }
-  return items.map((itemId) => `<img src="${getItemImage(itemId)}" alt="Item ${itemId}" title="Item ${itemId}" />`).join("");
-};
-
-const renderBuildTimeline = (events = []) => {
-  const purchases = events.filter((event) => event.type === "ITEM_PURCHASED").slice(0, 12);
-  if (!purchases.length) {
-    return '<span class="muted-text">Timeline de build no disponible.</span>';
-  }
-
-  return purchases
-    .map(
-      (event) => `
-        <div class="build-event">
-          <img src="${getItemImage(event.itemId)}" alt="Item ${event.itemId}" />
-          <span>${formatDuration(event.timestamp / 1000)}</span>
-        </div>
-      `
-    )
-    .join("");
-};
-
-const renderMatches = (matches) =>
-  matches
-    .map(
-      (match) => `
-        <article class="match-card expanded ${match.win ? "win" : "loss"}">
-          <div class="match-summary">
-            <img src="${getChampionSquare(match.championId, match.championName)}" alt="${escapeHtml(match.championName)}" />
-            <div>
-              <strong>${escapeHtml(match.championName)} - ${escapeHtml(QUEUES[match.queueId] || match.gameMode)}</strong>
-              <span>${escapeHtml(POSITION_LABELS[match.teamPosition] || match.teamPosition || "Rol")} · ${match.kills}/${match.deaths}/${match.assists} KDA · ${match.creepScore} CS (${match.creepScorePerMinute.toFixed(1)}/min) · ${formatDuration(match.gameDuration)} · ${formatDate(match.gameCreation)}</span>
-            </div>
-            <span class="match-result">${match.win ? "Victoria" : "Derrota"}</span>
-          </div>
-          <div class="build-panel">
-            <div>
-              <h4>Build final</h4>
-              <div class="item-strip">${renderItems(match.itemIds)}</div>
-            </div>
-            <div>
-              <h4>Tiempo de build</h4>
-              <div class="build-timeline">${renderBuildTimeline(match.itemTimeline)}</div>
-            </div>
-            <div>
-              <h4>Recursos</h4>
-              <p>${match.goldEarned.toLocaleString("es-AR")} oro · ${match.visionScore} vision</p>
-            </div>
-          </div>
-          <div class="teams-grid">
-            ${renderTeamList("Tu equipo", match.allyTeam, match.playerPuuid)}
-            ${renderTeamList("Rivales", match.enemyTeam, "")}
-          </div>
-        </article>
-      `
-    )
-    .join("");
-
-const renderPlayerHTML = (data, profileIcon) => `
-  <div class="player-header">
-    <img class="profile-icon" src="${profileIcon}" alt="Icono de perfil" />
-    <div class="player-title">
-      <h2>${escapeHtml(data.account.gameName)}#${escapeHtml(data.account.tagLine)}</h2>
-      <p>Nivel ${data.summoner.summonerLevel}</p>
-    </div>
-    <span class="live-badge ${data.activeGame ? "active" : ""}">${data.activeGame ? "En partida" : "Offline"}</span>
-  </div>
-  <div class="result-grid">
-    <section class="result-section">
-      <h3>Clasificatorias</h3>
-      ${renderRanked(data.ranked)}
-      <h3>Partida activa</h3>
-      ${renderActiveGame(data.activeGame)}
-    </section>
-    <section class="result-section">
-      <h3>Ultimas partidas</h3>
-      ${data.matches.length ? renderMatches(data.matches) : '<div class="match-card"><strong>Sin partidas recientes</strong><span>No hay partidas para mostrar.</span></div>'}
-    </section>
-  </div>
-`;
-
-const lookupPlayer = async () => {
-  if (!els.riotIdInput || !els.platformSelect) return;
-  const riotId = els.riotIdInput.value.trim();
-  if (!riotId) {
-    renderPlayerError(new Error("Escribe un Riot ID, por ejemplo Nombre#TAG."));
-    return;
-  }
-  renderPlayerLoading();
-  try {
-    const data = await window.riftAtlas.lookupPlayer({
-      riotId,
-      platform: els.platformSelect.value
-    });
-    renderPlayer(data);
-  } catch (error) {
-    renderPlayerError(error);
-  }
 };
 
 const renderModPackages = (result) => {
@@ -3761,10 +6777,10 @@ const renderModPackages = (result) => {
     .map(
       (item) => `
         <button class="mod-package-row" type="button" data-path="${escapeHtml(item.path)}">
-          <span class="mod-extension">${escapeHtml(item.extension.replace(".", ""))}</span>
+          <span class="mod-extension">${escapeHtml(getDisplayExtension(item))}</span>
           <span>
             <strong>${escapeHtml(item.name)}</strong>
-            <small>${escapeHtml(item.relativePath)}</small>
+            <small>${escapeHtml(item.relativePath)} - click para agregar y seleccionar</small>
           </span>
           <span>${formatBytes(item.size)}</span>
         </button>
@@ -3774,7 +6790,18 @@ const renderModPackages = (result) => {
 
   els.modsPackageList.querySelectorAll(".mod-package-row").forEach((button) => {
     button.addEventListener("click", () => {
-      window.riftAtlas.revealModPath(button.dataset.path);
+      const item = result.packages.find((pkg) => pkg.path === button.dataset.path);
+      if (!item) return;
+      addCustomMods([item]);
+      const { replaced } = queueSkinKey(item.path);
+      saveQueuedSkins();
+      scheduleAutoApplyQueuedFromPengu("local-mod-added");
+      els.modsFolderLabel.textContent = replaced
+        ? `${item.name} agregado y seleccionado. Cambio ${replaced} mod(s) del mismo campeon.`
+        : `${item.name} agregado y seleccionado.`;
+      renderCustomMods();
+      renderSelectionTray();
+      sendPenguSkinCatalog("local-mod-added");
     });
   });
 };
@@ -3814,6 +6841,7 @@ const resetSkinView = ({ clearProfile = false } = {}) => {
 };
 
 const renderSkinChampionOptions = () => {
+  if (!els.skinChampionSelect) return;
   const champions = [...new Set(state.skinLibrary.map((skin) => skin.champion))].sort((a, b) => a.localeCompare(b, "es"));
   els.skinChampionSelect.innerHTML = '<option value="all">Todos</option>' + champions.map((champion) => `<option value="${escapeHtml(champion)}">${escapeHtml(champion)}</option>`).join("");
   els.skinChampionSelect.value = champions.includes(state.skinChampion) ? state.skinChampion : "all";
@@ -3840,6 +6868,7 @@ const loadMoreSkinsIfNeeded = () => {
 };
 
 const bindSkinLibraryActions = () => {
+  if (!els.skinLibraryList) return;
   els.skinLibraryList.querySelectorAll(".skin-row").forEach((row) => {
     row.addEventListener("click", (event) => {
       if (event.target.closest("button")) return;
@@ -3849,7 +6878,8 @@ const bindSkinLibraryActions = () => {
   });
 
   els.skinLibraryList.querySelectorAll(".skin-favorite").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
       if (state.favoriteSkins.has(button.dataset.path)) {
         state.favoriteSkins.delete(button.dataset.path);
       } else {
@@ -3858,23 +6888,36 @@ const bindSkinLibraryActions = () => {
       state.selectedSkinKey = button.dataset.path;
       saveFavoriteSkins();
       renderSkinProfile();
+      sendPenguSkinCatalog("favorite-updated");
     });
   });
 
   els.skinLibraryList.querySelectorAll(".skin-toggle").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
       if (state.managedSkins.has(button.dataset.path)) {
         state.managedSkins.delete(button.dataset.path);
       } else {
         state.managedSkins.add(button.dataset.path);
       }
+      state.selectedSkinKey = button.dataset.path;
       saveManagedSkins();
+      renderSkinProfile();
     });
   });
 
   els.skinLibraryList.querySelectorAll(".skin-reveal").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
       window.riftAtlas.revealModPath(button.dataset.path);
+    });
+  });
+
+  els.skinLibraryList.querySelectorAll(".skin-edit").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      stopButtonEvent(event);
+      state.selectedSkinKey = button.dataset.path;
+      openSkinMetadataModal(button.dataset.path);
     });
   });
 
@@ -3912,17 +6955,25 @@ const bindSkinLibraryActions = () => {
 };
 
 const renderSkinLibrary = () => {
-  els.managedSkinsCount.textContent = `${state.managedSkins.size} gestionadas`;
-  els.queuedSkinsCount.textContent = `${state.queuedSkins.size} seleccionadas`;
+  if (els.managedSkinsCount) els.managedSkinsCount.textContent = `${state.customMods.length} cargados`;
+  if (els.queuedSkinsCount) els.queuedSkinsCount.textContent = `${state.queuedSkins.size} seleccionados`;
+  if (els.groupSkinsCheckbox) els.groupSkinsCheckbox.checked = state.groupSkinsByChampion;
+  if (els.libraryIndexStatus) {
+    const count = getUnifiedLibrarySkins().length;
+    els.libraryIndexStatus.textContent = state.libraryIndex?.indexPath
+      ? `${count} entrada(s). Indice: ${state.libraryIndex.indexPath}`
+      : `${count} entrada(s). Indice local pendiente.`;
+  }
   if (els.clearQueueButton) {
     const hasActiveP2P = [...state.queuedSkins].some(isActivePartyP2PPath);
     els.clearQueueButton.textContent = hasActiveP2P ? "Limpiar no P2P" : "Limpiar todo";
+    els.clearQueueButton.disabled = state.queuedSkins.size === 0 || state.importingQueue;
   }
-  els.clearQueueButton.disabled = (state.queuedSkins.size === 0 && state.managedSkins.size === 0) || state.importingQueue;
   renderSelectionTray();
-  renderCustomMods();
   renderSkinProfile();
   renderSkinsP2PSection();
+
+  if (!els.skinLibraryList) return;
 
   if (!state.skinLibrary.length) {
     els.skinLibraryList.innerHTML = `
@@ -3956,6 +7007,7 @@ const renderSkinLibrary = () => {
       : "";
   els.skinLibraryList.innerHTML = limitNote + visibleSkins
     .map((skin) => {
+      skin = applySkinMetadata(skin);
       const key = getSkinKey(skin);
       const managed = state.managedSkins.has(key);
       const queued = state.queuedSkins.has(key);
@@ -3966,12 +7018,12 @@ const renderSkinLibrary = () => {
         <article class="skin-row ${managed ? "managed" : ""} ${queued ? "queued" : ""} ${state.selectedSkinKey === key ? "selected" : ""}" data-path="${escapeHtml(key)}">
           <div class="skin-art ${art ? "" : "missing-art"}">
             ${art ? `<img src="${art}" data-fallback="${escapeHtml(fallbackArt)}" alt="${escapeHtml(getSkinDisplayName(skin))}" loading="lazy" />` : ""}
-            <span class="skin-art-fallback">${escapeHtml(skin.extension.replace(".", ""))}</span>
-            <span class="mod-extension">${escapeHtml(skin.extension.replace(".", ""))}</span>
+            <span class="skin-art-fallback">${escapeHtml(getDisplayExtension(skin))}</span>
+            <span class="mod-extension">${escapeHtml(getDisplayExtension(skin))}</span>
           </div>
           <div class="skin-copy">
             <span>${escapeHtml(skin.champion)}</span>
-            <strong>${escapeHtml(skin.skin)}</strong>
+            <strong>${escapeHtml(getSkinVisibleName(skin))}</strong>
             <small>${queued ? "Seleccionada - " : ""}${skin.needsFantonize ? "Genera .fantome local - " : ""}${skin.numericSource ? `ID ${escapeHtml(skin.rawChampion)} / ${escapeHtml(skin.rawSkin)} - ` : ""}${escapeHtml(skin.variant || skin.relativePath)}</small>
           </div>
           <div class="skin-card-footer">
@@ -3980,11 +7032,38 @@ const renderSkinLibrary = () => {
             <button class="secondary-button skin-toggle compact-hidden" type="button" data-path="${escapeHtml(key)}">${managed ? "Quitar" : "Gestionar"}</button>
             <button class="${queued ? "secondary-button" : "docs-link"} skin-queue" type="button" data-path="${escapeHtml(key)}">${queued ? "Quitar" : "Seleccionar"}</button>
           </div>
+          <button class="secondary-button skin-edit" type="button" data-path="${escapeHtml(key)}">Editar</button>
           <button class="secondary-button skin-reveal" type="button" data-path="${escapeHtml(skin.path)}">Abrir</button>
         </article>
       `;
     })
     .join("");
+
+  if (state.groupSkinsByChampion) {
+    const rows = [...els.skinLibraryList.querySelectorAll(".skin-row")];
+    const groups = new Map();
+    rows.forEach((row) => {
+      const champion = row.querySelector(".skin-copy span")?.textContent?.trim() || "Sin campeon";
+      const normalizedChampion = champion.split(" - ")[0] || champion;
+      if (!groups.has(normalizedChampion)) groups.set(normalizedChampion, []);
+      groups.get(normalizedChampion).push(row);
+    });
+    els.skinLibraryList.innerHTML = limitNote;
+    [...groups.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0], "es"))
+      .forEach(([champion, groupRows]) => {
+        const section = document.createElement("section");
+        section.className = "skin-champion-group";
+        section.innerHTML = `
+          <div class="skin-group-heading">
+            <strong>${escapeHtml(champion)}</strong>
+            <span>${groupRows.length} skin(s)</span>
+          </div>
+        `;
+        groupRows.forEach((row) => section.append(row));
+        els.skinLibraryList.append(section);
+      });
+  }
 
   bindSkinLibraryActions();
 };
@@ -3994,10 +7073,60 @@ const loadPresetToQueue = (preset = getActivePreset()) => {
   state.queuedSkins = new Set(normalizeQueuedSkinKeys(preset.skinKeys));
   saveQueuedSkins();
   if (els.presetStatusLabel) els.presetStatusLabel.textContent = `Preset "${preset.name}" cargado a la cola.`;
+  if (preset.autoApply) {
+    setTimeout(() => applyQueuedSkins().catch(() => false), 100);
+  }
 };
 
-const applyQueuedSkins = async (skinKeysOverride = null) => {
-  if (state.importingQueue) return;
+const buildPreflightChecks = (skinKeys = []) => {
+  const queued = skinKeys.map(getSkinByKey).filter(Boolean);
+  const paths = queued.map((skin) => skin.path).filter(Boolean);
+  const champions = queued.map(getQueueChampionKey).filter(Boolean);
+  const duplicateChampions = champions.filter((champion, index) => champions.indexOf(champion) !== index);
+  return [
+    { id: "league", ok: Boolean(state.leagueGamePath), label: "League path", detail: state.leagueGamePath || "No configurado" },
+    { id: "engine", ok: Boolean(state.ltkOverlaySidecarPath), label: "Engine", detail: state.ltkOverlaySidecarPath || "No configurado" },
+    { id: "dll", ok: state.engineBinaryName === "mod-tools.exe" || Boolean(state.ltkOverlayDllPath), label: "DLL", detail: state.engineBinaryName === "mod-tools.exe" ? "No requerida por runoverlay" : (state.ltkOverlayDllPath || "No configurada") },
+    { id: "mods", ok: paths.length === skinKeys.length && paths.length > 0, label: "Mods locales", detail: `${paths.length}/${skinKeys.length} archivo(s) resueltos` },
+    { id: "pengu", ok: state.penguBridgeConnected || !state.penguAutoParty, label: "Pengu", detail: state.penguBridgeConnected ? "Plugin conectado" : "No conectado; overlay manual puede continuar" },
+    { id: "conflicts", ok: duplicateChampions.length === 0, label: "Conflictos", detail: duplicateChampions.length ? "Hay mas de una skin para el mismo campeon" : "Sin conflictos obvios" },
+    { id: "cache", ok: true, label: "Overlay cache", detail: state.customOverlayPath ? "Overlay base disponible" : "Se construira si hace falta" }
+  ];
+};
+
+const confirmPreflight = (checks = []) => new Promise((resolve) => {
+  if (!els.preflightModal || !els.preflightList) {
+    resolve(true);
+    return;
+  }
+  const blocking = checks.filter((check) => !check.ok && ["league", "engine", "mods"].includes(check.id));
+  els.preflightSummary.textContent = blocking.length
+    ? `${blocking.length} punto(s) importantes necesitan atencion.`
+    : "Todo listo para aplicar.";
+  els.preflightList.innerHTML = checks
+    .map((check) => `
+      <article class="diagnostic-row ${check.ok ? "ok" : "bad"}">
+        <span>${check.ok ? "OK" : "!"}</span>
+        <div>
+          <strong>${escapeHtml(check.label)}</strong>
+          <small>${escapeHtml(check.detail)}</small>
+        </div>
+      </article>
+    `)
+    .join("");
+  els.preflightModal.hidden = false;
+  const finish = (value) => {
+    els.preflightModal.hidden = true;
+    els.confirmPreflightButton.onclick = null;
+    els.cancelPreflightButton.onclick = null;
+    resolve(value);
+  };
+  els.confirmPreflightButton.onclick = () => finish(true);
+  els.cancelPreflightButton.onclick = () => finish(false);
+});
+
+const applyQueuedSkins = async (skinKeysOverride = null, options = {}) => {
+  if (state.importingQueue) return false;
   const isPartyApply = Array.isArray(skinKeysOverride);
   if (isPartyConnected() && !isPartyApply) {
     setOverlayPanelStatus({
@@ -4006,81 +7135,265 @@ const applyQueuedSkins = async (skinKeysOverride = null) => {
     });
     renderSelectionTray();
     renderCompactLauncher();
-    return;
-  }
-  if (state.overlayRunning) {
-    setOverlayPanelStatus({
-      label: "Overlay activo",
-      message: "Overlay activo. Detenlo antes de ejecutar otra vez.",
-      active: true
-    });
-    return;
+    return false;
   }
   const skinKeys = isPartyApply ? skinKeysOverride : [...state.queuedSkins];
-  if (skinKeys.length === 0) return;
+  const optionExtraMods = Array.isArray(options.extraMods) ? options.extraMods.filter((mod) => mod?.path) : [];
+  const totalRequestedMods = skinKeys.length + optionExtraMods.length;
+  if (totalRequestedMods === 0) return false;
+  if (!options.skipPreflight && !state.preflightAcceptedOnce && !isPartyApply) {
+    const accepted = await confirmPreflight(buildPreflightChecks(skinKeys));
+    if (!accepted) return false;
+    state.preflightAcceptedOnce = true;
+    setTimeout(() => {
+      state.preflightAcceptedOnce = false;
+    }, 1500);
+  }
   state.importingQueue = true;
   renderSkinLibrary();
 
   const queued = skinKeys.map(getSkinByKey).filter(Boolean);
   const skinPaths = queued.map((s) => s.path).filter(Boolean);
 
-  if (!skinPaths.length) {
+  if (!skinPaths.length && !optionExtraMods.length) {
     state.importingQueue = false;
     renderSkinLibrary();
     setOverlayPanelStatus({ message: "Las skins seleccionadas no tienen archivo local." });
-    return;
+    return false;
+  }
+
+  if (!state.ltkOverlaySidecarPath) {
+    state.importingQueue = false;
+    await autoConfigureOverlay({ silent: true });
+    state.importingQueue = true;
   }
 
   if (!state.ltkOverlaySidecarPath) {
     state.importingQueue = false;
     renderSkinLibrary();
-    setOverlayPanelStatus({ message: "Engine no configurado. Descargalo o configuralo en Configuracion." });
-    return;
+    setOverlayPanelStatus({
+      label: "Engine faltante",
+      message: `No encontre ${state.engineBinaryName}. Instalalo desde Descargas o cambia el modo de engine en Configuracion.`
+    });
+    return false;
   }
 
+  const restartingOverlay = state.overlayRunning;
+  const totalOverlayMods = skinPaths.length + optionExtraMods.length;
   setOverlayPanelStatus({
-    label: "Aplicando",
-    message: `Inyectando ${formatSkinCount(skinPaths.length)} (mkoverlay + patcher)...`
+    label: restartingOverlay ? "Reiniciando overlay" : "Aplicando",
+    message: restartingOverlay
+      ? `Deteniendo overlay actual para aplicar ${formatSkinCount(totalOverlayMods)}...`
+      : `Aplicando ${formatSkinCount(totalOverlayMods)} (mkoverlay + runoverlay)...`
   });
   try {
-    const result = await window.riftAtlas.runBocchiOverlay({
+    if (restartingOverlay) {
+      await window.riftAtlas.stopOverlay();
+      state.overlayRunning = false;
+      await refreshOverlayStatus();
+      setOverlayPanelStatus({
+        label: "Aplicando",
+        message: `Overlay anterior detenido. Aplicando ${formatSkinCount(totalOverlayMods)} (mkoverlay + runoverlay)...`
+      });
+    }
+
+    await startRoseEarlyMonitor("manual-apply");
+
+    const extraMods = [...await getSelectedRoseExtraMods(), ...optionExtraMods];
+
+    const runOverlay = state.engineBinaryName === "mod-tools.exe"
+      ? window.riftAtlas.runRoseOverlay
+      : window.riftAtlas.runBocchiOverlay;
+    if (!runOverlay) throw new Error("Runner de overlay no disponible; reinicia la aplicacion.");
+    const result = await runOverlay({
       sidecarPath: state.ltkOverlaySidecarPath,
       dllPath: state.ltkOverlayDllPath,
       gamePath: state.leagueGamePath,
       skinPaths,
-      skinEntries: queued
+      skinEntries: queued,
+      roseMode: state.engineBinaryName === "mod-tools.exe",
+      forceFreshOverlay: true,
+      extraMods: extraMods.length > 0 ? extraMods : undefined
     });
+    await stopRoseEarlyMonitor("manual-overlay-ready");
 
     if (result.enginePath) {
       setLtkOverlaySidecarPath(result.enginePath);
     }
     addOverlayHistoryEntry(queued);
-    setOverlayPanelStatus({
-      label: "Overlay activo",
-      message: `Overlay activo. ${formatSkinCount(skinPaths.length)} cargada${skinPaths.length === 1 ? "" : "s"}. Entra a partida para ver las skins.`,
-      active: true
-    });
+    if (result.ready === false) {
+      setOverlayPanelStatus({
+        label: "Overlay esperando",
+        message: `Runoverlay quedo listo con ${formatSkinCount(totalOverlayMods)}. Esperando a que League cargue la partida para enganchar la DLL.`,
+        active: true
+      });
+    } else {
+      setOverlayPanelStatus({
+        label: "Overlay activo",
+        message: `Overlay activo. ${formatSkinCount(totalOverlayMods)} cargada${totalOverlayMods === 1 ? "" : "s"}. Entra a partida para ver las skins.`,
+        active: true
+      });
+    }
     await refreshOverlayStatus();
+    return true;
   } catch (error) {
     setOverlayPanelStatus({
       label: "Error",
       message: `Error: ${error.message}`,
       error: true
     });
+    return false;
+  } finally {
+    await stopRoseEarlyMonitor("apply-finally");
+    state.importingQueue = false;
+    renderSkinLibrary();
+  }
+};
+
+const isLeagueGameRunning = async () => {
+  if (GAMEFLOW_ACTIVE_PHASES.has(state.penguGameflowPhase)) return true;
+  try {
+    const status = await window.riftAtlas.isLeagueGameRunning?.(state.leagueGamePath);
+    return Boolean(status?.running);
+  } catch {
+    return false;
+  }
+};
+
+const maybeRunCustomOverlayFromPrebuild = async (reason = "prebuild") => {
+  if (!state.customOverlayPath || state.importingQueue || state.overlayRunning) return false;
+  if (!state.ltkOverlaySidecarPath || !state.leagueGamePath) return false;
+
+  const customKeys = (state.customOverlayKeys || []).filter((key) => {
+    const skin = getSkinByKey(key);
+    return skin?.custom && !isDownloadedLeagueSkinsPath(key);
+  });
+  if (!customKeys.length) return false;
+
+  const running = await isLeagueGameRunning();
+  if (!running) {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] prebuild custom listo pero League no esta en partida (${reason}). overlay=${state.customOverlayPath}`).catch(() => { });
+    return false;
   }
 
-  state.importingQueue = false;
-  renderSkinLibrary();
+  const signature = `${state.customOverlayPath}|${customKeys.join("|")}`;
+  if (state.autoRunCustomOverlaySignature === signature) return false;
+  state.autoRunCustomOverlaySignature = signature;
+
+  state.importingQueue = true;
+  setOverlayPanelStatus({
+    label: "Activando overlay",
+    message: "Partida detectada. Arrancando runoverlay con mods propios..."
+  });
+  try {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] auto-run overlay custom (${reason}): ${state.customOverlayPath}`).catch(() => { });
+    const result = await window.riftAtlas.runBocchiOverlay({
+      sidecarPath: state.ltkOverlaySidecarPath,
+      dllPath: state.ltkOverlayDllPath,
+      gamePath: state.leagueGamePath,
+      skinEntries: [],
+      baseOverlayPath: state.customOverlayPath,
+      allowNoCacheBase: true
+    });
+    if (result?.enginePath) setLtkOverlaySidecarPath(result.enginePath);
+    setOverlayPanelStatus({
+      label: result?.ready === false ? "Overlay esperando" : "Overlay activo",
+      message: result?.ready === false
+        ? "Runoverlay quedo listo y espera enganchar League."
+        : "Overlay activo con mods propios.",
+      active: true
+    });
+    await refreshOverlayStatus();
+    return Boolean(result?.success);
+  } catch (error) {
+    state.autoRunCustomOverlaySignature = "";
+    setOverlayPanelStatus({
+      label: "Error",
+      message: `No pude arrancar el overlay custom: ${error.message || error}`,
+      error: true
+    });
+    return false;
+  } finally {
+    state.importingQueue = false;
+    renderSkinLibrary();
+    renderSelectionTray();
+  }
+};
+
+const prebuildCustomOverlay = async () => {
+  if (state.prebuildingOverlay) return;
+  state.prebuildingOverlay = true;
+  try {
+    if (state.engineBinaryName === "mod-tools.exe") {
+      state.customOverlayPath = "";
+      state.customOverlayKeys = [];
+      state.autoRunCustomOverlaySignature = "";
+      return;
+    }
+    if (!state.ltkOverlaySidecarPath || !state.leagueGamePath) return;
+    const customKeys = [...state.queuedSkins].filter((key) => {
+      const skin = getSkinByKey(key);
+      return skin?.custom && !isDownloadedLeagueSkinsPath(key);
+    });
+    if (!customKeys.length) {
+      state.customOverlayPath = "";
+      state.customOverlayKeys = [];
+      renderBaseOverlayStatus();
+      return;
+    }
+
+    const entries = customKeys.map((k) => getSkinByKey(k)).filter(Boolean);
+    if (!entries.length) {
+      state.customOverlayPath = "";
+      state.customOverlayKeys = [];
+      renderBaseOverlayStatus();
+      return;
+    }
+
+    const result = await window.riftAtlas.buildBaseOverlay({
+      sidecarPath: state.ltkOverlaySidecarPath,
+      gamePath: state.leagueGamePath,
+      skinEntries: entries
+    });
+    if (result?.overlayPath) {
+      state.customOverlayPath = result.overlayPath;
+      state.customOverlayKeys = customKeys;
+    } else {
+      state.customOverlayPath = "";
+      state.customOverlayKeys = [];
+      state.autoRunCustomOverlaySignature = "";
+    }
+  } catch {
+    state.customOverlayPath = "";
+    state.customOverlayKeys = [];
+    state.autoRunCustomOverlaySignature = "";
+  } finally {
+    state.prebuildingOverlay = false;
+  }
+  renderBaseOverlayStatus();
+};
+
+const schedulePrebuildCustomOverlay = () => {
+  if (state.customOverlayTimer) clearTimeout(state.customOverlayTimer);
+  state.customOverlayTimer = setTimeout(() => {
+    state.customOverlayTimer = null;
+    prebuildCustomOverlay();
+  }, 700);
 };
 
 const applyPartyQueue = async () => {
   const readiness = getPartyReadiness();
-  const partyKeys = getPartyApplyKeys();
-  if (!readiness.allReady || !partyKeys.length) {
+  const partyKeys = getPartySharedKeys();
+  const partyExtraMods = getPartyPeerExtraMods();
+  if (!readiness.allReady || (!partyKeys.length && !partyExtraMods.length)) {
     renderParty();
     return;
   }
-  await applyQueuedSkins(partyKeys);
+  await window.riftAtlas.appendOverlayLog?.(`[PartyMode] Aplicando party estilo Rose: propias=${partyKeys.length} peers=${partyExtraMods.length}.`).catch(() => { });
+  await applyQueuedSkins(partyKeys, {
+    extraMods: partyExtraMods,
+    source: "party"
+  });
 };
 
 const stopOverlayFromUi = async () => {
@@ -4088,6 +7401,7 @@ const stopOverlayFromUi = async () => {
     const result = await window.riftAtlas.stopOverlay();
     state.importingQueue = false;
     state.overlayRunning = false;
+    state.autoRunCustomOverlaySignature = "";
     setOverlayPanelStatus({
       label: "Sin overlay",
       message: result.stopped ? "Overlay detenido." : "No habia overlay activo."
@@ -4114,20 +7428,40 @@ const refreshOverlayStatus = async () => {
     const wasRunning = state.overlayRunning;
     state.overlayRunning = Boolean(status.running);
     state.overlayProfilePath = status.profilePath || "";
+    const signature = [
+      state.overlayRunning ? "1" : "0",
+      status.ready ? "1" : "0",
+      state.overlayProfilePath,
+      status.error || "",
+      state.overlayActiveMessage || ""
+    ].join("::");
+    const statusChanged = signature !== lastOverlayStatusSignature;
+    lastOverlayStatusSignature = signature;
     if (state.importingQueue && !status.error) {
-      renderCompactLauncher();
+      if (statusChanged) renderCompactLauncher();
+      return;
+    }
+    if (!statusChanged) {
       return;
     }
     if (status.error) {
       state.overlayRunning = false;
       setConfigStatus(status.error);
-      setOverlayPanelStatus({ label: "Error de DLL", message: status.error, error: true });
+      setOverlayPanelStatus({ label: "Error de inyeccion", message: status.error, error: true });
     } else if (state.overlayRunning) {
-      setOverlayPanelStatus({
-        label: "Overlay activo",
-        message: state.overlayActiveMessage || "Overlay activo. Entra a partida para ver las skins.",
-        active: true
-      });
+      if (status.ready === false) {
+        setOverlayPanelStatus({
+          label: "Overlay esperando",
+          message: state.overlayActiveMessage || "Runoverlay esta listo y esperando que League cargue la partida.",
+          active: true
+        });
+      } else {
+        setOverlayPanelStatus({
+          label: "Overlay activo",
+          message: state.overlayActiveMessage || "Overlay activo. Entra a partida para ver las skins.",
+          active: true
+        });
+      }
     } else {
       setOverlayPanelStatus({
         label: "Sin overlay",
@@ -4184,6 +7518,33 @@ const renderLeagueIssueRows = (items = [], label, mapper) => items
     </article>
   `)
   .join("");
+
+const renderMaintenance = async () => {
+  if (!els.maintenanceList) return;
+  els.maintenanceList.innerHTML = '<div class="tier-empty">Leyendo caches...</div>';
+  try {
+    const result = await window.riftAtlas.maintenanceStatus?.();
+    els.maintenanceList.innerHTML = (result?.targets || [])
+      .map((target) => `
+        <article class="diagnostic-row ${target.exists ? "ok" : ""}">
+          <span>${target.exists ? "OK" : "-"}</span>
+          <div>
+            <strong>${escapeHtml(target.name)}</strong>
+            <small>${escapeHtml(target.path)} - ${formatBytes(target.size || 0)}</small>
+          </div>
+        </article>
+      `)
+      .join("") || '<div class="tier-empty">Sin datos de mantenimiento.</div>';
+  } catch (error) {
+    els.maintenanceList.innerHTML = `<div class="tier-empty">${escapeHtml(error.message)}</div>`;
+  }
+};
+
+const cleanupMaintenanceTargets = async (targets = []) => {
+  await window.riftAtlas.cleanupMaintenance?.({ targets });
+  await renderMaintenance();
+  setConfigStatus("Mantenimiento completado.");
+};
 
 const runLeagueInstallCheck = async () => {
   if (!els.leagueCheckList) return;
@@ -4266,7 +7627,7 @@ const applyToLtk = async () => {
 
     for (const r of result.results) {
       if (r.success && !r.skipped) {
-        const skin = state.skinLibrary.find((s) => s.path === r.path);
+        const skin = state.customMods.find((s) => s.path === r.path);
         if (skin) {
           state.managedSkins.add(getSkinKey(skin));
         }
@@ -4283,16 +7644,72 @@ const applyToLtk = async () => {
 };
 
 const bindEvents = () => {
+  els.titlebar?.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.target.closest("button, a, input, select")) return;
+    window.riftAtlas.windowStartDragging?.().catch(() => null);
+  });
+  els.titlebar?.addEventListener("dblclick", async (event) => {
+    if (event.target.closest("button, a, input, select")) return;
+    const maximized = await window.riftAtlas.windowToggleMaximize?.().catch(() => null);
+    if (maximized !== null) updateMaximizeIcon(maximized);
+  });
+
+  // Window maximize state change - update icon
+  const updateMaximizeIcon = (maximized) => {
+    if (els.windowMaximizeButton) {
+      els.windowMaximizeButton.textContent = maximized ? "❐" : "□";
+      els.windowMaximizeButton.title = maximized ? "Restaurar" : "Maximizar o restaurar";
+    }
+  };
+  window.riftAtlas.onWindowMaximizeChange?.((payload) => {
+    updateMaximizeIcon(payload?.maximized);
+  });
+  window.riftAtlas.windowIsMaximized?.().then((m) => updateMaximizeIcon(m)).catch(() => {});
+
+  els.windowMinimizeButton?.addEventListener("click", () => window.riftAtlas.windowMinimize?.());
+  els.windowMaximizeButton?.addEventListener("click", async () => {
+    const maximized = await window.riftAtlas.windowToggleMaximize?.().catch(() => null);
+    if (maximized !== null) updateMaximizeIcon(maximized);
+  });
+  els.windowCloseButton?.addEventListener("click", () => window.riftAtlas.windowHide?.());
+
+  // Detect league path button
+  els.detectLeaguePathButton?.addEventListener("click", async () => {
+    els.detectLeaguePathButton.disabled = true;
+    els.detectLeaguePathButton.textContent = "Detectando...";
+    try {
+      const result = await window.riftAtlas.detectLeaguePath();
+      if (result?.detected) {
+        setLeagueGamePath(result.leagueGamePath);
+        setConfigStatus("League detectado y guardado.");
+      } else {
+        setConfigStatus("No se encontro League. Asegurate de que este instalado o selecciona la ruta manualmente.");
+      }
+    } catch (err) {
+      setConfigStatus("Error detectando League: " + (err.message || err));
+    } finally {
+      els.detectLeaguePathButton.disabled = false;
+      els.detectLeaguePathButton.textContent = "Detectar";
+    }
+  });
+
+  // League detected on startup
+  window.riftAtlas.onLeagueDetected?.((payload) => {
+    if (payload?.detected && payload.leagueGamePath) {
+      setLeagueGamePath(payload.leagueGamePath);
+    }
+  });
+
   els.searchInput.addEventListener("input", (event) => {
     state.query = event.target.value.trim();
-    renderChampionGrid();
+    renderChampionGrid({ resetScroll: true });
   });
 
   document.querySelectorAll(".filter-pill").forEach((button) => {
     button.addEventListener("click", () => {
       state.role = button.dataset.role;
       document.querySelectorAll(".filter-pill").forEach((item) => item.classList.toggle("active", item === button));
-      renderChampionGrid();
+      renderChampionGrid({ resetScroll: true });
     });
   });
 
@@ -4311,12 +7728,6 @@ const bindEvents = () => {
 
   document.querySelectorAll(".nav-item").forEach((button) => {
     button.addEventListener("click", () => {
-      if (button.dataset.view === "help") {
-        tutorialAutoStarted = false;
-        forceStartTutorial({ reason: "help" });
-        closeIntroSidebar();
-        return;
-      }
       setView(button.dataset.view);
       closeIntroSidebar();
     });
@@ -4334,28 +7745,6 @@ const bindEvents = () => {
 
   document.querySelectorAll(".nav-shortcut").forEach((button) => {
     button.addEventListener("click", () => setView(button.dataset.viewTarget));
-  });
-
-  els.apiKeyForm?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    try {
-      await window.riftAtlas.setRiotApiKey(els.apiKeyInput.value);
-      els.apiKeyInput.value = "";
-      setApiKeyStatus(true, "API key cargada solo para esta sesion.");
-    } catch (error) {
-      setApiKeyStatus(false, error.message);
-    }
-  });
-
-  els.clearApiKeyButton?.addEventListener("click", async () => {
-    const hasEnvKey = await window.riftAtlas.clearRiotApiKey();
-    setApiKeyStatus(hasEnvKey, hasEnvKey ? "Key de sesion borrada. Sigue activa la variable RIOT_API_KEY." : "Key de sesion borrada.");
-    els.apiKeyInput.value = "";
-  });
-
-  els.playerSearchForm?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    lookupPlayer();
   });
 
   els.buildSearchForm?.addEventListener("submit", (event) => {
@@ -4424,12 +7813,14 @@ const bindEvents = () => {
 
   document.querySelectorAll(".selection-stop-button").forEach((button) => button.addEventListener("click", stopOverlayFromUi));
 
-  els.compactRunButton?.addEventListener("click", applyQueuedSkins);
-  els.compactStopButton?.addEventListener("click", stopOverlayFromUi);
-  els.compactLoadPresetButton?.addEventListener("click", () => {
-    const preset = state.presets.find((item) => item.id === els.compactPresetSelect.value) || getActivePreset();
-    if (preset) loadPresetToQueue(preset);
-  });
+  document.querySelectorAll("#rebuildBaseOverlayButton").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.textContent = "Construyendo...";
+    await prebuildCustomOverlay();
+    renderBaseOverlayStatus();
+    button.disabled = false;
+    button.textContent = "Reconstruir";
+  }));
 
   els.clearOverlayHistoryButton?.addEventListener("click", () => {
     state.overlayHistory = [];
@@ -4438,13 +7829,40 @@ const bindEvents = () => {
 
   els.runDiagnosticsButton?.addEventListener("click", runDiagnostics);
   els.checkLeagueInstallButton?.addEventListener("click", runLeagueInstallCheck);
+  els.refreshMaintenanceButton?.addEventListener("click", renderMaintenance);
+  els.cleanupOverlayCacheButton?.addEventListener("click", () => cleanupMaintenanceTargets(["overlays", "staging"]));
+  els.cleanupPreviewCacheButton?.addEventListener("click", () => cleanupMaintenanceTargets(["previews"]));
+  els.cleanupPartyCacheButton?.addEventListener("click", () => cleanupMaintenanceTargets(["party", "party-transfers"]));
+  els.cleanupDownloadsButton?.addEventListener("click", () => cleanupMaintenanceTargets(["downloads"]));
+  els.openLogsFolderButton?.addEventListener("click", async () => {
+    const folderPath = await window.riftAtlas.openLogsFolder?.();
+    setConfigStatus(`Logs abiertos: ${folderPath}`);
+  });
+  els.exportDiagnosticsButton?.addEventListener("click", async () => {
+    const result = await window.riftAtlas.exportDiagnostics?.({
+      queuedSkins: [...state.queuedSkins],
+      presets: state.presets,
+      leagueGamePath: state.leagueGamePath,
+      ltkOverlaySidecarPath: state.ltkOverlaySidecarPath,
+      ltkOverlayDllPath: state.ltkOverlayDllPath,
+      libraryIndex: state.libraryIndex
+    });
+    setConfigStatus(`Diagnostico exportado: ${result?.exportPath || ""}`);
+  });
+
+  document.getElementById("helpStartTutorialButton")?.addEventListener("click", () => {
+    tutorialAutoStarted = false;
+    forceStartTutorial({ reason: "help-page" });
+  });
 
   if (window.riftAtlas.onDownloadProgress) {
     window.riftAtlas.onDownloadProgress((payload) => {
       if (!payload || !payload.type) return;
-      if (state.activeDownloadType && payload.type !== state.activeDownloadType && payload.type !== "app-update") return;
+      const bootstrapComponent = state.activeDownloadType === "first-run-bootstrap" &&
+        ["first-run-bootstrap", "engine", "league-skins", "pengu-loader"].includes(payload.type);
+      if (state.activeDownloadType && !bootstrapComponent && payload.type !== state.activeDownloadType && payload.type !== "app-update") return;
       const percentText = formatDownloadProgress(payload);
-      if (els.downloadProgressLabel && ["engine", "league-skins", "pengu-loader"].includes(payload.type)) {
+      if (els.downloadProgressLabel && ["first-run-bootstrap", "engine", "league-skins", "pengu-loader"].includes(payload.type)) {
         els.downloadProgressLabel.textContent = `${payload.message || "Descargando..."}${percentText}`;
       }
       if (els.updateStatusLabel && payload.type === "app-update") {
@@ -4464,8 +7882,33 @@ const bindEvents = () => {
   if (window.riftAtlas.onPenguBridgeStatus) {
     window.riftAtlas.onPenguBridgeStatus((payload = {}) => {
       state.penguBridgeConnected = Boolean(payload.connected);
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] puente Pengu: conectado=${state.penguBridgeConnected} clientes=${payload.clients}`).catch(() => { });
       renderPenguBridgeStatus();
-      if (state.penguBridgeConnected) sendPenguSkinCatalog("bridge-connected");
+      if (state.penguBridgeConnected) {
+        Promise.allSettled([
+          ensureSkinLibraryLoaded(),
+          ensureUserModsLoaded()
+        ])
+          .catch((error) => {
+            window.riftAtlas.appendOverlayLog(`[Diagnostico] no pude precargar LeagueSkins para Pengu: ${error.message}`).catch(() => { });
+          })
+          .finally(() => {
+            sendPenguSkinCatalog("bridge-connected");
+            sendPenguDebugMode(Boolean(window.__riftAtlasDebug), "bridge-connected");
+            replayCustomModState();
+          });
+      }
+    });
+  }
+
+  if (window.riftAtlas.onPatcherDied) {
+    window.riftAtlas.onPatcherDied(() => {
+      window.riftAtlas.appendOverlayLog("[Diagnostico] patcher-died event recibido, limpiando estado inmediatamente.").catch(() => { });
+      state.overlayRunning = false;
+      setOverlayPanelStatus({ label: "Sin overlay", message: "Overlay terminado." });
+      renderSelectionTray();
+      renderCompactLauncher();
+      renderParty();
     });
   }
 
@@ -4480,30 +7923,176 @@ const bindEvents = () => {
   if (window.riftAtlas.onPenguMessage) {
     window.riftAtlas.onPenguMessage((payload = {}) => {
       if (payload.source === "rift-atlas-app") return;
+      if (payload.type?.startsWith("party-")) {
+        handlePenguPartyModeMessage(payload).catch((error) => {
+          window.riftAtlas.appendOverlayLog(`[PartyMode] ${error.message}`).catch(() => { });
+        });
+        return;
+      }
+      if (payload.type === "dismiss-custom-mod") {
+        lastCustomModStateSignature = "";
+        clearRoseAuthoritativeSelection();
+        window.riftAtlas.appendOverlayLog("[Rose] custom mod descartado desde el popup de Pengu.").catch(() => { });
+        return;
+      }
       if (payload.type === "skin-catalog-request") {
-        sendPenguSkinCatalog("client-request");
+        Promise.allSettled([
+          ensureSkinLibraryLoaded(),
+          ensureUserModsLoaded()
+        ])
+          .catch((error) => {
+            window.riftAtlas.appendOverlayLog(`[Diagnostico] no pude cargar LeagueSkins para catalog-request: ${error.message}`).catch(() => { });
+          })
+          .finally(() => sendPenguSkinCatalog("client-request"));
       }
       if (payload.type === "phase-change") {
         handlePenguPhaseChange(payload);
+      }
+      if (payload.type === "champion-locked") {
+        state.penguChampionLocked = true;
+        const lockedChampionId = Number(payload.championId || 0);
+        const lockedSelectedSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
+        if (lockedChampionId && lockedSelectedSkinId) {
+          lastPenguLcuSelection = { championId: lockedChampionId, selectedSkinId: lockedSelectedSkinId, at: Date.now() };
+        }
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] champion-locked recibido; procesando skin-syncs desde ahora.`).catch(() => { });
+        // The first skin snapshot can arrive just before the lock event. Rose
+        // retains that snapshot; replay it now instead of waiting for the DOM to
+        // emit the same skin again (which is not guaranteed for every champion).
+        const pendingLockedPayload = lastPenguSkinSyncPayload?.canonical
+          ? null
+          : (lastPenguSkinSyncPayload || {});
+        const replayPayload = {
+          ...pendingLockedPayload,
+          championId: Number(pendingLockedPayload.championId || lockedChampionId || 0) || undefined,
+          selectedSkinId: Number(pendingLockedPayload.selectedSkinId || pendingLockedPayload.skinId || lockedSelectedSkinId || 0) || undefined,
+          skin: pendingLockedPayload.skin || pendingLockedPayload.originalName || payload.name || undefined,
+          originalName: pendingLockedPayload.originalName || pendingLockedPayload.skin || payload.name || undefined,
+        };
+        if (replayPayload.skin || replayPayload.selectedSkinId || replayPayload.skinId) {
+          penguSkinSyncQueue = penguSkinSyncQueue
+            .catch(() => null)
+            .then(() => handlePenguSkinSync(replayPayload))
+            .catch((error) => {
+              window.riftAtlas.appendOverlayLog(`[Diagnostico] replay post-lock fallo: ${error.message || error}`).catch(() => { });
+            });
+        }
+      }
+      if (payload.type === "loadout-finalization") {
+        handlePenguLoadoutFinalization(payload);
       }
       if (payload.type === "carousel-status") {
         handlePenguCarouselStatus(payload);
       }
       if (payload.type === "skin-apply") {
-        handlePenguSkinApply(payload).catch((error) => {
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-apply recibido, encolando por handlePenguSkinSync (estilo Rose: un solo camino)`).catch(() => { });
+      }
+      if (payload.type === "lcu-selection-state") {
+        const championId = Number(payload.championId || 0);
+        const selectedSkinId = Number(payload.selectedSkinId || 0);
+        if (championId && selectedSkinId) {
+          lastPenguLcuSelection = { championId, selectedSkinId, at: Date.now() };
+          if (roseAuthoritativeSelection.championId === championId && roseAuthoritativeSelection.payload) {
+            roseAuthoritativeSelection = {
+              ...roseAuthoritativeSelection,
+              payload: {
+                ...roseAuthoritativeSelection.payload,
+                actualLcuSkinId: selectedSkinId,
+              },
+            };
+          }
+          if (lastPenguSkinSyncPayload?.championId === championId) {
+            lastPenguSkinSyncPayload = {
+              ...lastPenguSkinSyncPayload,
+              actualLcuSkinId: selectedSkinId,
+            };
+          }
+        }
+      }
+      if (payload.type === "skin-state" || payload.type === "force-skin-result") {
+        const forceRequestId = String(payload.forceRequestId || "");
+        if (forceRequestId && pendingPenguForceSkinRequests.has(forceRequestId)) {
+          const pending = pendingPenguForceSkinRequests.get(forceRequestId);
+          pendingPenguForceSkinRequests.delete(forceRequestId);
+          pending?.resolve?.(payload);
+        }
+        const forcedChampionId = Number(payload.championId || 0);
+        const verifiedSkinId = Number(payload.verifiedSkinId || 0);
+        if (payload.type === "force-skin-result" && forcedChampionId && verifiedSkinId) {
+          lastPenguLcuSelection = { championId: forcedChampionId, selectedSkinId: verifiedSkinId, at: Date.now() };
+        }
+        const signature = `${payload.championId || ""}:${payload.skinId || ""}:${payload.name || ""}:${payload.owned ?? ""}:${payload.forceOk ?? ""}:${payload.forceError || ""}`;
+        const now = Date.now();
+        if (signature !== lastPenguSkinStateSignature || now - lastPenguSkinStateAt > 5000) {
+          lastPenguSkinStateSignature = signature;
+          lastPenguSkinStateAt = now;
+          window.riftAtlas.appendOverlayLog(`[Diagnostico] ${payload.type} recibido: championId=${payload.championId} skinId=${payload.skinId} name=${payload.name} owned=${payload.owned === true ? "si" : payload.owned === false ? "no" : "?"} accepted=${payload.requestAccepted ?? ""} forceOk=${payload.forceOk ?? ""} method=${payload.forceMethod || ""} verified=${payload.verifiedSkinId || ""} error=${payload.forceError || ""}`).catch(() => { });
+        }
+      }
+      if (payload.type === "owned-skins") {
+        state.penguOwnedSkinIds = new Set(
+          (payload.ownedSkinIds || [])
+            .map((id) => Number(id))
+            .filter((id) => Number.isFinite(id) && id > 0)
+        );
+        for (const skinMap of lcuChampionSkinCache.values()) {
+          for (const [chromaId, baseSkinId] of skinMap.baseSkinByChroma?.entries?.() || []) {
+            if (state.penguOwnedSkinIds.has(Number(chromaId))) {
+              state.penguOwnedSkinIds.add(Number(baseSkinId));
+            }
+          }
+        }
+        state.penguOwnedSkinsReady = true;
+        const count = state.penguOwnedSkinIds.size || payload.count || 0;
+        if (count !== lastPenguOwnedSkinCount) {
+          lastPenguOwnedSkinCount = count;
+          window.riftAtlas.appendOverlayLog(`[Diagnostico] Pengu inventario del cliente cargado: ${count} owned skin(s). No es el total de LeagueSkins.`).catch(() => { });
+        }
+      }
+      if (payload.type === "chroma-panel-opened") {
+        lastPenguChromaPanel = {
+          championId: Number(payload.championId || 0),
+          skinId: Number(payload.skinId || 0),
+          open: true,
+          at: Date.now()
+        };
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] chroma panel abierto: championId=${payload.championId || ""} skinId=${payload.skinId || ""}`).catch(() => { });
+      }
+      if (payload.type === "chroma-panel-closed") {
+        lastPenguChromaPanel = {
+          championId: Number(payload.championId || 0),
+          skinId: Number(payload.skinId || payload.baseSkinId || 0),
+          open: false,
+          at: Date.now()
+        };
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] chroma panel cerrado: championId=${payload.championId || ""} skinId=${payload.skinId || payload.baseSkinId || ""} reason=${payload.reason || ""}`).catch(() => { });
+      }
+      if (payload.type === "chroma-selection") {
+        window.riftAtlas.sendPenguMessage?.({
+          type: "chroma-state",
+          championId: Number(payload.championId || 0),
+          currentSkinId: Number(payload.baseSkinId || payload.skinId || 0),
+          selectedChromaId: Number(payload.chromaId || payload.selectedSkinId || payload.skinId || 0),
+          chromaColor: payload.primaryColor || null,
+          chromaColors: payload.colors || [],
+          chromaName: payload.chromaName || "",
+          source: "rift-atlas-app"
+        }).catch(() => null);
+      }
+      if (payload.type === "request-chroma-data" && payload.skinId) {
+        const signature = `${payload.skinId}:${payload.skin || ""}`;
+        lastPenguSkinId = Number(payload.skinId);
+        if (signature !== lastPenguChromaRequestSignature) {
+          lastPenguChromaRequestSignature = signature;
+          window.riftAtlas.appendOverlayLog(`[Diagnostico] request-chroma-data almacenado: skinId=${lastPenguSkinId} skin=${payload.skin || ""}`).catch(() => { });
+        }
+      }
+      if (payload.type === "skin-sync" || payload.type === "chroma-selection" || payload.type === "skin-apply" || (payload.skin && !payload.type)) {
+        penguSkinSyncQueue = penguSkinSyncQueue.catch(() => null).then(() => handlePenguSkinSync(payload)).catch((error) => {
           window.riftAtlas.sendPenguMessage?.({
             type: "skin-apply-result",
             ok: false,
             key: payload.key || payload.path,
-            message: error.message
-          }).catch(() => null);
-        });
-      }
-      if (payload.type === "skin-sync" || payload.type === "chroma-selection" || (payload.skin && !payload.type)) {
-        handlePenguSkinSync(payload).catch((error) => {
-          window.riftAtlas.sendPenguMessage?.({
-            type: "skin-apply-result",
-            ok: false,
             message: error.message
           }).catch(() => null);
         });
@@ -4513,7 +8102,11 @@ const bindEvents = () => {
 
   els.createPartyButton?.addEventListener("click", async () => {
     try {
-      await createParty();
+      if (isPartyConnected()) {
+        await leaveParty();
+      } else {
+        await createParty();
+      }
     } catch (error) {
       if (els.partyConnectionLabel) els.partyConnectionLabel.textContent = error.message;
     }
@@ -4521,6 +8114,12 @@ const bindEvents = () => {
 
   els.joinPartyButton?.addEventListener("click", async () => {
     try {
+      if (!isPartyConnected()) {
+        throw new Error("Enable Party Mode antes de agregar un friend token.");
+      }
+      if (!partyOwnToken) {
+        throw new Error("Esta party no tiene token Rose propio. Usa Enable Party Mode manual.");
+      }
       await joinParty();
     } catch (error) {
       if (els.partyConnectionLabel) els.partyConnectionLabel.textContent = error.message;
@@ -4553,15 +8152,25 @@ const bindEvents = () => {
     renderParty();
   });
 
-  els.skinsP2PApplyButton?.addEventListener("click", applyPartyQueue);
-
   els.copyPartyLinkButton?.addEventListener("click", async () => {
     if (!state.partyLink) return;
     try {
       await navigator.clipboard.writeText(state.partyLink);
-      els.partyShareLinkLabel.textContent = `${state.partyLink} copiado.`;
+      if ("value" in els.partyShareLinkLabel) {
+        els.partyShareLinkLabel.value = state.partyLink;
+      } else {
+        els.partyShareLinkLabel.textContent = `${state.partyLink} copiado.`;
+      }
+      els.copyPartyLinkButton.textContent = "Copied!";
+      setTimeout(() => {
+        if (els.copyPartyLinkButton) els.copyPartyLinkButton.textContent = "Copy";
+      }, 1800);
     } catch {
-      els.partyShareLinkLabel.textContent = state.partyLink;
+      if ("value" in els.partyShareLinkLabel) {
+        els.partyShareLinkLabel.value = state.partyLink;
+      } else {
+        els.partyShareLinkLabel.textContent = state.partyLink;
+      }
     }
   });
 
@@ -4586,15 +8195,49 @@ const bindEvents = () => {
   });
 
   els.downloadCslolButton?.addEventListener("click", () => {
-    downloadCslolTools();
-  });
-
-  els.downloadLeagueSkinsButton?.addEventListener("click", () => {
-    loadDownloadedLeagueSkins();
+    if (window.riftAtlasTutorial?.isActive?.()) window.riftAtlasTutorial.pauseForModal();
+    if (els.engineChoiceModal) els.engineChoiceModal.hidden = false;
   });
 
   els.downloadEngineButton?.addEventListener("click", () => {
-    downloadCslolTools();
+    if (window.riftAtlasTutorial?.isActive?.()) window.riftAtlasTutorial.pauseForModal();
+    if (els.engineChoiceModal) els.engineChoiceModal.hidden = false;
+  });
+
+  const hideEngineChoiceModal = () => {
+    if (els.engineChoiceModal) els.engineChoiceModal.hidden = true;
+    if (window.riftAtlasTutorial?.isPaused?.()) window.riftAtlasTutorial.resumeAfterModal();
+  };
+
+  els.chooseLtkManagerButton?.addEventListener("click", () => {
+    hideEngineChoiceModal();
+    downloadCslolTools("ltk-manager.exe");
+  });
+
+  els.chooseModToolsButton?.addEventListener("click", () => {
+    hideEngineChoiceModal();
+    downloadCslolTools("mod-tools.exe");
+  });
+
+  els.cancelEngineChoiceButton?.addEventListener("click", hideEngineChoiceModal);
+
+  els.engineBinarySelector?.addEventListener("change", (e) => {
+    setEngineBinaryName(e.target.value, { detect: true });
+  });
+
+  els.engineModeButtons?.forEach((button) => {
+    button.addEventListener("click", () => {
+      setEngineBinaryName(button.dataset.engineBinary, { detect: true });
+      setConfigStatus(button.dataset.engineBinary === "mod-tools.exe"
+        ? "Modo Rose seleccionado: mod-tools usa mkoverlay + runoverlay."
+        : "Modo LTK seleccionado: ltk-manager usa mkoverlay + patcher.");
+    });
+  });
+
+  setEngineBinaryName(state.engineBinaryName);
+
+  els.downloadLeagueSkinsButton?.addEventListener("click", () => {
+    loadDownloadedLeagueSkins();
   });
 
   els.downloadLeagueSkinsButtonDownload?.addEventListener("click", () => {
@@ -4606,6 +8249,7 @@ const bindEvents = () => {
   });
 
   els.launchPenguLoaderButton?.addEventListener("click", activatePenguFromUi);
+  els.uninstallPenguLoaderButton?.addEventListener("click", uninstallPenguFromUi);
   els.overlayLaunchPenguButton?.addEventListener("click", activatePenguFromUi);
   els.overlayDeactivatePenguButton?.addEventListener("click", deactivatePenguFromUi);
 
@@ -4631,7 +8275,7 @@ const bindEvents = () => {
   });
 
   els.firstDllLaterButton?.addEventListener("click", () => {
-    hideFirstDllModal({ remember: true });
+    hideFirstDllModal();
   });
 
   els.openDllFolderButton?.addEventListener("click", async () => {
@@ -4663,7 +8307,7 @@ const bindEvents = () => {
   });
 
   els.factoryResetButton?.addEventListener("click", async () => {
-    const confirmed = window.confirm("Esto va a borrar configuracion, skins descargadas, engine, DLL, P2P, presets y cache de Rift Atlas. La app se cerrara y volvera a abrir limpia. Queres continuar?");
+    const confirmed = window.confirm("Esto va a desactivar y borrar Pengu de Rift Atlas, y tambien borrar configuracion, skins descargadas, engine, DLL, P2P, presets y caches de overlay/mods. La app se cerrara y volvera a abrir limpia. Queres continuar?");
     if (!confirmed) return;
     try {
       els.factoryResetButton.disabled = true;
@@ -4676,35 +8320,88 @@ const bindEvents = () => {
     }
   });
 
-  els.addCustomModFilesButton?.addEventListener("click", async () => {
+  els.openModsFolderButton?.addEventListener("click", async () => {
     try {
-      if (els.customModsLabel) els.customModsLabel.textContent = "Leyendo archivo(s) propios...";
-      const items = await window.riftAtlas.selectCustomModFiles();
-      addCustomMods(items);
+      await openCustomModDestinationFolder();
+    } catch (error) {
+      if (els.customModsLabel) els.customModsLabel.textContent = `Error: ${error.message || error}`;
+    }
+  });
+
+  els.modDropZone?.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    els.modDropZone.classList.add("drag-over");
+  });
+
+  els.modDropZone?.addEventListener("dragleave", () => {
+    els.modDropZone.classList.remove("drag-over");
+  });
+
+  els.modDropZone?.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    els.modDropZone.classList.remove("drag-over");
+    try {
+      const paths = window.riftAtlas.getDroppedFilePaths?.(event.dataTransfer?.files || []) || [];
+      if (paths.length) await importCustomModPathsToSelectedSkin(paths, "drop");
     } catch (error) {
       if (els.customModsLabel) els.customModsLabel.textContent = error.message;
     }
   });
 
-  els.addCustomModFolderButton?.addEventListener("click", async () => {
+  window.addEventListener("rift-atlas:file-drop", async (event) => {
     try {
-      if (els.customModsLabel) els.customModsLabel.textContent = "Leyendo carpeta de mods propios...";
-      const result = await window.riftAtlas.selectCustomModFolder();
-      addCustomMods(result.packages || []);
-      if (result.folderPath && els.customModsLabel) {
-        els.customModsLabel.textContent = `${result.folderPath} - ${result.packages.length} mod(s) propios encontrados.`;
-      }
+      const paths = event.detail?.paths || [];
+      if (paths.length) await importCustomModPathsToSelectedSkin(paths, "drop");
     } catch (error) {
       if (els.customModsLabel) els.customModsLabel.textContent = error.message;
     }
+  });
+
+  els.groupSkinsCheckbox?.addEventListener("change", (event) => {
+    state.groupSkinsByChampion = event.target.checked;
+    localStorage.setItem("riftAtlas:groupSkinsByChampion", state.groupSkinsByChampion ? "1" : "0");
+    renderSkinLibrary();
+  });
+
+  els.skinMetadataForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveMetadataForm().catch((error) => {
+      if (els.metadataPreviewInput) els.metadataPreviewInput.value = error.message;
+    });
+  });
+
+  els.cancelMetadataButton?.addEventListener("click", closeSkinMetadataModal);
+
+  els.chooseMetadataPreviewButton?.addEventListener("click", async () => {
+    const previewPath = await window.riftAtlas.selectPreviewImage?.();
+    if (!previewPath) return;
+    const key = els.metadataSkinKeyInput?.value || previewPath;
+    const cached = await window.riftAtlas.cachePreview?.({ key, source: previewPath }).catch(() => null);
+    els.metadataPreviewInput.value = cached?.previewUrl || previewPath;
+  });
+
+  els.regenerateMetadataPreviewButton?.addEventListener("click", async () => {
+    const key = els.metadataSkinKeyInput?.value || "";
+    const skin = getSkinByKey(key);
+    if (!skin) return;
+    const preview = await inferPreviewForSkin(skin);
+    els.metadataPreviewInput.value = preview;
   });
 
   els.stopOverlayButton?.addEventListener("click", stopOverlayFromUi);
 
   els.selectLtkOverlaySidecarButton?.addEventListener("click", async () => {
     const p = await window.riftAtlas.selectBocchiSidecar();
-    if (p) { setLtkOverlaySidecarPath(p); setConfigStatus("Engine overlay configurado."); }
+    if (p) {
+      const binary = getEngineBinaryFromPath(p);
+      if (binary) setEngineBinaryName(binary);
+      setLtkOverlaySidecarPath(p);
+      setConfigStatus(binary === "mod-tools.exe"
+        ? "Engine Rose configurado."
+        : "Engine LTK configurado.");
+    }
   });
+
 
   els.selectLtkOverlayDllButton?.addEventListener("click", async () => {
     try {
@@ -4757,36 +8454,30 @@ const bindEvents = () => {
 
   document.querySelectorAll(".selection-save-button").forEach((button) => button.addEventListener("click", () => {
     const name = `Seleccion ${new Date().toLocaleString("es-AR")}`;
-    const preset = {
-      id: `preset-${Date.now()}`,
-      name,
-      skinKeys: [...state.queuedSkins],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+    const preset = createProfilePreset(name);
     state.presets.push(preset);
     state.activePresetId = preset.id;
     savePresets();
     els.importStatusLabel.textContent = `Seleccion guardada como "${name}".`;
   }));
 
-  els.selectSkinLibraryButton.addEventListener("click", async () => {
-    els.skinLibraryLabel.textContent = "Indexando LeagueSkins...";
+  els.selectSkinLibraryButton?.addEventListener("click", async () => {
+    if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = "Indexando LeagueSkins...";
     try {
       const result = await window.riftAtlas.selectSkinLibrary();
       if (result) setSkinLibrary(result);
     } catch (error) {
-      els.skinLibraryLabel.textContent = error.message;
+      if (els.skinLibraryLabel) els.skinLibraryLabel.textContent = error.message;
     }
   });
 
-  els.skinSearchInput.addEventListener("input", (event) => {
+  els.skinSearchInput?.addEventListener("input", (event) => {
     state.skinQuery = event.target.value.trim();
     resetSkinView({ clearProfile: true });
     renderSkinLibrary();
   });
 
-  els.skinChampionSelect.addEventListener("change", (event) => {
+  els.skinChampionSelect?.addEventListener("change", (event) => {
     state.skinChampion = event.target.value;
     resetSkinView({ clearProfile: true });
     renderSkinLibrary();
@@ -4812,13 +8503,7 @@ const bindEvents = () => {
       if (els.presetStatusLabel) els.presetStatusLabel.textContent = "Escribe un nombre para el preset.";
       return;
     }
-    const preset = {
-      id: `preset-${Date.now()}`,
-      name,
-      skinKeys: [...state.queuedSkins],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+    const preset = createProfilePreset(name);
     state.presets.push(preset);
     state.activePresetId = preset.id;
     if (els.presetNameInput) els.presetNameInput.value = "";
@@ -4835,6 +8520,10 @@ const bindEvents = () => {
     const preset = getActivePreset();
     if (!preset) return;
     preset.skinKeys = [...state.queuedSkins];
+    preset.enginePath = state.ltkOverlaySidecarPath;
+    preset.dllPath = state.ltkOverlayDllPath;
+    preset.leagueGamePath = state.leagueGamePath;
+    preset.penguAutoParty = state.penguAutoParty;
     preset.updatedAt = new Date().toISOString();
     if (els.presetStatusLabel) els.presetStatusLabel.textContent = `Cola guardada en "${preset.name}" (${preset.skinKeys.length}).`;
     savePresets();
@@ -4842,6 +8531,19 @@ const bindEvents = () => {
 
   els.loadPresetQueueButton?.addEventListener("click", () => {
     loadPresetToQueue();
+  });
+
+  els.togglePresetAutoApplyButton?.addEventListener("click", () => {
+    const preset = getActivePreset();
+    if (!preset) return;
+    preset.autoApply = !preset.autoApply;
+    preset.updatedAt = new Date().toISOString();
+    if (els.presetStatusLabel) {
+      els.presetStatusLabel.textContent = preset.autoApply
+        ? `Perfil "${preset.name}" se autoaplicara cuando lo cargues.`
+        : `Autoaplicar desactivado para "${preset.name}".`;
+    }
+    savePresets();
   });
 
   els.deletePresetButton?.addEventListener("click", () => {
@@ -4853,6 +8555,47 @@ const bindEvents = () => {
     savePresets();
   });
 };
+
+const fetchLcuChampionSkinData = async (championKey, { forceRefresh = false } = {}) => {
+  const cacheKey = String(Number(championKey) || "");
+  const cached = lcuChampionSkinCache.get(cacheKey);
+  if (!forceRefresh && cached) return cached;
+  if (!cacheKey || !window.riftAtlas.getLcuChampionSkins) return new Map();
+  const payload = await window.riftAtlas.getLcuChampionSkins(Number(cacheKey));
+  const skins = Array.isArray(payload?.skins) ? payload.skins : [];
+  const map = new Map();
+  const baseSkinByChroma = new Map();
+  for (const skin of skins) {
+    const skinId = Number(skin.id || skin.skinId || 0);
+    if (!skinId) continue;
+    const displayName = String(skin.name || skin.skinName || "").trim();
+    if (displayName) {
+      map.set(String(skinId), displayName);
+      const skinNum = Number(skin.num);
+      if (Number.isFinite(skinNum) && skinNum >= 0) map.set(String(skinNum), displayName);
+    }
+    for (const chroma of Array.isArray(skin.chromas) ? skin.chromas : []) {
+      const chromaId = Number(chroma.id || chroma.chromaId || 0);
+      if (!chromaId) continue;
+      const chromaName = String(chroma.name || chroma.chromaName || displayName).trim();
+      if (chromaName) map.set(String(chromaId), chromaName);
+      baseSkinByChroma.set(chromaId, skinId);
+    }
+  }
+  map.baseSkinByChroma = baseSkinByChroma;
+  map.source = "lcu";
+  lcuChampionSkinCache.set(cacheKey, map);
+  // Inventory can expose an owned chroma ID without repeating its parent skin
+  // ID. Rose treats that parent as owned for the base-skin decision.
+  for (const [chromaId, baseSkinId] of baseSkinByChroma.entries()) {
+    if (state.penguOwnedSkinIds.has(Number(chromaId))) {
+      state.penguOwnedSkinIds.add(Number(baseSkinId));
+    }
+  }
+  resolveSkinLibraryNames();
+  return map;
+};
+
 
 const loadChampions = async () => {
   els.patchLabel.textContent = "Cargando campeones...";
@@ -4878,6 +8621,8 @@ const loadChampions = async () => {
   state.version = payload.version;
   els.patchLabel.textContent = state.version;
   state.champions = payload.champions.sort((a, b) => a.name.localeCompare(b.name, "es"));
+  state.customMods = state.customMods.map(enrichCustomMod);
+  localStorage.setItem("riftAtlas:customMods", JSON.stringify(state.customMods));
   renderChampionGrid();
   renderBuildChampionOptions();
   updateBuildView();
@@ -4889,11 +8634,7 @@ const loadChampions = async () => {
   if (state.champions.length > 0) {
     selectChampion(state.champions[0].id).catch(showError);
   }
-};
 
-const loadApiKeyStatus = async () => {
-  const hasKey = await window.riftAtlas.hasRiotApiKey();
-  setApiKeyStatus(hasKey);
 };
 
 const showError = (error) => {
@@ -4950,7 +8691,8 @@ const forceStartTutorial = ({ attempt = 0, reason = "auto" } = {}) => {
   }
   const started = window.startRiftAtlasTutorial(setView, {
     force: true,
-    showIntroControls: true
+    showIntroControls: true,
+    setupResult: firstRunBootstrapResult
   });
   setTutorialDebug({ attempt, reason, started });
   if (started) {
@@ -4964,6 +8706,7 @@ const forceStartTutorial = ({ attempt = 0, reason = "auto" } = {}) => {
 
 const getTutorialAutostartReason = async () => {
   const flags = await window.riftAtlas.getStartupFlags?.().catch(() => null);
+  setAppDebugMode(Boolean(flags?.flags?.debug || flags?.debug), "startup-flags");
   setTutorialDebug({ flags, localSeen: hasLocalTutorialSeen() });
   if (flags?.showTutorial) return "post-reset";
   if (flags?.firstRun) return "first-run-main";
@@ -4990,46 +8733,65 @@ const scheduleTutorialAutostart = async () => {
 };
 
 const startTutorialFromMainEvent = (flags = {}) => {
+  if (flags?.flags?.debug || flags?.debug) setAppDebugMode(true, "start-tutorial-event");
   setTutorialDebug({ event: "app:start-tutorial", flags });
   tutorialAutoStartScheduled = false;
   localStorage.removeItem("riftAtlas:tutorialIntroSeen");
   localStorage.removeItem("riftAtlas:tutorialIntroSeen:v2");
   localStorage.removeItem("riftAtlas:tutorialIntroDisabled");
-  [200, 700, 1400, 2600, 4200, 6500].forEach((delay, index) => {
-    setTimeout(() => forceStartTutorial({ attempt: index, reason: flags.showTutorial ? "post-reset-main-event" : "first-run-main-event" }), delay);
+  Promise.resolve(firstRunBootstrapPromise).finally(() => {
+    [200, 700, 1400, 2600, 4200, 6500].forEach((delay, index) => {
+      setTimeout(() => forceStartTutorial({ attempt: index, reason: flags.showTutorial ? "post-reset-main-event" : "first-run-main-event" }), delay);
+    });
   });
 };
 
 window.riftAtlas.onStartTutorial?.(startTutorialFromMainEvent);
+window.riftAtlas.onDebugMode?.((payload = {}) => {
+  setAppDebugMode(Boolean(payload.enabled), payload.source || "app-event");
+});
 
 bindEvents();
+window.riftAtlas.appendOverlayLog(
+  `[RoseFlow] renderer=20260625-3 ticker=rust-lcu-monotonic chroma-state=rose-base force=final-only threshold=${ROSE_INJECTION_THRESHOLD_MS}ms.`
+).catch(() => { });
+loadLibraryIndex().then(() => {
+  renderPresets();
+  renderSkinLibrary();
+  persistLibraryIndex();
+}).catch(() => null);
 loadLtkOverlayPaths();
+
 setLeagueGamePath(state.leagueGamePath);
 autoConfigureOverlay({ silent: true });
 renderPresets();
+localStorage.removeItem("riftAtlas:customModFolders");
+restoreKnownLocalMods();
+saveCustomMods();
+saveQueuedSkins();
 renderCustomMods();
 renderOverlayHistory();
 renderCompactLauncher();
 renderParty();
-loadApiKeyStatus();
+renderMaintenance();
 loadAppVersion();
 loadAppDataPath();
 loadPenguLoaderStatus();
+const startupDependenciesReady = startFirstRunBootstrap();
 setTimeout(() => {
   loadPenguLoaderStatus();
   checkForUpdates({ manual: false });
 }, 1200);
 window.addEventListener("load", () => {
-  scheduleTutorialAutostart();
+  startupDependenciesReady.finally(() => scheduleTutorialAutostart());
 });
 setTimeout(() => {
-  scheduleTutorialAutostart();
+  startupDependenciesReady.finally(() => scheduleTutorialAutostart());
 }, 1200);
 refreshOverlayStatus();
-loadChampions().catch(showError);
-setTimeout(() => {
-  loadSavedSkinLibrary();
-}, 2500);
+startupDependenciesReady.finally(() => ensureSkinLibraryLoaded().catch(showError));
+ensureUserModsLoaded().catch(() => null);
+renderBaseOverlayStatus();
 setInterval(refreshOverlayStatus, 3000);
 setInterval(() => {
   if (state.partyStatus === "connected") {
