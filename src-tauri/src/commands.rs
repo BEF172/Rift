@@ -399,7 +399,7 @@ pub async fn select_league_game(app: AppHandle) -> Result<String, String> {
             let game_dir = crate::config::infer_game_dir_from_league_path(&executable_path);
             let client_dir = crate::config::infer_client_path_from_league_path(&executable_path);
             match (game_dir, client_dir) {
-                (Some(game_dir), Some(client_dir)) => crate::config::save_paths(&game_dir, &client_dir),
+                (Some(game_dir), Some(client_dir)) => persist_league_paths(&game_dir, &client_dir),
                 (Some(game_dir), None) => crate::config::save_league_path(&game_dir),
                 (None, Some(client_dir)) => crate::config::save_client_path(&client_dir),
                 (None, None) => {}
@@ -628,10 +628,60 @@ pub async fn check_league_install(
 }
 
 /// Detect League of Legends paths (Rose-style) and persist to config.ini.
-/// Tries: 1) existing config, 2) lockfile, 3) running LeagueClient process.
+/// Tries live League first, then falls back to saved config/manual selection.
 #[tauri::command]
 pub async fn detect_league_path() -> Result<serde_json::Value, String> {
-    // 1. Try existing config first
+    // 1. Running process is authoritative, like Rose.
+    for process_name in ["LeagueClientUx.exe", "LeagueClient.exe"] {
+        if let Some(dir) = overlay::find_process_exe_path(process_name) {
+            if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
+                if let Some(game_dir) = find_league_game_path(&dir) {
+                    persist_league_paths(&game_dir, &dir);
+                    let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
+                    return Ok(serde_json::json!({
+                        "detected": true,
+                        "source": "process",
+                        "leagueGamePath": league_exe.to_string_lossy(),
+                        "leagueClientPath": dir,
+                    }));
+                }
+            }
+        }
+    }
+
+    // 2. Then the live lockfile.
+    if let Some(lockfile) = find_league_client_lockfile() {
+        let client_dir = PathBuf::from(&lockfile)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !client_dir.is_empty() && PathBuf::from(&client_dir).join("LeagueClient.exe").exists() {
+            if let Some(game_dir) = find_league_game_path(&client_dir) {
+                persist_league_paths(&game_dir, &client_dir);
+                let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
+                return Ok(serde_json::json!({
+                    "detected": true,
+                    "source": "lockfile",
+                    "leagueGamePath": league_exe.to_string_lossy(),
+                    "leagueClientPath": client_dir,
+                }));
+            }
+        }
+    }
+
+    // 3. Rose's own config is next; Pengu/core.dll reads this file too.
+    if let Some((game_dir, client_dir)) = load_rose_league_paths() {
+        persist_league_paths(&game_dir, &client_dir);
+        let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
+        return Ok(serde_json::json!({
+            "detected": true,
+            "source": "rose-config",
+            "leagueGamePath": league_exe.to_string_lossy(),
+            "leagueClientPath": client_dir,
+        }));
+    }
+
+    // 4. Saved Rift Atlas config/manual selection is a fallback only.
     if let Some(league) = crate::config::load_league_path() {
         if let Some(client) = crate::config::load_client_path()
             .or_else(|| crate::config::infer_client_path_from_league_path(&league))
@@ -644,7 +694,7 @@ pub async fn detect_league_path() -> Result<serde_json::Value, String> {
                 if let Some(game_dir) =
                     crate::config::infer_game_dir_from_league_path(&league_exe.to_string_lossy())
                 {
-                    crate::config::save_paths(&game_dir, &client);
+                    persist_league_paths(&game_dir, &client);
                 }
                 return Ok(serde_json::json!({
                     "detected": true,
@@ -656,57 +706,7 @@ pub async fn detect_league_path() -> Result<serde_json::Value, String> {
         }
     }
 
-    // 2. Try lockfile
-    if let Some(lockfile) = find_league_client_lockfile() {
-        let client_dir = PathBuf::from(&lockfile)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !client_dir.is_empty() && PathBuf::from(&client_dir).join("LeagueClient.exe").exists() {
-            if let Some(game_dir) = find_league_game_path(&client_dir) {
-                crate::config::save_paths(&game_dir, &client_dir);
-                let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
-                return Ok(serde_json::json!({
-                    "detected": true,
-                    "source": "lockfile",
-                    "leagueGamePath": league_exe.to_string_lossy(),
-                    "leagueClientPath": client_dir,
-                }));
-            }
-        }
-    }
-
-    // 3. Try running process (Rose-style: reads exe path from memory)
-    if let Some(dir) = overlay::find_process_exe_path("LeagueClientUx.exe") {
-        if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
-            if let Some(game_dir) = find_league_game_path(&dir) {
-                crate::config::save_paths(&game_dir, &dir);
-                let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
-                return Ok(serde_json::json!({
-                    "detected": true,
-                    "source": "process",
-                    "leagueGamePath": league_exe.to_string_lossy(),
-                    "leagueClientPath": dir,
-                }));
-            }
-        }
-    }
-    if let Some(dir) = overlay::find_process_exe_path("LeagueClient.exe") {
-        if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
-            if let Some(game_dir) = find_league_game_path(&dir) {
-                crate::config::save_paths(&game_dir, &dir);
-                let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
-                return Ok(serde_json::json!({
-                    "detected": true,
-                    "source": "process",
-                    "leagueGamePath": league_exe.to_string_lossy(),
-                    "leagueClientPath": dir,
-                }));
-            }
-        }
-    }
-
-    // 4. Nothing found
+    // 5. Nothing found
     Ok(serde_json::json!({
         "detected": false,
         "source": "",
@@ -5025,6 +5025,48 @@ fn clean_general_ini_content(content: &str) -> String {
     lines.join("\n")
 }
 
+fn write_rose_league_paths(client_path: &str, game_path: &str) -> Result<String, String> {
+    let config_path = get_rose_config_path();
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Error creating Rose config dir: {}", e))?;
+    }
+    let content =
+        std::fs::read_to_string(&config_path).unwrap_or_else(|_| "[General]\n".to_string());
+    let content = clean_general_ini_content(&content);
+    let content = set_ini_value(&content, "clientpath", client_path);
+    let content = set_ini_value(&content, "leaguepath", game_path);
+    let content = set_ini_value(&content, "disabled", "0");
+    std::fs::write(&config_path, &content)
+        .map_err(|e| format!("Error writing Rose config: {}", e))?;
+    Ok(config_path.to_string_lossy().to_string())
+}
+
+fn load_rose_league_paths() -> Option<(String, String)> {
+    let content = std::fs::read_to_string(get_rose_config_path()).ok()?;
+    let client_path = read_ini_value(&content, "clientpath")
+        .filter(|value| !value.trim().is_empty())?;
+    let league_path = read_ini_value(&content, "leaguepath")
+        .filter(|value| !value.trim().is_empty())?;
+    let client_dir = PathBuf::from(client_path.trim());
+    let game_dir = PathBuf::from(league_path.trim());
+    if client_dir.join("LeagueClient.exe").exists()
+        && game_dir.join("League of Legends.exe").exists()
+    {
+        Some((
+            game_dir.to_string_lossy().to_string(),
+            client_dir.to_string_lossy().to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn persist_league_paths(game_path: &str, client_path: &str) {
+    crate::config::save_paths(game_path, client_path);
+    let _ = write_rose_league_paths(client_path, game_path);
+}
+
 fn write_rose_pengu_config(
     executable_path: &str,
     league_client_path: &str,
@@ -5345,6 +5387,29 @@ pub fn pengu_try_auto_activate(app_dir: &str, token_dir: &str) {
 }
 
 fn find_league_client_lockfile() -> Option<String> {
+    for process_name in ["LeagueClientUx.exe", "LeagueClient.exe"] {
+        if let Some(dir) = overlay::find_process_exe_path(process_name) {
+            let lockfile = PathBuf::from(&dir).join("lockfile");
+            if lockfile.exists() {
+                return Some(lockfile.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    if let Some((_, client)) = load_rose_league_paths() {
+        let lockfile = PathBuf::from(&client).join("lockfile");
+        if lockfile.exists() {
+            return Some(lockfile.to_string_lossy().to_string());
+        }
+    }
+
+    if let Some(client) = crate::config::load_client_path() {
+        let lockfile = PathBuf::from(&client).join("lockfile");
+        if lockfile.exists() {
+            return Some(lockfile.to_string_lossy().to_string());
+        }
+    }
+
     let candidates = [
         std::env::var("LCU_LOCKFILE").ok(),
         Some("C:\\Riot Games\\League of Legends\\lockfile".to_string()),
@@ -5366,7 +5431,19 @@ fn find_league_client_lockfile() -> Option<String> {
 }
 
 fn find_league_client_path() -> Option<String> {
-    // 1. Try lockfile dir first
+    // 1. Get path from running process (Rose-style: reads exe path from memory)
+    if let Some(dir) = overlay::find_process_exe_path("LeagueClientUx.exe") {
+        if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
+            return Some(dir);
+        }
+    }
+    if let Some(dir) = overlay::find_process_exe_path("LeagueClient.exe") {
+        if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
+            return Some(dir);
+        }
+    }
+
+    // 2. Try lockfile dir
     if let Some(lockfile) = find_league_client_lockfile() {
         let dir = PathBuf::from(&lockfile)
             .parent()?
@@ -5376,15 +5453,18 @@ fn find_league_client_path() -> Option<String> {
             return Some(dir);
         }
     }
-    // 2. Get path from running process (Rose-style: reads exe path from memory)
-    if let Some(dir) = overlay::find_process_exe_path("LeagueClientUx.exe") {
-        if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
-            return Some(dir);
+
+    // 3. Fall back to Rose config/manual selection.
+    if let Some((_, client)) = load_rose_league_paths() {
+        if PathBuf::from(&client).join("LeagueClient.exe").exists() {
+            return Some(client);
         }
     }
-    if let Some(dir) = overlay::find_process_exe_path("LeagueClient.exe") {
-        if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
-            return Some(dir);
+
+    // 4. Fall back to saved Rift Atlas config/manual selection.
+    if let Some(client) = crate::config::load_client_path() {
+        if PathBuf::from(&client).join("LeagueClient.exe").exists() {
+            return Some(client);
         }
     }
     None
