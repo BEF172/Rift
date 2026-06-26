@@ -5044,10 +5044,10 @@ fn write_rose_league_paths(client_path: &str, game_path: &str) -> Result<String,
 
 fn load_rose_league_paths() -> Option<(String, String)> {
     let content = std::fs::read_to_string(get_rose_config_path()).ok()?;
-    let client_path = read_ini_value(&content, "clientpath")
-        .filter(|value| !value.trim().is_empty())?;
-    let league_path = read_ini_value(&content, "leaguepath")
-        .filter(|value| !value.trim().is_empty())?;
+    let client_path =
+        read_ini_value(&content, "clientpath").filter(|value| !value.trim().is_empty())?;
+    let league_path =
+        read_ini_value(&content, "leaguepath").filter(|value| !value.trim().is_empty())?;
     let client_dir = PathBuf::from(client_path.trim());
     let game_dir = PathBuf::from(league_path.trim());
     if client_dir.join("LeagueClient.exe").exists()

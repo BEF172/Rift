@@ -516,8 +516,9 @@ async fn broadcast_phase(app: &AppHandle, phase: &str, previous: &str) {
         "previousPhase": previous,
         "source": "lcu-gameflow-monitor",
     });
-    let _ = app.emit("pengu:message", payload.clone());
     let state = app.state::<AppState>();
+    *state.current_gameflow_phase.lock().await = phase.to_string();
+    let _ = app.emit("pengu:message", payload.clone());
     if let Ok(text) = serde_json::to_string(&payload) {
         if let Some(tx) = state.pengu_bridge_tx.lock().await.as_ref() {
             let _ = tx.send(text);

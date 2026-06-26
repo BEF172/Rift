@@ -405,6 +405,15 @@ fn build_overlay(
     })
 }
 
+fn rose_overlay_can_start_in_phase(phase: &str) -> bool {
+    let phase = phase.trim();
+    phase.is_empty()
+        || matches!(
+            phase,
+            "ChampSelect" | "FINALIZATION" | "GameStart" | "InProgress" | "Reconnect"
+        )
+}
+
 #[tauri::command]
 pub async fn run_rose_overlay_v2(
     payload: serde_json::Value,
@@ -470,6 +479,20 @@ pub async fn run_rose_overlay_v2(
                 return Err(
                     "La sesion termino durante mkoverlay; la inyeccion fue cancelada.".to_string(),
                 );
+            }
+            let current_phase = state.current_gameflow_phase.lock().await.clone();
+            if !rose_overlay_can_start_in_phase(&current_phase) {
+                overlay::append_overlay_log(&format!(
+                    "[Engine] mkoverlay termino en fase {}; no se inicia runoverlay para evitar overlay viejo.",
+                    current_phase
+                ));
+                overlay::wipe_overlay_dir(&build.overlay_dir.to_string_lossy());
+                overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+                *state.active_overlay_run.lock().await = false;
+                return Err(format!(
+                    "La sesion ya no esta en champ select/game (fase {}); overlay cancelado.",
+                    current_phase
+                ));
             }
 
             // Rose starts runoverlay immediately after mkoverlay. The monitor

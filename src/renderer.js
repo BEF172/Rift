@@ -582,7 +582,10 @@ const saveManagedSkins = () => {
 
 const saveQueuedSkins = () => {
   const normalizedKeys = normalizeQueuedSkinKeys([...state.queuedSkins]);
-  if (normalizedKeys.length !== state.queuedSkins.size) {
+  const currentKeys = [...state.queuedSkins];
+  const queueChanged = normalizedKeys.length !== currentKeys.length ||
+    normalizedKeys.some((key, index) => key !== currentKeys[index]);
+  if (queueChanged) {
     state.queuedSkins = new Set(normalizedKeys);
   }
   state.autoRunCustomOverlaySignature = "";
@@ -1131,10 +1134,19 @@ const getSkinVisibleName = (skin) => {
 
 const getSkinImportName = (skin) => sanitizeImportName(getSkinDisplayName(skin));
 
+const normalizeSkinKey = (key = "") =>
+  String(key || "").replace(/\//g, "\\").replace(/\\+/g, "\\").toLowerCase();
+
 const getSkinByKey = (key) => {
-  const skin = state.customMods.find((mod) => getSkinKey(mod) === key) ||
+  const directSkin = state.customMods.find((mod) => getSkinKey(mod) === key) ||
     state.skinLibrary.find((item) => getSkinKey(item) === key);
-  return skin ? applySkinMetadata(skin) : skin;
+  if (directSkin) return applySkinMetadata(directSkin);
+
+  const normalizedKey = normalizeSkinKey(key);
+  if (!normalizedKey) return null;
+  const normalizedSkin = state.customMods.find((mod) => normalizeSkinKey(getSkinKey(mod)) === normalizedKey) ||
+    state.skinLibrary.find((item) => normalizeSkinKey(getSkinKey(item)) === normalizedKey);
+  return normalizedSkin ? applySkinMetadata(normalizedSkin) : null;
 };
 
 const saveSkinMetadata = () => {
@@ -1238,9 +1250,10 @@ const getQueueChampionKey = (skin = {}) => {
 
 const removeQueuedSkinsForChampion = (championKey, exceptKey = "") => {
   if (!championKey) return 0;
+  const normalizedExceptKey = normalizeSkinKey(exceptKey);
   let removed = 0;
   [...state.queuedSkins].forEach((queuedKey) => {
-    if (queuedKey === exceptKey) return;
+    if (queuedKey === exceptKey || normalizeSkinKey(queuedKey) === normalizedExceptKey) return;
     const queuedSkin = getSkinByKey(queuedKey);
     if (queuedSkin && getQueueChampionKey(queuedSkin) === championKey) {
       state.queuedSkins.delete(queuedKey);
@@ -1255,14 +1268,21 @@ const removeQueuedSkinsForChampion = (championKey, exceptKey = "") => {
 const queueSkinKey = (key, options = {}) => {
   const skin = getSkinByKey(key);
   if (!skin) return { queued: false, replaced: 0 };
-  const replaced = options.preserveExistingChampion ? 0 : removeQueuedSkinsForChampion(getQueueChampionKey(skin), key);
-  state.queuedSkins.add(key);
+  const canonicalKey = getSkinKey(skin);
+  const replaced = options.preserveExistingChampion ? 0 : removeQueuedSkinsForChampion(getQueueChampionKey(skin), canonicalKey);
+  [...state.queuedSkins].forEach((queuedKey) => {
+    if (normalizeSkinKey(queuedKey) === normalizeSkinKey(canonicalKey) && queuedKey !== canonicalKey) {
+      state.queuedSkins.delete(queuedKey);
+      state.penguSessionQueuedSkins.delete(queuedKey);
+    }
+  });
+  state.queuedSkins.add(canonicalKey);
   if (options.sessionSource === "pengu") {
-    state.penguSessionQueuedSkins.add(key);
+    state.penguSessionQueuedSkins.add(canonicalKey);
   } else {
-    state.penguSessionQueuedSkins.delete(key);
+    state.penguSessionQueuedSkins.delete(canonicalKey);
   }
-  return { queued: true, replaced };
+  return { queued: true, replaced, key: canonicalKey };
 };
 
 const removeP2PFileIfUnused = async (key = "") => {
@@ -2314,9 +2334,12 @@ async function handlePenguSkinApply(payload = {}) {
     payload.type === "chroma-selection" ||
     payload.source === "rift-atlas-party" ||
     payload.source === "LU-ChromaWheel";
-  queueSkinKey(getSkinKey(skin), {
+  const queueResult = queueSkinKey(getSkinKey(skin), {
     sessionSource: isPenguAutoApply ? "pengu" : ""
   });
+  window.riftAtlas.appendOverlayLog(
+    `[Diagnostico] cola overlay actualizada: queued=${queueResult.queued} replaced=${queueResult.replaced || 0} total=${state.queuedSkins.size} key=${queueResult.key || getSkinKey(skin)}`
+  ).catch(() => { });
   saveQueuedSkins();
   renderSkinLibrary();
   renderSelectionTray();
