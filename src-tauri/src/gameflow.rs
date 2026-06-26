@@ -53,11 +53,9 @@ fn lcu_url(lockfile: &Lockfile, path: &str) -> String {
 
 fn local_selection(session: &serde_json::Value) -> Option<(i64, u64, u64)> {
     let local_cell_id = session.get("localPlayerCellId")?.as_i64()?;
-    let player = session
-        .get("myTeam")?
-        .as_array()?
-        .iter()
-        .find(|player| player.get("cellId").and_then(|value| value.as_i64()) == Some(local_cell_id))?;
+    let player = session.get("myTeam")?.as_array()?.iter().find(|player| {
+        player.get("cellId").and_then(|value| value.as_i64()) == Some(local_cell_id)
+    })?;
     Some((
         local_cell_id,
         player
@@ -125,7 +123,9 @@ async fn verify_lcu_skin(
         .header("Authorization", lcu_auth(lockfile))
         .send()
         .await;
-    let Ok(response) = response else { return 0; };
+    let Ok(response) = response else {
+        return 0;
+    };
     let Ok(session) = response.json::<serde_json::Value>().await else {
         return 0;
     };
@@ -200,7 +200,11 @@ pub async fn force_selected_skin(
                     last_error = "action aceptada sin confirmacion".to_string();
                 }
                 Ok((_, status, body)) => {
-                    last_error = format!("action HTTP {} {}", status, body.chars().take(240).collect::<String>());
+                    last_error = format!(
+                        "action HTTP {} {}",
+                        status,
+                        body.chars().take(240).collect::<String>()
+                    );
                 }
                 Err(error) => last_error = error,
             }

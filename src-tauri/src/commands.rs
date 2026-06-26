@@ -251,7 +251,10 @@ pub async fn check_updates(app: AppHandle) -> Result<serde_json::Value, String> 
 }
 
 #[tauri::command]
-pub async fn download_update(app: AppHandle, _payload: serde_json::Value) -> Result<serde_json::Value, String> {
+pub async fn download_update(
+    app: AppHandle,
+    _payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let update = app
         .updater()
         .map_err(|e| format!("Updater no configurado: {}", e))?
@@ -620,13 +623,15 @@ pub async fn detect_league_path() -> Result<serde_json::Value, String> {
     // 1. Try existing config first
     if let Some(league) = crate::config::load_league_path() {
         if let Some(client) = crate::config::load_client_path() {
-            let league_exe = PathBuf::from(&league).join("League of Legends.exe");
+            let league_exe = overlay::resolve_league_game_executable(&league)
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(&league).join("League of Legends.exe"));
             let client_exe = PathBuf::from(&client).join("LeagueClient.exe");
             if league_exe.exists() && client_exe.exists() {
                 return Ok(serde_json::json!({
                     "detected": true,
                     "source": "config",
-                    "leagueGamePath": league,
+                    "leagueGamePath": league_exe.to_string_lossy(),
                     "leagueClientPath": client,
                 }));
             }
@@ -642,10 +647,11 @@ pub async fn detect_league_path() -> Result<serde_json::Value, String> {
         if !client_dir.is_empty() && PathBuf::from(&client_dir).join("LeagueClient.exe").exists() {
             if let Some(game_dir) = find_league_game_path(&client_dir) {
                 crate::config::save_paths(&game_dir, &client_dir);
+                let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
                 return Ok(serde_json::json!({
                     "detected": true,
                     "source": "lockfile",
-                    "leagueGamePath": game_dir,
+                    "leagueGamePath": league_exe.to_string_lossy(),
                     "leagueClientPath": client_dir,
                 }));
             }
@@ -657,10 +663,11 @@ pub async fn detect_league_path() -> Result<serde_json::Value, String> {
         if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
             if let Some(game_dir) = find_league_game_path(&dir) {
                 crate::config::save_paths(&game_dir, &dir);
+                let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
                 return Ok(serde_json::json!({
                     "detected": true,
                     "source": "process",
-                    "leagueGamePath": game_dir,
+                    "leagueGamePath": league_exe.to_string_lossy(),
                     "leagueClientPath": dir,
                 }));
             }
@@ -670,10 +677,11 @@ pub async fn detect_league_path() -> Result<serde_json::Value, String> {
         if PathBuf::from(&dir).join("LeagueClient.exe").exists() {
             if let Some(game_dir) = find_league_game_path(&dir) {
                 crate::config::save_paths(&game_dir, &dir);
+                let league_exe = PathBuf::from(&game_dir).join("League of Legends.exe");
                 return Ok(serde_json::json!({
                     "detected": true,
                     "source": "process",
-                    "leagueGamePath": game_dir,
+                    "leagueGamePath": league_exe.to_string_lossy(),
                     "leagueClientPath": dir,
                 }));
             }
@@ -923,7 +931,9 @@ pub async fn get_engine_dll_status(
 
 #[tauri::command]
 pub async fn open_engine_folder(state: State<'_, AppState>) -> Result<(), String> {
-    let dir = PathBuf::from(state.app_data_dir.lock().await.clone()).join("engine").join("tools");
+    let dir = PathBuf::from(state.app_data_dir.lock().await.clone())
+        .join("engine")
+        .join("tools");
     std::fs::create_dir_all(&dir).ok();
     let _ = Command::new("explorer").arg(&dir).spawn();
     Ok(())
@@ -994,10 +1004,7 @@ pub async fn get_champion_data() -> Result<serde_json::Value, String> {
     }))
 }
 
-async fn call_opgg_mcp(
-    tool_name: &str,
-    arguments: serde_json::Value,
-) -> Result<String, String> {
+async fn call_opgg_mcp(tool_name: &str, arguments: serde_json::Value) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 RiftAtlas/1.0")
         .timeout(std::time::Duration::from_secs(30))
@@ -1084,7 +1091,10 @@ pub async fn get_tier_lane(payload: serde_json::Value) -> Result<serde_json::Val
     let text = match call_opgg_mcp("lol_list_lane_meta_champions", arguments).await {
         Ok(t) => t,
         Err(e) => {
-            let warning = format!("OP.GG MCP no disponible: {}; usando fallback comunitario.", e);
+            let warning = format!(
+                "OP.GG MCP no disponible: {}; usando fallback comunitario.",
+                e
+            );
             return fetch_huggingface_lane_tier_list(normalized_lane, warning).await;
         }
     };
@@ -1107,9 +1117,11 @@ pub async fn get_tier_lane(payload: serde_json::Value) -> Result<serde_json::Val
 fn parse_opgg_tier_response(text: &str, lane: &str) -> Vec<serde_json::Value> {
     let mut rows = Vec::new();
 
-    for cap in regex_lite::Regex::new(r#"(\w+)\("([^"]*)",(\d+),([\d.]+),([\d.]+),([\d.]+),(\d+),([\d.]+),(\d+)\)"#)
-        .unwrap()
-        .captures_iter(text)
+    for cap in regex_lite::Regex::new(
+        r#"(\w+)\("([^"]*)",(\d+),([\d.]+),([\d.]+),([\d.]+),(\d+),([\d.]+),(\d+)\)"#,
+    )
+    .unwrap()
+    .captures_iter(text)
     {
         let champion_name = cap[2].to_string();
         let tier_num: i64 = cap[3].parse().unwrap_or(5);
@@ -1211,7 +1223,8 @@ pub async fn import_mods_to_folder(
     ensure_user_mods_layout(&mods_root)?;
     let target_dir = mods_root.join("others");
     let (copied_paths, skipped) = copy_user_mod_files(files, &target_dir)?;
-    let packages = index_custom_mod_paths(copied_paths.clone(), Some(&mods_root.to_string_lossy()))?;
+    let packages =
+        index_custom_mod_paths(copied_paths.clone(), Some(&mods_root.to_string_lossy()))?;
     Ok(serde_json::json!({
         "folderPath": target_dir.to_string_lossy(),
         "copied": copied_paths.len(),
@@ -1590,11 +1603,10 @@ fn parse_opgg_champion_analysis(text: &str, champion: &str) -> serde_json::Value
         "matches": 0,
     });
 
-    if let Some(caps) = regex_lite::Regex::new(
-        r#"AverageStats\(([\d.]+),([\d.]+),([\d.]+),(\d+),([\d.]+),(\d+)\)"#
-    )
-    .unwrap()
-    .captures(text)
+    if let Some(caps) =
+        regex_lite::Regex::new(r#"AverageStats\(([\d.]+),([\d.]+),([\d.]+),(\d+),([\d.]+),(\d+)\)"#)
+            .unwrap()
+            .captures(text)
     {
         let win_rate: f64 = caps[1].parse().unwrap_or(0.0);
         let pick_rate: f64 = caps[2].parse().unwrap_or(0.0);
@@ -1654,11 +1666,9 @@ fn parse_opgg_champion_analysis(text: &str, champion: &str) -> serde_json::Value
         });
     }
 
-    if let Some(caps) = regex_lite::Regex::new(
-        r#"Skills\(\[((?:[^\]]*)?)\],(\d+),(\d+)\)"#
-    )
-    .unwrap()
-    .captures(text)
+    if let Some(caps) = regex_lite::Regex::new(r#"Skills\(\[((?:[^\]]*)?)\],(\d+),(\d+)\)"#)
+        .unwrap()
+        .captures(text)
     {
         let order_raw = caps[1].to_string();
         let wins: i64 = caps[2].parse().unwrap_or(0);
@@ -1668,11 +1678,19 @@ fn parse_opgg_champion_analysis(text: &str, champion: &str) -> serde_json::Value
             .split(',')
             .filter_map(|s| {
                 let clean = s.trim().trim_matches('"').to_string();
-                if clean.is_empty() { None } else { Some(serde_json::Value::String(clean)) }
+                if clean.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::String(clean))
+                }
             })
             .collect();
 
-        let winrate = if play > 0 { (wins as f64 / play as f64) * 100.0 } else { 0.0 };
+        let winrate = if play > 0 {
+            (wins as f64 / play as f64) * 100.0
+        } else {
+            0.0
+        };
 
         result["skills"] = serde_json::json!({
             "priority": path,
@@ -1682,12 +1700,11 @@ fn parse_opgg_champion_analysis(text: &str, champion: &str) -> serde_json::Value
         });
     }
 
-    let item_caps: Vec<_> = regex_lite::Regex::new(
-        r#"StarterItems\(\[((?:[^\]]*)?)\],(\d+),(\d+)\)"#
-    )
-    .unwrap()
-    .captures_iter(text)
-    .collect();
+    let item_caps: Vec<_> =
+        regex_lite::Regex::new(r#"StarterItems\(\[((?:[^\]]*)?)\],(\d+),(\d+)\)"#)
+            .unwrap()
+            .captures_iter(text)
+            .collect();
 
     if item_caps.len() >= 1 {
         let caps = &item_caps[0];
@@ -1698,10 +1715,18 @@ fn parse_opgg_champion_analysis(text: &str, champion: &str) -> serde_json::Value
             .split(',')
             .filter_map(|s| {
                 let clean = s.trim().trim_matches('"').to_string();
-                if clean.is_empty() { None } else { Some(clean) }
+                if clean.is_empty() {
+                    None
+                } else {
+                    Some(clean)
+                }
             })
             .collect();
-        let winrate = if play > 0 { (wins as f64 / play as f64) * 100.0 } else { 0.0 };
+        let winrate = if play > 0 {
+            (wins as f64 / play as f64) * 100.0
+        } else {
+            0.0
+        };
         result["startingItems"] = serde_json::json!({
             "names": names,
             "winrate": winrate,
@@ -1718,10 +1743,18 @@ fn parse_opgg_champion_analysis(text: &str, champion: &str) -> serde_json::Value
             .split(',')
             .filter_map(|s| {
                 let clean = s.trim().trim_matches('"').to_string();
-                if clean.is_empty() { None } else { Some(clean) }
+                if clean.is_empty() {
+                    None
+                } else {
+                    Some(clean)
+                }
             })
             .collect();
-        let winrate = if play > 0 { (wins as f64 / play as f64) * 100.0 } else { 0.0 };
+        let winrate = if play > 0 {
+            (wins as f64 / play as f64) * 100.0
+        } else {
+            0.0
+        };
         result["coreItems"] = serde_json::json!({
             "names": names,
             "winrate": winrate,
@@ -1738,7 +1771,11 @@ fn parse_opgg_champion_analysis(text: &str, champion: &str) -> serde_json::Value
             .split(',')
             .filter_map(|s| s.trim().parse::<i64>().ok())
             .collect();
-        let winrate = if play > 0 { (wins as f64 / play as f64) * 100.0 } else { 0.0 };
+        let winrate = if play > 0 {
+            (wins as f64 / play as f64) * 100.0
+        } else {
+            0.0
+        };
         result["summonerSpells"] = serde_json::json!({
             "ids": ids,
             "winrate": winrate,
@@ -2010,11 +2047,12 @@ async fn run_bocchi_overlay_inner(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let game_path = payload
+    let raw_game_path = payload
         .get("gamePath")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let game_path = overlay::resolve_league_game_executable(&raw_game_path)?;
 
     if game_path.is_empty() || !game_path.to_lowercase().ends_with("league of legends.exe") {
         return Err("League of Legends.exe no configurado.".to_string());
@@ -2056,7 +2094,10 @@ async fn run_bocchi_overlay_inner(
     } else if !dll_path.is_empty() && PathBuf::from(&dll_path).exists() {
         dll_path
     } else {
-        let engine_dll = PathBuf::from(&app_dir).join("engine").join("tools").join("cslol-dll.dll");
+        let engine_dll = PathBuf::from(&app_dir)
+            .join("engine")
+            .join("tools")
+            .join("cslol-dll.dll");
         if engine_dll.exists() {
             engine_dll.to_string_lossy().to_string()
         } else {
@@ -2514,10 +2555,14 @@ pub async fn build_base_overlay(
         .get("sidecarPath")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let game_path = payload
+    let raw_game_path = payload
         .get("gamePath")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let game_path = match overlay::resolve_league_game_executable(raw_game_path) {
+        Ok(path) => path,
+        Err(_) => return Ok(serde_json::json!({ "overlayPath": "" })),
+    };
 
     if game_path.is_empty() || !game_path.to_lowercase().ends_with("league of legends.exe") {
         return Ok(serde_json::json!({ "overlayPath": "" }));
@@ -2544,7 +2589,7 @@ pub async fn build_base_overlay(
         return Ok(serde_json::json!({ "overlayPath": "" }));
     }
 
-    let game_folder = PathBuf::from(game_path)
+    let game_folder = PathBuf::from(&game_path)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -2564,7 +2609,7 @@ pub async fn build_base_overlay(
                 index + 1,
                 entry.get("champion").and_then(|v| v.as_str()).unwrap_or("")
             ));
-            overlay::generate_fantome_from_league_wad(&engine_path, game_path, entry, &app_dir)
+            overlay::generate_fantome_from_league_wad(&engine_path, &game_path, entry, &app_dir)
         })
         .collect();
 
@@ -2722,7 +2767,8 @@ pub async fn diagnose_overlay(
 
     // DLL source metadata (read as JSON, extract fields like Electron)
     let dll_meta_path = PathBuf::from(&app_dir)
-        .join("engine").join("tools")
+        .join("engine")
+        .join("tools")
         .join("dll-source.json");
     let dll_meta: Option<serde_json::Value> = std::fs::read_to_string(&dll_meta_path)
         .ok()
@@ -3496,7 +3542,8 @@ pub async fn ltk_detect() -> Result<serde_json::Value, String> {
     for bin in &known_binaries {
         candidates.push(
             crate::install_dir()
-                .join("engine").join("tools")
+                .join("engine")
+                .join("tools")
                 .join(bin)
                 .to_string_lossy()
                 .to_string(),
@@ -3843,7 +3890,12 @@ fn resolve_preferred_engine(
         }
     }
 
-    candidates.push(PathBuf::from(app_dir).join("engine").join("tools").join(preferred_binary));
+    candidates.push(
+        PathBuf::from(app_dir)
+            .join("engine")
+            .join("tools")
+            .join(preferred_binary),
+    );
 
     for candidate in candidates {
         if candidate.exists() {
@@ -3918,7 +3970,10 @@ pub async fn mods_auto_configure_overlay(
         .filter(|p| PathBuf::from(p).exists())
         .map(|p| p.to_string())
         .or_else(|| {
-            let dll = PathBuf::from(&app_dir).join("engine").join("tools").join("cslol-dll.dll");
+            let dll = PathBuf::from(&app_dir)
+                .join("engine")
+                .join("tools")
+                .join("cslol-dll.dll");
             if dll.exists() {
                 Some(dll.to_string_lossy().to_string())
             } else {
@@ -4933,7 +4988,11 @@ fn clean_general_ini_content(content: &str) -> String {
     let mut lines = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('[') || trimmed.starts_with(';') || trimmed.starts_with('#') {
+        if trimmed.is_empty()
+            || trimmed.starts_with('[')
+            || trimmed.starts_with(';')
+            || trimmed.starts_with('#')
+        {
             lines.push(line.to_string());
             continue;
         }
@@ -5087,7 +5146,11 @@ pub fn pengu_startup_init(app_dir: &str, token_dir: &str) {
                     None => match search_pengu_exe_wide(token_dir) {
                         Some(p) => p,
                         None => {
-                            eprintln!("[PenguStartup] PenguLoader.exe no encontrado en {} ni {}", loader_dir_app.display(), loader_dir_token.display());
+                            eprintln!(
+                                "[PenguStartup] PenguLoader.exe no encontrado en {} ni {}",
+                                loader_dir_app.display(),
+                                loader_dir_token.display()
+                            );
                             return;
                         }
                     },

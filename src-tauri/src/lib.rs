@@ -8,8 +8,8 @@ use tauri::{
 use tokio::sync::{broadcast, Mutex};
 
 mod asset_server;
-pub mod config;
 mod commands;
+pub mod config;
 mod downloads;
 mod gameflow;
 pub mod junction;
@@ -266,9 +266,12 @@ pub fn run() {
                     window.on_window_event(move |event| {
                         if let tauri::WindowEvent::Resized(_) = event {
                             if let Ok(maximized) = w.is_maximized() {
-                                let _ = handle.emit("app:window-maximize-changed", serde_json::json!({
-                                    "maximized": maximized,
-                                }));
+                                let _ = handle.emit(
+                                    "app:window-maximize-changed",
+                                    serde_json::json!({
+                                        "maximized": maximized,
+                                    }),
+                                );
                             }
                         }
                     });

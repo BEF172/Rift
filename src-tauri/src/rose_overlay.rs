@@ -26,6 +26,57 @@ struct RoseBuild {
     overlay_dir: PathBuf,
 }
 
+fn resolve_game_dir(input: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(input.trim());
+    if path.as_os_str().is_empty() {
+        return Err("League of Legends.exe no configurado.".to_string());
+    }
+
+    let direct_game_dir = if path.is_dir()
+        && path
+            .file_name()
+            .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Game"))
+            .unwrap_or(false)
+    {
+        Some(path.clone())
+    } else if path.is_file()
+        && path
+            .file_name()
+            .map(|name| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case("League of Legends.exe")
+            })
+            .unwrap_or(false)
+    {
+        path.parent().map(|parent| parent.to_path_buf())
+    } else if path.is_file()
+        && path
+            .file_name()
+            .map(|name| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case("LeagueClient.exe")
+            })
+            .unwrap_or(false)
+    {
+        path.parent().map(|parent| parent.join("Game"))
+    } else {
+        let nested = path.join("Game");
+        if nested.is_dir() {
+            Some(nested)
+        } else {
+            None
+        }
+    };
+
+    let game_dir = direct_game_dir
+        .filter(|dir| dir.join("League of Legends.exe").is_file())
+        .ok_or_else(|| {
+            "No pude resolver la carpeta Game de League. Configura ...\\League of Legends\\Game o ...\\Game\\League of Legends.exe.".to_string()
+        })?;
+
+    Ok(game_dir)
+}
+
 fn prepare_rose_tools(app_dir: &str, bundled_exe: &Path) -> Result<PathBuf, String> {
     let tools_dir = PathBuf::from(app_dir).join("engine").join("tools");
     std::fs::create_dir_all(&tools_dir)
@@ -246,16 +297,12 @@ fn build_overlay(
             mod_tools.display()
         ));
     }
-    let game_exe = PathBuf::from(
+    let game_dir = resolve_game_dir(
         payload
             .get("gamePath")
             .and_then(|value| value.as_str())
             .unwrap_or(""),
-    );
-    let game_dir = game_exe
-        .parent()
-        .filter(|path| path.is_dir())
-        .ok_or_else(|| "League of Legends.exe no configurado.".to_string())?;
+    )?;
     let paths = collect_paths(payload);
     if paths.is_empty() {
         return Err("No hay mods para construir el overlay.".to_string());
@@ -278,7 +325,8 @@ fn build_overlay(
         "--ignoreConflict".to_string(),
     ];
     overlay::append_overlay_log(&format!(
-        "[Engine] mkoverlay mods={} paths={}",
+        "[Engine] mkoverlay game={} mods={} paths={}",
+        game_dir.display(),
         mod_names.join("/"),
         paths.len()
     ));
@@ -306,7 +354,7 @@ fn build_overlay(
     );
     Ok(RoseBuild {
         mod_tools,
-        game_dir: game_dir.to_path_buf(),
+        game_dir,
         overlay_dir,
     })
 }
@@ -381,9 +429,7 @@ pub async fn run_rose_overlay_v2(
             // Rose starts runoverlay immediately after mkoverlay. The monitor
             // handles suspension independently; runoverlay will wait for League
             // internally if needed.
-            overlay::append_overlay_log(
-                "[Engine] Overlay listo; iniciando runoverlay.",
-            );
+            overlay::append_overlay_log("[Engine] Overlay listo; iniciando runoverlay.");
             let runner =
                 match start_runoverlay(&build.mod_tools, &build.game_dir, &build.overlay_dir) {
                     Ok(runner) => runner,

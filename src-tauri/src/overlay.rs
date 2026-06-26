@@ -1739,39 +1739,55 @@ pub fn kill_all_runoverlay_processes() -> u32 {
 // ── Path resolution ──
 
 pub fn resolve_league_game_executable(selected_path: &str) -> Result<String, String> {
-    let target = selected_path.to_string();
-    if !target.to_lowercase().ends_with(".exe") {
+    let target = selected_path.trim().to_string();
+    if target.is_empty() {
         return Err("Configura League of Legends.exe antes de importar.".to_string());
     }
 
-    let filename = PathBuf::from(&target)
+    let target_path = PathBuf::from(&target);
+    let filename = target_path
         .file_name()
         .map(|f| f.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    let candidates = if filename == "leagueclient.exe" {
-        let parent = PathBuf::from(&target)
-            .parent()
-            .unwrap_or(std::path::Path::new(""))
-            .to_path_buf();
-        vec![parent
-            .join("Game")
-            .join("League of Legends.exe")
-            .to_string_lossy()
-            .to_string()]
-    } else {
-        let parent = PathBuf::from(&target)
-            .parent()
-            .unwrap_or(std::path::Path::new(""))
-            .to_path_buf();
-        vec![
-            target.clone(),
-            parent
+    let candidates = if target_path.is_dir() {
+        if filename == "game" {
+            vec![target_path
+                .join("League of Legends.exe")
+                .to_string_lossy()
+                .to_string()]
+        } else {
+            vec![target_path
                 .join("Game")
                 .join("League of Legends.exe")
                 .to_string_lossy()
-                .to_string(),
-        ]
+                .to_string()]
+        }
+    } else {
+        if !target.to_lowercase().ends_with(".exe") {
+            return Err("Configura League of Legends.exe antes de importar.".to_string());
+        }
+
+        let parent = target_path
+            .parent()
+            .unwrap_or(std::path::Path::new(""))
+            .to_path_buf();
+        if filename == "leagueclient.exe" {
+            vec![parent
+                .join("Game")
+                .join("League of Legends.exe")
+                .to_string_lossy()
+                .to_string()]
+        } else {
+            vec![
+                target.clone(),
+                parent
+                    .join("Game")
+                    .join("League of Legends.exe")
+                    .to_string_lossy()
+                    .to_string(),
+            ]
+        }
     };
 
     for candidate in &candidates {

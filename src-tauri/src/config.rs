@@ -42,15 +42,13 @@ pub fn load_client_path() -> Option<String> {
 
 pub fn save_league_path(path: &str) {
     let mut ini = read_ini();
-    ini.with_section(Some("General"))
-        .set("leaguePath", path);
+    ini.with_section(Some("General")).set("leaguePath", path);
     write_ini(&ini);
 }
 
 pub fn save_client_path(path: &str) {
     let mut ini = read_ini();
-    ini.with_section(Some("General"))
-        .set("clientPath", path);
+    ini.with_section(Some("General")).set("clientPath", path);
     write_ini(&ini);
 }
 
@@ -64,7 +62,11 @@ pub fn save_paths(league_path: &str, client_path: &str) {
 
 pub fn infer_client_path_from_league_path(league_path: &str) -> Option<String> {
     let league_dir = PathBuf::from(league_path.trim());
-    if league_dir.file_name()?.to_string_lossy().eq_ignore_ascii_case("Game") {
+    if league_dir
+        .file_name()?
+        .to_string_lossy()
+        .eq_ignore_ascii_case("Game")
+    {
         let client_dir = league_dir.parent()?;
         if client_dir.join("LeagueClient.exe").exists() {
             return Some(client_dir.to_string_lossy().to_string());

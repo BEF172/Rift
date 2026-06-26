@@ -190,15 +190,15 @@ async fn serve_bridge_port_discovery(stream: &mut TcpStream, bridge_port: u16) -
     if !is_discovery {
         return false;
     }
-    let origin = request
-        .lines()
-        .find_map(|line| line.split_once(':').and_then(|(name, value)| {
+    let origin = request.lines().find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
             if name.trim().eq_ignore_ascii_case("origin") {
                 Some(value.trim())
             } else {
                 None
             }
-        }));
+        })
+    });
     if !is_allowed_loopback_origin(origin) {
         let response = "HTTP/1.1 403 Forbidden\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
@@ -564,13 +564,21 @@ async fn handle_local_preview(
         .get("championId")
         .and_then(json_to_u64)
         .map(|v| v.to_string())
-        .or_else(|| msg.get("championId").and_then(|v| v.as_str()).map(str::to_string))
+        .or_else(|| {
+            msg.get("championId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_default();
     let skin_id = msg
         .get("skinId")
         .and_then(json_to_u64)
         .map(|v| v.to_string())
-        .or_else(|| msg.get("skinId").and_then(|v| v.as_str()).map(str::to_string))
+        .or_else(|| {
+            msg.get("skinId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_default();
     let chroma_id = msg.get("chromaId").and_then(|v| v.as_u64()).unwrap_or(0);
     if champion_id.is_empty() || skin_id.is_empty() || chroma_id == 0 {
