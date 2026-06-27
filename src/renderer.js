@@ -3244,21 +3244,14 @@ const queuePenguSelectionForFinalization = async (payload, key) => {
   window.riftAtlas.appendOverlayLog(
     `[Rose] estado canonico: championId=${preparedPayload.championId || "?"} requestedSkinId=${preparedPayload.requestedSkinId || "?"} actualLcuSkinId=${preparedPayload.actualLcuSkinId || lastPenguLcuSelection?.selectedSkinId || "?"} name=${preparedPayload.resolvedSkinName || preparedPayload.skin || "?"}.`
   ).catch(() => { });
-  // Rose-style: force LCU skin IMMEDIATELY when skin sync arrives, not at
-  // FINALIZATION threshold. The threshold only controls when overlay build starts.
+  // Rose-style: do NOT force LCU skin here. The PATCH happens at FINALIZATION
+  // threshold inside triggerRoseFinalizationApply, same as Rose's _force_owned_skin
+  // which is called synchronously inside inject_skin (after extraction, before mkoverlay).
   if (deferred) {
     window.riftAtlas.appendOverlayLog(
-      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; forzando skin LCU inmediato y diferidiendo overlay build.`
+      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; inyeccion diferida al ticker local monotonic de ${ROSE_INJECTION_THRESHOLD_MS}ms.`
     ).catch(() => { });
-    // Force LCU skin NOW (Rose: _force_owned_skin / _force_base_skin in update_skin())
-    await maybeForceLeagueSkinForOverlay(skin, preparedPayload);
-    // Also force support skins now
-    const supportKeys = getPenguSupportModKeys(finalKey, preparedPayload.championId || 0);
-    for (const supportKey of supportKeys) {
-      const supportSkin = getSkinByKey(supportKey);
-      if (supportSkin) await maybeForceLeagueSkinForOverlay(supportSkin, preparedPayload);
-    }
-    // Start early monitor to suspend League (Rose: starts monitor in update_skin)
+    // Start early monitor now to freeze League before mkoverlay (Rose-style)
     await startRoseEarlyMonitor(`selection-${finalKey}`);
   }
   return handlePenguSkinApply({ ...preparedPayload, key: finalKey, apply: !deferred });
