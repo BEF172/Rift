@@ -25,6 +25,7 @@ const SUSPICIOUS_WAD_SIZE: u64 = 1024 * 1024;
 const MKOVERLAY_BASE_TIMEOUT_MS: u64 = 1000 * 60 * 5;
 const MKOVERLAY_PER_MB_TIMEOUT_MS: u64 = 1000 * 20;
 const MKOVERLAY_MAX_TIMEOUT_MS: u64 = 1000 * 60 * 30;
+const EARLY_MONITOR_AUTO_RESUME_SECS: u64 = 60;
 
 #[derive(Clone)]
 pub struct OverlayRunToken {
@@ -219,7 +220,7 @@ pub fn start_early_monitor(
         let max_duration = Duration::from_secs(60);
         // Safety timeout: only resume if GameSuspensionGuard never takes over
         // (e.g., run_overlay_blocking was never called or crashed before creating guard)
-        let auto_resume_timeout = Duration::from_secs(20);
+        let auto_resume_timeout = Duration::from_secs(EARLY_MONITOR_AUTO_RESUME_SECS);
         let mut suspended_pid: Option<u32> = None;
         let mut suspended_at: Option<Instant> = None;
         let mut logged_waiting = false;
@@ -231,8 +232,8 @@ pub fn start_early_monitor(
                     match suspend_process(pid) {
                         Ok(()) => {
                             append_overlay_log(&format!(
-                                "[EarlyMonitor] League suspendido pid={}",
-                                pid
+                                "[EarlyMonitor] League suspendido pid={} auto_resume={}s",
+                                pid, EARLY_MONITOR_AUTO_RESUME_SECS
                             ));
                         }
                         Err(e) => {
@@ -251,7 +252,9 @@ pub fn start_early_monitor(
                     }
                 }
 
-                // Rose-style auto-resume safety timeout
+                // Rose-style auto-resume safety timeout. Rose defaults this to
+                // 60s for real injections; shorter windows can release League
+                // before mkoverlay finishes on slower first builds.
                 if let Some(since) = suspended_at {
                     if since.elapsed() >= auto_resume_timeout {
                         append_overlay_log(&format!(
