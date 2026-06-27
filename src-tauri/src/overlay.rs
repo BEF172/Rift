@@ -213,13 +213,11 @@ pub fn start_early_monitor(
     game_path: &str,
     active: Arc<AtomicBool>,
     pid_shared: Arc<StdMutex<Option<u32>>>,
+    runoverlay_started: Arc<AtomicBool>,
 ) {
     let gp = game_path.to_string();
     tokio::spawn(async move {
         let start = Instant::now();
-        // max_duration must exceed auto-resume timeout so the monitor outlives
-        // the safety window. Previously 60s < 120s auto-resume, causing the
-        // monitor to exit and resume League BEFORE the safety timeout fired.
         let max_duration = Duration::from_secs(EARLY_MONITOR_AUTO_RESUME_SECS + 30);
         let auto_resume_timeout = Duration::from_secs(EARLY_MONITOR_AUTO_RESUME_SECS);
         let mut suspended_pid: Option<u32> = None;
@@ -227,13 +225,20 @@ pub fn start_early_monitor(
         let mut logged_waiting = false;
         let mut immediate_checks = 0u32;
 
-        append_overlay_log("[EarlyMonitor] Monitor temprano iniciado (50ms poll).");
+        append_overlay_log("[EarlyMonitor] Monitor temprano iniciado (5ms→50ms poll).");
         while active.load(Ordering::SeqCst) && start.elapsed() < max_duration {
+            // Rose-style: once runoverlay has started, NEVER re-suspend.
+            // This prevents the monitor from fighting with runoverlay's DLL injection.
+            if runoverlay_started.load(Ordering::SeqCst) {
+                append_overlay_log("[EarlyMonitor] runoverlay ya inicio; saliendo del monitor.");
+                break;
+            }
+
             if let Some(pid) = find_league_process(&gp) {
                 if suspended_pid != Some(pid) {
-                    // Rose-style: don't re-suspend if runoverlay already started
-                    // and the process was resumed. This prevents the monitor from
-                    // fighting with runoverlay's injection.
+                    // Rose-style: log and continue on failure (don't break).
+                    // Rose catches the exception and keeps the loop alive so
+                    // it can retry on the next iteration.
                     match suspend_process(pid) {
                         Ok(()) => {
                             append_overlay_log(&format!(
@@ -243,10 +248,27 @@ pub fn start_early_monitor(
                         }
                         Err(e) => {
                             append_overlay_log(&format!(
-                                "[EarlyMonitor] ERROR suspendiendo pid={}: {}",
+                                "[EarlyMonitor] ERROR suspendiendo pid={}: {} (continuando)",
                                 pid, e
                             ));
-                            break;
+                            // Don't break — Rose continues the loop and retries.
+                            // Only break if the process is gone entirely.
+                            if !is_process_alive(pid) {
+                                append_overlay_log(&format!(
+                                    "[EarlyMonitor] pid={} no existe; limpiando estado.",
+                                    pid
+                                ));
+                                suspended_pid = None;
+                                match pid_shared.lock() {
+                                    Ok(mut shared) => *shared = None,
+                                    Err(poisoned) => *poisoned.into_inner() = None,
+                                }
+                            }
+                            logged_waiting = false;
+                            let delay = if immediate_checks < 10 { 5 } else { 50 };
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            immediate_checks += 1;
+                            continue;
                         }
                     }
                     suspended_pid = Some(pid);
@@ -257,9 +279,7 @@ pub fn start_early_monitor(
                     }
                 }
 
-                // Rose-style auto-resume safety timeout. Rose defaults this to
-                // 60s for real injections; shorter windows can release League
-                // before mkoverlay finishes on slower first builds.
+                // Rose-style auto-resume safety timeout.
                 if let Some(since) = suspended_at {
                     if since.elapsed() >= auto_resume_timeout {
                         append_overlay_log(&format!(
@@ -290,6 +310,8 @@ pub fn start_early_monitor(
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
 
+        // Post-loop resume: only resume if stop_early_monitor hasn't already taken
+        // the PID (meaning we still own the suspension).
         if let Some(pid) = suspended_pid {
             let should_resume = match pid_shared.lock() {
                 Ok(mut shared) => shared.take() == Some(pid),
@@ -309,29 +331,55 @@ pub fn start_early_monitor(
                 }
             }
         }
-        // Always clear the active flag so a new monitor can be started for the next game.
         active.store(false, Ordering::SeqCst);
         append_overlay_log("[EarlyMonitor] Monitor temprano finalizado.");
     });
 }
 
-pub fn stop_early_monitor(active: &AtomicBool, pid_shared: &StdMutex<Option<u32>>) -> bool {
+/// Rose-style resume: calls resume_game() which sets _runoverlay_started = True
+/// BEFORE resuming, preventing the monitor from re-suspending. Then resumes
+/// the process with retry logic (Rose retries up to GAME_RESUME_MAX_ATTEMPTS).
+pub fn stop_early_monitor(
+    active: &AtomicBool,
+    pid_shared: &StdMutex<Option<u32>>,
+    runoverlay_started: &AtomicBool,
+) -> bool {
+    // Rose-style: set runoverlay_started FIRST to prevent the monitor from
+    // re-suspending League while we're trying to resume it.
+    runoverlay_started.store(true, Ordering::SeqCst);
     active.store(false, Ordering::SeqCst);
+
     let pid = match pid_shared.lock() {
         Ok(mut g) => g.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
     if let Some(pid) = pid {
-        match resume_process(pid) {
-            Ok(()) => append_overlay_log(&format!(
-                "[EarlyMonitor] League reanudado por stop pid={}",
-                pid
-            )),
-            Err(error) => append_overlay_log(&format!(
-                "[EarlyMonitor] ERROR reanudando por stop pid={}: {}",
-                pid, error
-            )),
+        // Rose-style: retry resume with verification (GAME_RESUME_MAX_ATTEMPTS = 3)
+        let max_attempts = 3;
+        for attempt in 1..=max_attempts {
+            match resume_process(pid) {
+                Ok(()) => {
+                    append_overlay_log(&format!(
+                        "[EarlyMonitor] League reanudado por stop pid={} intento={}",
+                        pid, attempt
+                    ));
+                    return true;
+                }
+                Err(error) => {
+                    append_overlay_log(&format!(
+                        "[EarlyMonitor] ERROR reanudando por stop pid={} intento={}: {}",
+                        pid, attempt, error
+                    ));
+                    if attempt < max_attempts {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
         }
+        append_overlay_log(&format!(
+            "[EarlyMonitor] Todos los intentos de resume fallaron para pid={}",
+            pid
+        ));
         return true;
     }
     false
@@ -1066,9 +1114,10 @@ pub fn exec_tool_with_timeout(
         .spawn()
         .map_err(|e| format!("Error al ejecutar {}: {}", cmd, e))?;
 
-    // Rose boosts the short-lived mkoverlay process so it finishes before the
-    // FINALIZATION window closes. Runoverlay intentionally remains normal
-    // priority because it lives for the whole match.
+    // Rose boosts both mkoverlay and runoverlay to HIGH_PRIORITY_CLASS.
+    // mkoverlay needs high priority to finish before FINALIZATION closes.
+    // runoverlay needs high priority so DLL hooks CreateFileA before League
+    // loads WAD files — without this, no WAD redirects occur.
     if args
         .first()
         .map(|arg| arg.eq_ignore_ascii_case("mkoverlay"))
@@ -1175,7 +1224,7 @@ pub fn exec_tool_with_timeout(
 }
 
 #[cfg(windows)]
-fn boost_process_priority(pid: u32) {
+pub fn boost_process_priority(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, PROCESS_SET_INFORMATION,
@@ -1184,16 +1233,16 @@ fn boost_process_priority(pid: u32) {
         let handle = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
         if handle.is_null() {
             append_overlay_log(&format!(
-                "No pude elevar prioridad de mkoverlay pid={}",
+                "No pude elevar prioridad de proceso pid={}",
                 pid
             ));
             return;
         }
         if SetPriorityClass(handle, HIGH_PRIORITY_CLASS) != 0 {
-            append_overlay_log(&format!("mkoverlay prioridad alta pid={}", pid));
+            append_overlay_log(&format!("Proceso prioridad alta pid={}", pid));
         } else {
             append_overlay_log(&format!(
-                "No pude elevar prioridad de mkoverlay pid={}",
+                "No pude elevar prioridad de proceso pid={}",
                 pid
             ));
         }
@@ -1202,7 +1251,7 @@ fn boost_process_priority(pid: u32) {
 }
 
 #[cfg(not(windows))]
-fn boost_process_priority(_pid: u32) {}
+pub fn boost_process_priority(_pid: u32) {}
 
 // ── mkoverlay with fallback (matching Electron execMkoverlayWithFallback) ──
 

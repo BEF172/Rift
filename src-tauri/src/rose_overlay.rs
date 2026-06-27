@@ -1,5 +1,6 @@
 use crate::{junction, overlay, AppState};
 use std::collections::HashSet;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -245,10 +246,9 @@ fn start_runoverlay(
     mod_tools: &Path,
     game_dir: &Path,
     overlay_dir: &Path,
+    log_path: Option<&Path>,
 ) -> Result<RoseRunner, String> {
     let config_path = overlay_dir.join("cslol-config.json");
-    // Rose passes this path together with --opts:configless. The file does not
-    // need to exist; mod-tools uses the configless runtime configuration.
     let mut command = Command::new(mod_tools);
     command
         .arg("runoverlay")
@@ -256,17 +256,71 @@ fn start_runoverlay(
         .arg(&config_path)
         .arg(format!("--game:{}", game_dir.display()))
         .arg("--opts:configless")
-        .current_dir(mod_tools.parent().unwrap_or_else(|| Path::new(".")))
-        // Match Rose exactly: do not pipe runoverlay output. Capturing the DLL
-        // log is nice for diagnostics, but Rose lets mod-tools own its stdio.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .current_dir(mod_tools.parent().unwrap_or_else(|| Path::new(".")));
+
+    let capture_output = log_path.is_some();
+    if capture_output {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command
         .spawn()
         .map_err(|error| format!("No pude iniciar runoverlay: {}", error))?;
+
+    if capture_output {
+        if let Some(log_file_path) = log_path {
+            // Truncate once before spawning threads so file doesn't grow infinitely.
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(log_file_path);
+            if let Some(stdout) = child.stdout.take() {
+                let path = log_file_path.to_path_buf();
+                std::thread::spawn(move || {
+                    let reader = std::io::BufReader::new(stdout);
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = writeln!(file, "=== runoverlay stdout ===");
+                        for line in reader.lines().map_while(Result::ok) {
+                            let _ = writeln!(file, "{}", line);
+                        }
+                    }
+                });
+            }
+            if let Some(stderr) = child.stderr.take() {
+                let path = log_file_path.to_path_buf();
+                std::thread::spawn(move || {
+                    let reader = std::io::BufReader::new(stderr);
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = writeln!(file, "=== runoverlay stderr ===");
+                        for line in reader.lines().map_while(Result::ok) {
+                            let _ = writeln!(file, "{}", line);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     let pid = child.id();
+
+    // Rose-style: boost runoverlay to HIGH_PRIORITY_CLASS so DLL injection
+    // completes before League loads WAD files. Without this, League may open
+    // WADs before the hook is in place, causing no redirects.
+    overlay::boost_process_priority(pid);
+
     let exited = Arc::new(AtomicBool::new(false));
     let exited_thread = exited.clone();
     std::thread::spawn(move || {
@@ -410,12 +464,15 @@ pub async fn run_rose_overlay_v2(
     *state.running_overlay_ready.lock().await = None;
     *state.current_overlay_path.lock().await = String::new();
 
+    // Reset runoverlay_started flag at the start of a new injection cycle
+    state.early_monitor_runoverlay_started.store(false, Ordering::SeqCst);
+
     let app_dir = state.app_data_dir.lock().await.clone();
     let bundled_rose_mod_tools = match app.path().resource_dir() {
         Ok(path) => path.join("rose-tools").join("mod-tools.exe"),
         Err(error) => {
             *state.active_overlay_run.lock().await = false;
-            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
             return Err(format!("No pude resolver recursos: {}", error));
         }
     };
@@ -423,7 +480,7 @@ pub async fn run_rose_overlay_v2(
         Ok(path) => path,
         Err(error) => {
             *state.active_overlay_run.lock().await = false;
-            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
             return Err(error);
         }
     };
@@ -439,6 +496,7 @@ pub async fn run_rose_overlay_v2(
             &monitor_game_path,
             state.early_monitor_active.clone(),
             state.early_monitor_pid.clone(),
+            state.early_monitor_runoverlay_started.clone(),
         );
         overlay::append_overlay_log("[Engine] Early monitor iniciado desde run_rose_overlay_v2.");
     }
@@ -451,7 +509,7 @@ pub async fn run_rose_overlay_v2(
         Ok(result) => result,
         Err(error) => {
             *state.active_overlay_run.lock().await = false;
-            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
             return Err(format!("Engine worker fallo: {}", error));
         }
     };
@@ -460,29 +518,34 @@ pub async fn run_rose_overlay_v2(
         Ok(build) => {
             if state.overlay_cancel_epoch.load(Ordering::SeqCst) != run_epoch {
                 overlay::wipe_overlay_dir(&build.overlay_dir.to_string_lossy());
-                overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+                overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
                 *state.active_overlay_run.lock().await = false;
                 return Err(
                     "La sesion termino durante mkoverlay; la inyeccion fue cancelada.".to_string(),
                 );
             }
-            // Rose-style: NO phase gate between mkoverlay and runoverlay.
-            // Rose always completes the injection once inject_skin() starts.
-            // The game phase check was cancelling valid injections when mkoverlay
-            // took long enough for FINALIZATION to transition to InProgress.
-            // runoverlay will find League on its own regardless of phase.
 
-            // Rose starts runoverlay immediately after mkoverlay. The monitor
-            // handles suspension independently; runoverlay will wait for League
-            // internally if needed.
             overlay::append_overlay_log("[Engine] Overlay listo; iniciando runoverlay.");
-            let runner =
-                match start_runoverlay(&build.mod_tools, &build.game_dir, &build.overlay_dir) {
+            let runoverlay_log = std::env::var_os("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join("Rift Atlas")
+                .join("runoverlay-stderr.txt");
+            if let Some(parent) = runoverlay_log.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let runner = match start_runoverlay(
+                &build.mod_tools,
+                &build.game_dir,
+                &build.overlay_dir,
+                Some(&runoverlay_log),
+            ) {
                     Ok(runner) => runner,
                     Err(error) => {
                         overlay::stop_early_monitor(
                             &state.early_monitor_active,
                             &state.early_monitor_pid,
+                            &state.early_monitor_runoverlay_started,
                         );
                         overlay::wipe_overlay_dir(&build.overlay_dir.to_string_lossy());
                         *state.current_overlay_error.lock().await = error.clone();
@@ -491,17 +554,22 @@ pub async fn run_rose_overlay_v2(
                     }
                 };
 
-            // Rose-style: do NOT stop early monitor here. The monitor must keep
-            // running until it finds and suspends League.exe (which may not exist
-            // yet during ChampSelect/FINALIZATION). runoverlay uses --opts:configless
-            // and waits for League on its own. The monitor's auto-resume timeout
-            // handles the safety case. Stopping here caused the monitor to exit
-            // before League.exe started, leaving the game unsuspended during
-            // the DLL injection window — the #1 cause of intermittent failures.
-            overlay::append_overlay_log("[Engine] Early monitor mantenido vivo para capturar League.exe.");
+            // Rose-style: resume_game() equivalent. Rose calls this INSIDE
+            // mk_run_overlay() right after runoverlay starts. It resumes the
+            // frozen game and stops the monitor thread. This is the PRIMARY
+            // stop mechanism; the JS finally block's stopRoseEarlyMonitor is
+            // only defensive cleanup (no-op since monitor is already stopped).
+            //
+            // IMPORTANT: We add a small delay before resuming. In Rose, the
+            // overhead of Python/psutil (Popen + Process(pid).nice()) gives
+            // the DLL ~200-400ms to inject and hook CreateFileA before the
+            // game resumes. Without this delay, Rust's fast spawn+resume
+            // lets League load WADs before the hook is in place, causing
+            // intermittent injection failures.
+            std::thread::sleep(Duration::from_millis(300));
+            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
+            overlay::append_overlay_log("[Engine] runoverlay started; early monitor stopped (resume_game equivalent).");
 
-            // Rose does not wait for stdout confirmation. It just trusts
-            // that runoverlay will find League on its own.
             *state.running_overlay_process.lock().await = Some(runner.pid);
             *state.running_overlay_alive.lock().await = Some(runner.exited.clone());
             *state.running_overlay_ready.lock().await = None;
@@ -520,9 +588,6 @@ pub async fn run_rose_overlay_v2(
                     *state.running_overlay_process.lock().await = None;
                     *state.running_overlay_alive.lock().await = None;
                     *state.running_overlay_ready.lock().await = None;
-                    // Rose-style: do NOT wipe overlay on runoverlay exit.
-                    // The DLL inside League reads overlay files at runtime.
-                    // Overlay is cleaned up when: (1) game ends, or (2) a new overlay is built.
                     overlay::append_overlay_log(&format!(
                         "[Engine] runoverlay exited pid={}. Overlay kept alive for DLL.",
                         pid
@@ -551,7 +616,7 @@ pub async fn run_rose_overlay_v2(
             }))
         }
         Err(error) => {
-            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
             *state.current_overlay_error.lock().await = error.clone();
             Err(error)
         }

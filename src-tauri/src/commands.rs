@@ -1898,13 +1898,15 @@ pub async fn start_early_monitor(
 ) -> Result<serde_json::Value, String> {
     let active = state.early_monitor_active.clone();
     let pid = state.early_monitor_pid.clone();
+    let ros = state.early_monitor_runoverlay_started.clone();
 
     if active.load(Ordering::SeqCst) {
         return Ok(serde_json::json!({ "started": true, "alreadyRunning": true }));
     }
 
     active.store(true, Ordering::SeqCst);
-    overlay::start_early_monitor(&game_path, active, pid);
+    ros.store(false, Ordering::SeqCst);
+    overlay::start_early_monitor(&game_path, active, pid, ros);
     overlay::append_overlay_log("[CMD] Early monitor iniciado desde frontend.");
     Ok(serde_json::json!({ "started": true }))
 }
@@ -1912,7 +1914,7 @@ pub async fn start_early_monitor(
 #[tauri::command]
 pub async fn stop_early_monitor(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let had_suspended =
-        overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+        overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
     overlay::append_overlay_log(&format!(
         "[CMD] Early monitor detenido. suspended={}",
         had_suspended

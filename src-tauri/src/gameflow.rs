@@ -476,6 +476,7 @@ async fn stop_overlay_for_phase(app: &AppHandle, phase: &str, previous: &str) {
 
     state.overlay_cancel_epoch.fetch_add(1, Ordering::SeqCst);
     state.early_monitor_active.store(false, Ordering::SeqCst);
+    state.early_monitor_runoverlay_started.store(false, Ordering::SeqCst);
     let early_pid = match state.early_monitor_pid.lock() {
         Ok(mut pid) => pid.take(),
         Err(poisoned) => poisoned.into_inner().take(),

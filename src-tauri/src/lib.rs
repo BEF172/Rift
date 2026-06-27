@@ -118,6 +118,7 @@ pub struct AppState {
     pub app_data_dir: Mutex<String>,
     pub early_monitor_active: Arc<AtomicBool>,
     pub early_monitor_pid: Arc<StdMutex<Option<u32>>>,
+    pub early_monitor_runoverlay_started: Arc<AtomicBool>,
     pub suspended_pid: Mutex<Option<u32>>,
     pub shutdown_cleanup_started: Arc<AtomicBool>,
     pub debug_mode: bool,
@@ -133,6 +134,7 @@ fn begin_shutdown_cleanup(app: &AppHandle) {
     {
         let app_dir = state.app_data_dir.blocking_lock().clone();
         state.early_monitor_active.store(false, Ordering::SeqCst);
+        state.early_monitor_runoverlay_started.store(false, Ordering::SeqCst);
         state.overlay_cancel_epoch.fetch_add(1, Ordering::SeqCst);
         let early_pid = match state.early_monitor_pid.lock() {
             Ok(mut pid) => pid.take(),
@@ -210,6 +212,7 @@ pub fn run() {
             app_data_dir: Mutex::new(String::new()),
             early_monitor_active: Arc::new(AtomicBool::new(false)),
             early_monitor_pid: Arc::new(StdMutex::new(None)),
+            early_monitor_runoverlay_started: Arc::new(AtomicBool::new(false)),
             suspended_pid: Mutex::new(None),
             shutdown_cleanup_started: Arc::new(AtomicBool::new(false)),
             debug_mode,

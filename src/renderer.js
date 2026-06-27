@@ -3251,8 +3251,11 @@ const queuePenguSelectionForFinalization = async (payload, key) => {
     window.riftAtlas.appendOverlayLog(
       `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; inyeccion diferida al ticker local monotonic de ${ROSE_INJECTION_THRESHOLD_MS}ms.`
     ).catch(() => { });
-    // Start early monitor now to freeze League before mkoverlay (Rose-style)
-    await startRoseEarlyMonitor(`selection-${finalKey}`);
+    // Rose-style: do NOT start the monitor here. Rose starts the monitor in
+    // inject_skin_immediately() — when injection ACTUALLY happens (at the
+    // FINALIZATION threshold), not when the skin sync first arrives. Starting
+    // too early wastes monitor lifetime and causes it to exit before League.exe
+    // appears. The monitor starts in applyPenguSelectedSkin instead.
   }
   return handlePenguSkinApply({ ...preparedPayload, key: finalKey, apply: !deferred });
 };
