@@ -497,13 +497,20 @@ pub async fn run_rose_overlay_v2(
                     }
                 };
 
-            // Rose-style: resume_game() equivalent. Resume the frozen game,
-            // then sleep to give the DLL time to install CreateFileA hooks
-            // before League's main thread loads WADs. The DLL's DllMain runs
-            // when the process is RESUMED, not while suspended.
+            // Rose-style resume_game() timing. Rose's Python/psutil overhead
+            // (Popen + Process.nice()) naturally provides ~200-400ms between
+            // spawn and resume. During this window, runoverlay sets up DLL
+            // injection: OpenProcess → VirtualAllocEx → WriteProcessMemory →
+            // CreateRemoteThread. The game is still frozen so the remote thread
+            // sits dormant — but it MUST be created BEFORE resume, or the DLL
+            // never loads. Rust's fast spawn gives us only ~70ms; we need at
+            // least 500ms to match Rose's overhead.
+            std::thread::sleep(Duration::from_millis(500));
             overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
-            overlay::append_overlay_log("[Engine] game resumed; esperando DLL hook (300ms).");
-            std::thread::sleep(Duration::from_millis(300));
+            overlay::append_overlay_log("[Engine] game resumed; injection setup complete.");
+            // Short post-resume: give DLL's DllMain time to hook CreateFileA
+            // before League's main thread loads WADs.
+            std::thread::sleep(Duration::from_millis(100));
 
             *state.running_overlay_process.lock().await = Some(runner.pid);
             *state.running_overlay_alive.lock().await = Some(runner.exited.clone());
