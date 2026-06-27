@@ -497,21 +497,13 @@ pub async fn run_rose_overlay_v2(
                     }
                 };
 
-            // Rose-style: resume_game() equivalent. Rose calls this INSIDE
-            // mk_run_overlay() right after runoverlay starts. It resumes the
-            // frozen game and stops the monitor thread. This is the PRIMARY
-            // stop mechanism; the JS finally block's stopRoseEarlyMonitor is
-            // only defensive cleanup (no-op since monitor is already stopped).
-            //
-            // IMPORTANT: We add a small delay before resuming. In Rose, the
-            // overhead of Python/psutil (Popen + Process(pid).nice()) gives
-            // the DLL ~200-400ms to inject and hook CreateFileA before the
-            // game resumes. Without this delay, Rust's fast spawn+resume
-            // lets League load WADs before the hook is in place, causing
-            // intermittent injection failures.
-            std::thread::sleep(Duration::from_millis(300));
+            // Rose-style: resume_game() equivalent. Resume the frozen game,
+            // then sleep to give the DLL time to install CreateFileA hooks
+            // before League's main thread loads WADs. The DLL's DllMain runs
+            // when the process is RESUMED, not while suspended.
             overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
-            overlay::append_overlay_log("[Engine] runoverlay started; early monitor stopped (resume_game equivalent).");
+            overlay::append_overlay_log("[Engine] game resumed; esperando DLL hook (300ms).");
+            std::thread::sleep(Duration::from_millis(300));
 
             *state.running_overlay_process.lock().await = Some(runner.pid);
             *state.running_overlay_alive.lock().await = Some(runner.exited.clone());

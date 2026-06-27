@@ -869,6 +869,11 @@ const stopRoseEarlyMonitor = async (reason = "release") => {
 
 const triggerRoseFinalizationApply = async (reason = "finalization") => {
   if (state.lastHoverWritten || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted || state.importingQueue || state.overlayRunning) return false;
+  const injectPhase = String(state.penguGameflowPhase || "");
+  if (injectPhase && !["ChampSelect", "FINALIZATION"].includes(injectPhase)) {
+    window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION apply saltado: fase=${injectPhase} (${reason}).`).catch(() => { });
+    return false;
+  }
   // Rose-style cooldown guard: prevent re-injection within threshold window
   const now = Date.now();
   const elapsed = now - state.lastRoseInjectionTime;
@@ -924,6 +929,11 @@ const startRoseLocalFinalizationTicker = () => {
   window.riftAtlas.waitForLcuFinalizationThreshold(ROSE_INJECTION_THRESHOLD_MS)
     .then((result) => {
       if (generation !== roseLocalTickerGeneration || !result?.ready) return;
+      const tickerPhase = String(state.penguGameflowPhase || "");
+      if (tickerPhase && !["ChampSelect", "FINALIZATION"].includes(tickerPhase)) {
+        window.riftAtlas.appendOverlayLog(`[RoseTicker] ticker resuelto DEMASIADO TARDE; fase=${tickerPhase}. Abortando.`).catch(() => { });
+        return;
+      }
       state.penguGameflowPhase = "FINALIZATION";
       state.lastRemainMs = Math.max(0, Number(result.remainingMs || 0));
       clearRoseFinalizationTimer();
