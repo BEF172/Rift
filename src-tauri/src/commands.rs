@@ -161,7 +161,10 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn display_user_path(path: &Path) -> String {
     let display = path.display().to_string();
-    display.strip_prefix(r"\\?\").unwrap_or(&display).to_string()
+    display
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&display)
+        .to_string()
 }
 
 // Basic app info

@@ -1,6 +1,5 @@
 use crate::{junction, overlay, AppState};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +16,6 @@ struct RoseRunner {
     pid: u32,
     overlay_path: String,
     exited: Arc<AtomicBool>,
-    hook_ready: Arc<AtomicBool>,
 }
 
 struct RoseBuild {
@@ -123,11 +121,13 @@ fn clean_directory(path: &Path) -> Result<(), String> {
 }
 
 fn safe_mod_name(path: &Path, index: usize) -> String {
-    let source = path
-        .file_stem()
-        .or_else(|| path.file_name())
-        .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("mod-{}", index + 1));
+    let source = if path.is_dir() {
+        path.file_name()
+    } else {
+        path.file_stem().or_else(|| path.file_name())
+    }
+    .map(|value| value.to_string_lossy().to_string())
+    .unwrap_or_else(|| format!("mod-{}", index + 1));
     let cleaned = source
         .chars()
         .map(|character| {
@@ -138,7 +138,12 @@ fn safe_mod_name(path: &Path, index: usize) -> String {
             }
         })
         .collect::<String>();
-    format!("{:03}-{}", index + 1, cleaned.trim())
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        format!("mod-{}", index + 1)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn collect_paths(payload: &serde_json::Value) -> Vec<String> {
@@ -166,12 +171,19 @@ fn collect_paths(payload: &serde_json::Value) -> Vec<String> {
 
 fn stage_mods(mods_dir: &Path, paths: &[String]) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
+    let mut used_names = HashSet::new();
     for (index, source_text) in paths.iter().enumerate() {
         let source = PathBuf::from(source_text);
         if !source.exists() {
             return Err(format!("Mod no encontrado: {}", source.display()));
         }
-        let name = safe_mod_name(&source, index);
+        let base_name = safe_mod_name(&source, index);
+        let mut name = base_name.clone();
+        let mut duplicate_index = 2;
+        while !used_names.insert(name.to_ascii_lowercase()) {
+            name = format!("{}-{}", base_name, duplicate_index);
+            duplicate_index += 1;
+        }
         let destination = mods_dir.join(&name);
         let lower = source.to_string_lossy().to_lowercase();
         if source.is_dir() {
@@ -182,13 +194,12 @@ fn stage_mods(mods_dir: &Path, paths: &[String]) -> Result<Vec<String>, String> 
             })?;
             junction::extract_zip_to_dir(&source, &destination)?;
         } else if lower.ends_with(".wad") || lower.ends_with(".wad.client") {
-            let wad_dir = destination.join("WAD");
-            std::fs::create_dir_all(&wad_dir)
+            std::fs::create_dir_all(&destination)
                 .map_err(|error| format!("No pude crear WAD staging: {}", error))?;
             let file_name = source
                 .file_name()
                 .ok_or_else(|| format!("Nombre de WAD invalido: {}", source.display()))?;
-            std::fs::copy(&source, wad_dir.join(file_name))
+            std::fs::copy(&source, destination.join(file_name))
                 .map_err(|error| format!("No pude copiar {}: {}", source.display(), error))?;
         } else {
             return Err(format!(
@@ -246,54 +257,19 @@ fn start_runoverlay(
         .arg(format!("--game:{}", game_dir.display()))
         .arg("--opts:configless")
         .current_dir(mod_tools.parent().unwrap_or_else(|| Path::new(".")))
-        // mod-tools keeps its runoverlay loop alive while stdin remains open.
-        // Rose inherits an open stdin; our generic runner uses the same explicit
-        // pipe guard. Stdio::null() sends EOF and makes runoverlay exit with code
-        // 0 immediately after printing "Waiting for league match to start".
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // Match Rose exactly: do not pipe runoverlay output. Capturing the DLL
+        // log is nice for diagnostics, but Rose lets mod-tools own its stdio.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command
         .spawn()
         .map_err(|error| format!("No pude iniciar runoverlay: {}", error))?;
     let pid = child.id();
-    let stdin_guard = child.stdin.take();
-    let hook_ready = Arc::new(AtomicBool::new(false));
-    if let Some(stdout) = child.stdout.take() {
-        let stdout_hook_ready = hook_ready.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let line = line.trim();
-                if !line.is_empty() {
-                    overlay::append_overlay_log(&format!("[RoseV2/runoverlay] {}", line));
-                    let lower = line.to_lowercase();
-                    if lower.contains("hook applied")
-                        || lower.contains("init done")
-                        || lower.contains("overlay active")
-                        || lower.contains("redirected wad")
-                    {
-                        stdout_hook_ready.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let line = line.trim();
-                if !line.is_empty() {
-                    overlay::append_overlay_log(&format!("[RoseV2/runoverlay:stderr] {}", line));
-                }
-            }
-        });
-    }
     let exited = Arc::new(AtomicBool::new(false));
     let exited_thread = exited.clone();
     std::thread::spawn(move || {
-        let _keep_stdin_open = stdin_guard;
         let status = child.wait();
         exited_thread.store(true, Ordering::SeqCst);
         overlay::append_overlay_log(&format!(
@@ -305,7 +281,6 @@ fn start_runoverlay(
         pid,
         overlay_path: overlay_dir.to_string_lossy().to_string(),
         exited,
-        hook_ready,
     })
 }
 
@@ -521,7 +496,7 @@ pub async fn run_rose_overlay_v2(
             // that runoverlay will find League on its own.
             *state.running_overlay_process.lock().await = Some(runner.pid);
             *state.running_overlay_alive.lock().await = Some(runner.exited.clone());
-            *state.running_overlay_ready.lock().await = Some(runner.hook_ready.clone());
+            *state.running_overlay_ready.lock().await = None;
             *state.current_overlay_path.lock().await = runner.overlay_path.clone();
             *state.current_overlay_error.lock().await = String::new();
 
@@ -560,7 +535,7 @@ pub async fn run_rose_overlay_v2(
             Ok(serde_json::json!({
                 "success": true,
                 "started": true,
-                "ready": runner.hook_ready.load(Ordering::SeqCst),
+                "ready": false,
                 "pid": runner.pid,
                 "profilePath": runner.overlay_path,
                 "enginePath": rose_mod_tools_response,

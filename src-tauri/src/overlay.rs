@@ -1,4 +1,5 @@
 use serde_json;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1320,6 +1321,7 @@ fn prepare_mkoverlay_mods(
     crate::junction::clean_dir(&staging_dir);
 
     let mut staged_paths = Vec::new();
+    let mut used_names = HashSet::new();
     for (index, mod_path) in mod_paths.iter().enumerate() {
         let source = PathBuf::from(mod_path);
         let original_name = source
@@ -1327,12 +1329,22 @@ fn prepare_mkoverlay_mods(
             .map(|n| n.to_string_lossy().to_string())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| format!("mod-{}", index + 1));
-        let stem = source
-            .file_stem()
-            .map(|n| n.to_string_lossy().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| original_name.clone());
-        let staged_name = format!("{:03}-{}", index + 1, sanitize_mod_folder_name(&stem));
+        let stem = if source.is_dir() {
+            original_name.clone()
+        } else {
+            source
+                .file_stem()
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| original_name.clone())
+        };
+        let base_name = sanitize_mod_folder_name(&stem);
+        let mut staged_name = base_name.clone();
+        let mut duplicate_index = 2;
+        while !used_names.insert(staged_name.to_ascii_lowercase()) {
+            staged_name = format!("{}-{}", base_name, duplicate_index);
+            duplicate_index += 1;
+        }
         let target = staging_dir.join(&staged_name);
 
         if source.is_dir() {
@@ -1347,10 +1359,9 @@ fn prepare_mkoverlay_mods(
             crate::junction::extract_zip_to_dir(&source, &target)?;
         } else if is_wad_mod(&source) {
             // WAD → copy (single file, small)
-            let wad_dir = target.join("WAD");
-            std::fs::create_dir_all(&wad_dir)
+            std::fs::create_dir_all(&target)
                 .map_err(|e| format!("No pude crear carpeta WAD para mod-tools: {}", e))?;
-            std::fs::copy(&source, wad_dir.join(&original_name))
+            std::fs::copy(&source, target.join(&original_name))
                 .map_err(|e| format!("No pude preparar WAD para mod-tools: {}", e))?;
         } else {
             std::fs::create_dir_all(&target)
