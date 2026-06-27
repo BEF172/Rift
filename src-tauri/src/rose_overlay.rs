@@ -431,6 +431,20 @@ pub async fn run_rose_overlay_v2(
         }
     };
     let rose_mod_tools_response = rose_mod_tools.to_string_lossy().to_string();
+    if !state.early_monitor_active.load(Ordering::SeqCst) {
+        let monitor_game_path = payload
+            .get("gamePath")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        state.early_monitor_active.store(true, Ordering::SeqCst);
+        overlay::start_early_monitor(
+            &monitor_game_path,
+            state.early_monitor_active.clone(),
+            state.early_monitor_pid.clone(),
+        );
+        overlay::append_overlay_log("[Engine] Early monitor iniciado desde run_rose_overlay_v2.");
+    }
     let payload_for_build = payload.clone();
     let result = match tokio::task::spawn_blocking(move || {
         build_overlay(&payload_for_build, &app_dir, &rose_mod_tools)

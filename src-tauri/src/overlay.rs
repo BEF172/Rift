@@ -224,6 +224,7 @@ pub fn start_early_monitor(
         let mut suspended_pid: Option<u32> = None;
         let mut suspended_at: Option<Instant> = None;
         let mut logged_waiting = false;
+        let mut immediate_checks = 0u32;
 
         append_overlay_log("[EarlyMonitor] Monitor temprano iniciado (50ms poll).");
         while active.load(Ordering::SeqCst) && start.elapsed() < max_duration {
@@ -280,7 +281,9 @@ pub fn start_early_monitor(
                     logged_waiting = true;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            immediate_checks += 1;
+            let delay = if immediate_checks < 10 { 5 } else { 50 };
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
 
         if let Some(pid) = suspended_pid {
