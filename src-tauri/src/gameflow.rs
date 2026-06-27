@@ -253,7 +253,7 @@ pub async fn force_selected_skin(
 pub async fn wait_for_finalization_threshold(
     threshold_ms: u64,
 ) -> Result<serde_json::Value, String> {
-    let threshold_ms = threshold_ms.clamp(100, 2_000);
+    let threshold_ms = threshold_ms.clamp(0, 2_000);
     let lockfile = read_lockfile().ok_or_else(|| "LCU lockfile no encontrado.".to_string())?;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)

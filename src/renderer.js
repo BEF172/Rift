@@ -75,9 +75,10 @@ const state = {
   lastHoverWritten: false,
   tickerSeq: 0,
   currentTicker: 0,
-  skinWriteMs: Math.max(100, Math.min(2000, Number(localStorage.getItem("riftAtlas:roseInjectionThresholdMs") || 500))),
+  skinWriteMs: Math.max(0, Math.min(2000, Number(localStorage.getItem("riftAtlas:roseInjectionThresholdMs") || 500))),
   penguApplyLockedKey: "",
-  penguApplyLockedAt: 0
+  penguApplyLockedAt: 0,
+  lastRoseInjectionTime: 0,
 };
 
 const lcuChampionSkinCache = new Map(); // championId -> Map(full skin/chroma ID -> localized name)
@@ -810,7 +811,7 @@ const shouldKeepRoseEarlyMonitor = () =>
   ROSE_SUSPEND_PHASES.has(String(state.penguGameflowPhase || ""));
 
 const ROSE_INJECTION_THRESHOLD_MS = Math.max(
-  100,
+  0,
   Math.min(2000, Number(localStorage.getItem("riftAtlas:roseInjectionThresholdMs") || 500))
 );
 let roseLocalTickerGeneration = 0;
@@ -868,15 +869,18 @@ const stopRoseEarlyMonitor = async (reason = "release") => {
 
 const triggerRoseFinalizationApply = async (reason = "finalization") => {
   if (state.lastHoverWritten || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted || state.importingQueue || state.overlayRunning) return false;
+  // Rose-style cooldown guard: prevent re-injection within threshold window
+  const now = Date.now();
+  const elapsed = now - state.lastRoseInjectionTime;
+  if (state.lastRoseInjectionTime && elapsed < state.skinWriteMs) {
+    window.riftAtlas.appendOverlayLog(`[Rose] Cooldown activo (${state.skinWriteMs - elapsed}ms restantes); saltando inyeccion.`).catch(() => { });
+    return false;
+  }
   state.lastHoverWritten = true;
   state.roseFinalizationCommitted = true;
   state.roseFinalizationApplyStarted = true;
   let applied = false;
   try {
-    // Rose does not wait for every queued/repeated DOM notification at the
-    // injection threshold. It consumes the latest cached selection. Waiting for
-    // the whole JS queue can push the LCU base-skin force past ChampSelect and
-    // leave League on the previously owned skin.
     let payload = roseAuthoritativeSelection.payload || lastPenguSkinSyncPayload || {};
     const fallbackSkin = roseAuthoritativeSelection.skinKey ? getSkinByKey(roseAuthoritativeSelection.skinKey) : null;
     const resolved = await resolveRoseAuthoritativeSkinEntry(payload, fallbackSkin);
@@ -884,12 +888,11 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
     const skin = resolved.skin;
     if (skin) {
       lastPenguSkinSyncPayload = { ...payload };
-      // Rose calls _force_owned_skin/_force_base_skin synchronously inside
-      // trigger_injection, before starting the injection thread. Do the LCU
-      // write here, at the threshold, so it cannot be delayed behind the
-      // overlay/background queue and miss ChampSelect.
-      await maybeForceLeagueSkinForOverlay(skin, payload);
+      // Rose-style: LCU PATCH was already sent in queuePenguSelectionForFinalization
+      // when the skin sync first arrived. Only build the overlay now.
+      // Skip maybeForceLeagueSkinForOverlay here — it was already done.
       applied = Boolean(await handlePenguSkinApply({ ...payload, key: getSkinKey(skin), type: payload.type || "loadout-finalization" }));
+      if (applied) state.lastRoseInjectionTime = Date.now();
       return applied;
     }
     window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION sin una skin solicitada y resuelta; no se reutiliza la seleccion anterior.").catch(() => { });
@@ -1019,6 +1022,7 @@ const handlePenguPhaseChange = (payload = {}) => {
       state.roseFinalizationCommitted = false;
       state.roseFinalizationSignature = "";
       state.lastHoverWritten = false;
+      state.lastRoseInjectionTime = 0;
       state.loadoutCountdownActive = false;
       state.loadoutT0 = 0;
       state.loadoutLeft0Ms = 0;
@@ -3240,11 +3244,22 @@ const queuePenguSelectionForFinalization = async (payload, key) => {
   window.riftAtlas.appendOverlayLog(
     `[Rose] estado canonico: championId=${preparedPayload.championId || "?"} requestedSkinId=${preparedPayload.requestedSkinId || "?"} actualLcuSkinId=${preparedPayload.actualLcuSkinId || lastPenguLcuSelection?.selectedSkinId || "?"} name=${preparedPayload.resolvedSkinName || preparedPayload.skin || "?"}.`
   ).catch(() => { });
+  // Rose-style: force LCU skin IMMEDIATELY when skin sync arrives, not at
+  // FINALIZATION threshold. The threshold only controls when overlay build starts.
   if (deferred) {
     window.riftAtlas.appendOverlayLog(
-      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; inyeccion diferida al ticker local monotonic de ${ROSE_INJECTION_THRESHOLD_MS}ms.`
+      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; forzando skin LCU inmediato y diferidiendo overlay build.`
     ).catch(() => { });
-    await preforceUnownedBaseForFinalization(skin, preparedPayload, "selection-update");
+    // Force LCU skin NOW (Rose: _force_owned_skin / _force_base_skin in update_skin())
+    await maybeForceLeagueSkinForOverlay(skin, preparedPayload);
+    // Also force support skins now
+    const supportKeys = getPenguSupportModKeys(finalKey, preparedPayload.championId || 0);
+    for (const supportKey of supportKeys) {
+      const supportSkin = getSkinByKey(supportKey);
+      if (supportSkin) await maybeForceLeagueSkinForOverlay(supportSkin, preparedPayload);
+    }
+    // Start early monitor to suspend League (Rose: starts monitor in update_skin)
+    await startRoseEarlyMonitor(`selection-${finalKey}`);
   }
   return handlePenguSkinApply({ ...preparedPayload, key: finalKey, apply: !deferred });
 };
