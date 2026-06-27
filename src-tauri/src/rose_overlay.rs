@@ -1,6 +1,6 @@
 use crate::{junction, overlay, AppState};
 use std::collections::HashSet;
-use std::io::{BufRead, Write};
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -246,7 +246,6 @@ fn start_runoverlay(
     mod_tools: &Path,
     game_dir: &Path,
     overlay_dir: &Path,
-    log_path: Option<&Path>,
 ) -> Result<RoseRunner, String> {
     let config_path = overlay_dir.join("cslol-config.json");
     let mut command = Command::new(mod_tools);
@@ -255,15 +254,12 @@ fn start_runoverlay(
         .arg(overlay_dir)
         .arg(&config_path)
         .arg(format!("--game:{}", game_dir.display()))
-        .arg("--opts:configless")
-        .current_dir(mod_tools.parent().unwrap_or_else(|| Path::new(".")));
+        .arg("--opts:configless");
+    // Rose does NOT set current_dir — inherits parent CWD.
+    // Rose also discards all stdout/stderr (DEVNULL) to avoid pipe buffer
+    // deadlock that could block the DLL injection timing.
 
-    let capture_output = log_path.is_some();
-    if capture_output {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    } else {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
+    command.stdout(Stdio::null()).stderr(Stdio::null());
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -271,54 +267,10 @@ fn start_runoverlay(
         .spawn()
         .map_err(|error| format!("No pude iniciar runoverlay: {}", error))?;
 
-    if capture_output {
-        if let Some(log_file_path) = log_path {
-            // Truncate once before spawning threads so file doesn't grow infinitely.
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(log_file_path);
-            if let Some(stdout) = child.stdout.take() {
-                let path = log_file_path.to_path_buf();
-                std::thread::spawn(move || {
-                    let reader = std::io::BufReader::new(stdout);
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                    {
-                        let _ = writeln!(file, "=== runoverlay stdout ===");
-                        for line in reader.lines().map_while(Result::ok) {
-                            let _ = writeln!(file, "{}", line);
-                        }
-                    }
-                });
-            }
-            if let Some(stderr) = child.stderr.take() {
-                let path = log_file_path.to_path_buf();
-                std::thread::spawn(move || {
-                    let reader = std::io::BufReader::new(stderr);
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                    {
-                        let _ = writeln!(file, "=== runoverlay stderr ===");
-                        for line in reader.lines().map_while(Result::ok) {
-                            let _ = writeln!(file, "{}", line);
-                        }
-                    }
-                });
-            }
-        }
-    }
-
     let pid = child.id();
 
     // Rose-style: boost runoverlay to HIGH_PRIORITY_CLASS so DLL injection
-    // completes before League loads WAD files. Without this, League may open
-    // WADs before the hook is in place, causing no redirects.
+    // completes before League loads WAD files.
     overlay::boost_process_priority(pid);
 
     let exited = Arc::new(AtomicBool::new(false));
@@ -526,19 +478,10 @@ pub async fn run_rose_overlay_v2(
             }
 
             overlay::append_overlay_log("[Engine] Overlay listo; iniciando runoverlay.");
-            let runoverlay_log = std::env::var_os("LOCALAPPDATA")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default()
-                .join("Rift Atlas")
-                .join("runoverlay-stderr.txt");
-            if let Some(parent) = runoverlay_log.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             let runner = match start_runoverlay(
                 &build.mod_tools,
                 &build.game_dir,
                 &build.overlay_dir,
-                Some(&runoverlay_log),
             ) {
                     Ok(runner) => runner,
                     Err(error) => {
