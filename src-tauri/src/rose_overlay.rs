@@ -370,8 +370,14 @@ fn build_overlay(
         ));
     }
     junction::clean_dir(&mods_dir);
+
+    // Rose-style: hide overlay directory after mkoverlay succeeds.
+    // The cslol DLL and League's mod system expect the overlay WADs to be in
+    // a hidden directory. Without this, runoverlay may not detect the overlay.
+    overlay::hide_overlay_dir(&overlay_dir.to_string_lossy());
+
     overlay::append_overlay_log(
-        "[Engine] mkoverlay OK; staging limpiado; esperando League suspendido.",
+        "[Engine] mkoverlay OK; staging limpiado; overlay oculto; esperando League suspendido.",
     );
     Ok(RoseBuild {
         mod_tools,

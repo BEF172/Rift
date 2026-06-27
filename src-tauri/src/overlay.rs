@@ -217,9 +217,10 @@ pub fn start_early_monitor(
     let gp = game_path.to_string();
     tokio::spawn(async move {
         let start = Instant::now();
-        let max_duration = Duration::from_secs(60);
-        // Safety timeout: only resume if GameSuspensionGuard never takes over
-        // (e.g., run_overlay_blocking was never called or crashed before creating guard)
+        // max_duration must exceed auto-resume timeout so the monitor outlives
+        // the safety window. Previously 60s < 120s auto-resume, causing the
+        // monitor to exit and resume League BEFORE the safety timeout fired.
+        let max_duration = Duration::from_secs(EARLY_MONITOR_AUTO_RESUME_SECS + 30);
         let auto_resume_timeout = Duration::from_secs(EARLY_MONITOR_AUTO_RESUME_SECS);
         let mut suspended_pid: Option<u32> = None;
         let mut suspended_at: Option<Instant> = None;
@@ -230,6 +231,9 @@ pub fn start_early_monitor(
         while active.load(Ordering::SeqCst) && start.elapsed() < max_duration {
             if let Some(pid) = find_league_process(&gp) {
                 if suspended_pid != Some(pid) {
+                    // Rose-style: don't re-suspend if runoverlay already started
+                    // and the process was resumed. This prevents the monitor from
+                    // fighting with runoverlay's injection.
                     match suspend_process(pid) {
                         Ok(()) => {
                             append_overlay_log(&format!(
@@ -657,8 +661,9 @@ fn dir_contains_wad(path: &Path) -> bool {
     false
 }
 
-/// Set HIDDEN+SYSTEM attributes on overlay directory (matching Rose _hide_directory).
-/// Prevents users from accidentally deleting overlay WADs.
+/// Set HIDDEN+SYSTEM attributes on overlay directory recursively (matching Rose _hide_directory).
+/// Rose uses rglob('*') to hide ALL nested files/dirs. This prevents the filesystem
+/// filter from ignoring unhidden WADs and prevents users from accidentally deleting them.
 #[cfg(target_os = "windows")]
 pub fn hide_overlay_dir(overlay_path: &str) {
     if overlay_path.is_empty() {
@@ -668,10 +673,8 @@ pub fn hide_overlay_dir(overlay_path: &str) {
     const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
     let attrs = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
 
-    let dir = PathBuf::from(overlay_path);
-    if dir.is_dir() {
-        // Hide the directory itself
-        let wide: Vec<u16> = dir
+    fn hide_entry(path: &Path, attrs: u32) {
+        let wide: Vec<u16> = path
             .to_string_lossy()
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -679,23 +682,24 @@ pub fn hide_overlay_dir(overlay_path: &str) {
         unsafe {
             windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), attrs);
         }
-        // Hide all files inside
-        if let Ok(entries) = std::fs::read_dir(&dir) {
+    }
+
+    fn hide_recursive(dir: &Path, attrs: u32) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let entry_path = entry.path();
-                let wide: Vec<u16> = entry_path
-                    .to_string_lossy()
-                    .encode_utf16()
-                    .chain(std::iter::once(0))
-                    .collect();
-                unsafe {
-                    windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
-                        wide.as_ptr(),
-                        attrs,
-                    );
+                hide_entry(&entry_path, attrs);
+                if entry_path.is_dir() {
+                    hide_recursive(&entry_path, attrs);
                 }
             }
         }
+    }
+
+    let dir = PathBuf::from(overlay_path);
+    if dir.is_dir() {
+        hide_entry(&dir, attrs);
+        hide_recursive(&dir, attrs);
     }
 }
 
