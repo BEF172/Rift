@@ -491,8 +491,14 @@ pub async fn run_rose_overlay_v2(
                     }
                 };
 
-            // Exact Rose ordering: runoverlay exists before League is resumed.
-            overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid);
+            // Rose-style: do NOT stop early monitor here. The monitor must keep
+            // running until it finds and suspends League.exe (which may not exist
+            // yet during ChampSelect/FINALIZATION). runoverlay uses --opts:configless
+            // and waits for League on its own. The monitor's auto-resume timeout
+            // handles the safety case. Stopping here caused the monitor to exit
+            // before League.exe started, leaving the game unsuspended during
+            // the DLL injection window — the #1 cause of intermittent failures.
+            overlay::append_overlay_log("[Engine] Early monitor mantenido vivo para capturar League.exe.");
 
             // Rose does not wait for stdout confirmation. It just trusts
             // that runoverlay will find League on its own.
