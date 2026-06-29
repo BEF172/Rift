@@ -483,19 +483,53 @@ where
         "percent": 5,
     }));
     let release = github_api_get(CSLOL_REPO_API)?;
-    let asset = release["assets"]
-        .as_array()
-        .and_then(|assets| {
-            assets.iter().find(|a| {
-                a["name"]
-                    .as_str()
-                    .map(|n| n.to_lowercase() == "cslol-manager-windows.exe")
-                    .unwrap_or(false)
-            })
-        })
-        .ok_or("No se encontro cslol-manager-windows.exe en el release.")?;
 
-    let url = asset["browser_download_url"]
+    let assets = release["assets"]
+        .as_array()
+        .ok_or("No se encontraron assets en el release.")?;
+
+    // Priority 1: standalone mod-tools.exe (~1 MB, instant download)
+    let direct_asset = assets.iter().find(|a| {
+        a["name"]
+            .as_str()
+            .map(|n| n.eq_ignore_ascii_case("mod-tools.exe"))
+            .unwrap_or(false)
+    });
+
+    if let Some(asset) = direct_asset {
+        let url = asset["browser_download_url"].as_str().ok_or("No download URL")?;
+        let size = asset["size"].as_u64().unwrap_or(0);
+        on_progress(serde_json::json!({
+            "type": "engine",
+            "message": format!("Descargando mod-tools.exe ({} KB)...", size / 1024),
+            "percent": 10,
+        }));
+        download_file_with_progress(url, &modtools_path.to_string_lossy(), |downloaded, _| {
+            let pct = if size > 0 { (downloaded.saturating_mul(90) / size).min(90) as u8 } else { 50 };
+            on_progress(serde_json::json!({
+                "type": "engine",
+                "message": "Descargando mod-tools.exe...",
+                "percent": 10u8.saturating_add(pct),
+            }));
+        })?;
+        on_progress(serde_json::json!({
+            "type": "engine",
+            "message": "mod-tools.exe instalado.",
+            "percent": 100,
+        }));
+        return Ok(modtools_path.to_string_lossy().to_string());
+    }
+
+    // Priority 2: full cslol-manager installer (extract mod-tools from it)
+    let installer_asset = assets.iter().find(|a| {
+        a["name"]
+            .as_str()
+            .map(|n| n.to_lowercase().contains("cslol-manager") && n.to_lowercase().ends_with(".exe"))
+            .unwrap_or(false)
+    })
+    .ok_or("No se encontro cslol-manager-windows.exe ni mod-tools.exe en el release.")?;
+
+    let url = installer_asset["browser_download_url"]
         .as_str()
         .ok_or("No download URL")?;
     let temp_dir = PathBuf::from(std::env::temp_dir()).join("rift-atlas-cslol-modtools");

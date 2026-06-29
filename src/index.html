@@ -652,6 +652,61 @@
           <section class="page-panel">
             <div class="panel-heading">
               <div>
+                <h2>Timing de Inyeccion</h2>
+                <p>Controla el cooldown entre inyecciones de skins. Rose usa 500ms por defecto.</p>
+              </div>
+            </div>
+            <div class="manager-panel">
+              <div>
+                <span>Cooldown de inyeccion</span>
+                <strong id="injectionThresholdLabel">500ms</strong>
+                <small id="injectionThresholdHint">Tiempo minimo entre inyecciones. Rose recomienda 300-800ms.</small>
+              </div>
+              <div class="slider-container">
+                <input
+                  id="injectionThresholdSlider"
+                  type="range"
+                  min="0"
+                  max="2000"
+                  step="50"
+                  value="500"
+                  class="threshold-slider"
+                />
+                <div class="slider-labels">
+                  <span>0ms</span>
+                  <span>500ms</span>
+                  <span>1000ms</span>
+                  <span>1500ms</span>
+                  <span>2000ms</span>
+                </div>
+              </div>
+              <button id="saveThresholdButton" class="secondary-button" type="button">Guardar</button>
+            </div>
+            <div class="manager-panel">
+              <div>
+                <span>Estadisticas de confirmacion</span>
+                <strong id="baseSkinStatsLabel">Sin datos</strong>
+                <small id="baseSkinStatsHint">Mide el tiempo entre PATCH y confirmacion LCU.</small>
+              </div>
+              <div id="baseSkinStatsDetails" class="stats-details" hidden>
+                <div class="stat-row"><span>Muestras:</span><strong id="statTotalSamples">0</strong></div>
+                <div class="stat-row"><span>Confirmadas:</span><strong id="statConfirmed">0</strong></div>
+                <div class="stat-row"><span>Timeouts:</span><strong id="statTimeouts">0</strong></div>
+                <div class="stat-row"><span>Promedio:</span><strong id="statAvg">-</strong></div>
+                <div class="stat-row"><span>P90:</span><strong id="statP90">-</strong></div>
+                <div class="stat-row"><span>Max:</span><strong id="statMax">-</strong></div>
+                <div class="stat-row"><span>Recomendado:</span><strong id="statRecommended">-</strong></div>
+              </div>
+              <div class="automation-actions">
+                <button id="refreshStatsButton" class="secondary-button" type="button">Actualizar stats</button>
+                <button id="clearStatsButton" class="secondary-button danger-button" type="button">Limpiar samples</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="page-panel">
+            <div class="panel-heading">
+              <div>
                 <h2>Restablecer</h2>
                 <p>Borra datos locales y deja Rift Atlas como recien instalado.</p>
               </div>

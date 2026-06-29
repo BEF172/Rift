@@ -48,6 +48,8 @@ pub async fn start_bridge(handle: AppHandle) {
         return;
     };
     *state.pengu_bridge_port.lock().await = bridge_port;
+    // Signal bridge ready (Rose-style PenguSkinMonitorThread ready_event)
+    state.bridge_ready.store(true, std::sync::atomic::Ordering::SeqCst);
     println!(
         "[Bridge] WebSocket/HTTP discovery en http://127.0.0.1:{} (/bridge-port)",
         bridge_port
@@ -126,6 +128,24 @@ async fn handle_connection(
             "remote": peer.to_string(),
         }),
     );
+
+    // Rose-style: Re-activate Pengu Loader on LCU reconnect after account switch.
+    // When the bridge reconnects, check if Pengu Loader is still active.
+    // If not, try to re-activate it.
+    let app_dir = handle
+        .state::<crate::AppState>()
+        .app_data_dir
+        .lock()
+        .await
+        .clone();
+    let loader_dir = std::path::PathBuf::from(&app_dir).join("Pengu Loader");
+    if let Some(exec_path) = crate::commands::find_pengu_exe(&loader_dir) {
+        let activation = crate::commands::get_pengu_loader_activation_status(&exec_path, &app_dir);
+        if !activation.get("active").and_then(|v| v.as_bool()).unwrap_or(false) {
+            eprintln!("[Bridge] Pengu Loader inactive after reconnect — re-activating...");
+            let _ = crate::commands::run_pengu_loader_cli(&exec_path, &["--force-activate", "--silent"]);
+        }
+    }
 
     let (mut write, mut read) = ws_stream.split();
     let mut rx = outgoing.subscribe();
@@ -310,6 +330,60 @@ async fn handle_incoming_message(
             println!("[Pengu Carousel] {}", &short[..short.len().min(1200)]);
         }
         _ => {}
+    }
+
+    // Rose-style: update UI overlay state from plugin messages
+    {
+        let overlay = handle.state::<AppState>().ui_overlay.clone();
+        match msg_type {
+            "skin-sync" => {
+                if let Ok(mut w) = overlay.write() {
+                    if let Some(sid) = json.get("selectedSkinId").or_else(|| json.get("skinId")).and_then(|v| v.as_u64()) {
+                        w.ui_skin_id = Some(sid as i32);
+                        w.last_hovered_skin_id = Some(sid as i32);
+                    }
+                    if let Some(sn) = json.get("skin").and_then(|v| v.as_str()) {
+                        w.ui_skin_name = Some(sn.to_string());
+                        w.last_hovered_skin_key = Some(sn.to_string());
+                    }
+                    if let Some(cid) = json.get("championId").or_else(|| json.get("champion_id")).and_then(|v| v.as_u64()) {
+                        w.locked_champ_id = Some(cid as i32);
+                    }
+                }
+            }
+            "chroma-selection" => {
+                if let Ok(mut w) = overlay.write() {
+                    if let Some(cid) = json.get("chromaId").or_else(|| json.get("selectedChromaId")).and_then(|v| v.as_u64()) {
+                        w.selected_chroma_id = Some(cid as i32);
+                    }
+                    w.pending_chroma_selection = true;
+                }
+            }
+            "chroma-panel-opened" => {
+                if let Ok(mut w) = overlay.write() {
+                    w.chroma_panel_open = true;
+                }
+            }
+            "chroma-panel-closed" => {
+                if let Ok(mut w) = overlay.write() {
+                    w.chroma_panel_open = false;
+                }
+            }
+            "champion-locked" => {
+                if let Ok(mut w) = overlay.write() {
+                    w.own_champion_locked = true;
+                    if let Some(cid) = json.get("championId").and_then(|v| v.as_u64()) {
+                        w.locked_champ_id = Some(cid as i32);
+                    }
+                }
+            }
+            "champion-exchange" => {
+                if let Ok(mut w) = overlay.write() {
+                    w.champion_exchange_triggered = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     // Forward ALL messages to frontend first (like Electron does), then handle specific types

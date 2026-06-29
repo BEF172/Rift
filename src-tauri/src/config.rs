@@ -60,6 +60,38 @@ pub fn save_paths(league_path: &str, client_path: &str) {
     write_ini(&ini);
 }
 
+pub fn load_injection_threshold() -> f64 {
+    let ini = read_ini();
+    ini.section(Some("General"))
+        .and_then(|s| s.get("injection_threshold"))
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(0.5)
+}
+
+pub fn save_injection_threshold(value: f64) {
+    let mut ini = read_ini();
+    ini.with_section(Some("General"))
+        .set("injection_threshold", &format!("{:.2}", value));
+    write_ini(&ini);
+}
+
+pub fn load_auto_resume_timeout() -> u64 {
+    let ini = read_ini();
+    ini.section(Some("General"))
+        .and_then(|s| s.get("auto_resume_timeout"))
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v >= 1 && *v <= 180)
+        .unwrap_or(60)
+}
+
+pub fn save_auto_resume_timeout(value: u64) {
+    let mut ini = read_ini();
+    ini.with_section(Some("General"))
+        .set("auto_resume_timeout", &value.to_string());
+    write_ini(&ini);
+}
+
 pub fn infer_client_path_from_league_path(league_path: &str) -> Option<String> {
     let path = PathBuf::from(league_path.trim());
     if path

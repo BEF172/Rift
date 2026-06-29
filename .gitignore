@@ -14,6 +14,7 @@ src-tauri/**/latest.json
 *.exe
 !src-tauri/icons/*.ico
 !assets/*.ico
+!rose-tools/*.exe
 
 # IDE
 .vscode/

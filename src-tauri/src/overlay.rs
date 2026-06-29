@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
+use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
 #[cfg(windows)]
@@ -25,7 +26,7 @@ const SUSPICIOUS_WAD_SIZE: u64 = 1024 * 1024;
 const MKOVERLAY_BASE_TIMEOUT_MS: u64 = 1000 * 60 * 5;
 const MKOVERLAY_PER_MB_TIMEOUT_MS: u64 = 1000 * 20;
 const MKOVERLAY_MAX_TIMEOUT_MS: u64 = 1000 * 60 * 30;
-const EARLY_MONITOR_AUTO_RESUME_SECS: u64 = 120;
+const EARLY_MONITOR_AUTO_RESUME_SECS: u64 = 60;
 
 #[derive(Clone)]
 pub struct OverlayRunToken {
@@ -524,6 +525,11 @@ pub fn resume_process(pid: u32) -> Result<(), String> {
                 pid, statuses
             ));
         }
+
+        // Rose-style: verification sleep after resume (GAME_RESUME_VERIFICATION_WAIT_S = 0.1s).
+        // This gives the game time to actually start executing after NtResumeProcess.
+        std::thread::sleep(Duration::from_millis(100));
+
         if !is_process_alive(pid) {
             return Err(format!(
                 "League pid={} termino durante la verificacion de resume",
@@ -2192,5 +2198,81 @@ pub fn write_dll_source_metadata(app_data_dir: &str, metadata: &serde_json::Valu
         if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
             let _ = std::fs::write(&path, content);
         }
+    }
+}
+
+/// Rose-style phase cleanup: check if phase transition needs overlay cleanup,
+/// and perform it if needed.
+pub async fn check_cleanup(app: &tauri::AppHandle, phase: &str, previous: &str) {
+    let needs_cleanup = phase == "Lobby"
+        || matches!(phase, "PreEndOfGame" | "EndOfGame" | "WaitingForStats")
+        || (matches!(phase, "Matchmaking" | "ReadyCheck" | "None")
+            && matches!(
+                previous,
+                "ChampSelect"
+                    | "FINALIZATION"
+                    | "GameStart"
+                    | "InProgress"
+                    | "Reconnect"
+                    | "PreEndOfGame"
+                    | "EndOfGame"
+                    | "WaitingForStats"
+            ));
+
+    if !needs_cleanup {
+        return;
+    }
+
+    let state = app.state::<crate::AppState>();
+
+    if matches!(phase, "None" | "Matchmaking" | "ReadyCheck") {
+        let has_runner = state.running_overlay_process.lock().await.is_some();
+        let building = *state.active_overlay_run.lock().await;
+        let early_active = state.early_monitor_active.load(Ordering::SeqCst);
+        let has_preserved_overlay = !state.current_overlay_path.lock().await.is_empty();
+        if has_runner || building || early_active || has_preserved_overlay {
+            append_overlay_log(&format!(
+                "[Gameflow] {} -> {}: cleanup diferido; overlay activo/building={} early={} runner={} preserved={}.",
+                previous, phase, building, early_active, has_runner, has_preserved_overlay
+            ));
+            return;
+        }
+    }
+
+    state.overlay_cancel_epoch.fetch_add(1, Ordering::SeqCst);
+    state.early_monitor_active.store(false, Ordering::SeqCst);
+    state.early_monitor_runoverlay_started.store(false, Ordering::SeqCst);
+    let early_pid = match state.early_monitor_pid.lock() {
+        Ok(mut pid) => pid.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(pid) = early_pid {
+        let _ = resume_league_by_pid(pid);
+    }
+
+    let pid = state.running_overlay_process.lock().await.take();
+    let overlay_path = state.current_overlay_path.lock().await.clone();
+    if let Some(pid) = pid {
+        append_overlay_log(&format!(
+            "[Gameflow] {} -> {}: deteniendo runoverlay PID {}.",
+            previous, phase, pid
+        ));
+        stop_patcher(pid, &overlay_path);
+        state.running_overlay_alive.lock().await.take();
+        state.running_overlay_ready.lock().await.take();
+        *state.active_overlay_run.lock().await = false;
+        *state.current_overlay_path.lock().await = String::new();
+        let _ = app.emit(
+            "patcher-died",
+            serde_json::json!({
+                "pid": pid,
+                "reason": "gameflow-ended",
+                "phase": phase,
+            }),
+        );
+    }
+    let _ = tokio::task::spawn_blocking(kill_all_runoverlay_processes).await;
+    if !overlay_path.is_empty() {
+        wipe_overlay_dir(&overlay_path);
     }
 }
