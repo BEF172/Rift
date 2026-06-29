@@ -209,6 +209,10 @@ const RIFT_ATLAS_API = {
     const unlisten = listen("pengu:message", (event) => handler(event.payload));
     return () => unlisten.then((fn) => fn());
   },
+  onUiCommand: (handler) => {
+    const unlisten = listen("ui:command", (event) => handler(event.payload));
+    return () => unlisten.then((fn) => fn());
+  },
   onPatcherDied: (handler) => {
     const unlisten = listen("patcher-died", (event) => handler(event.payload));
     return () => unlisten.then((fn) => fn());
@@ -237,6 +241,20 @@ const RIFT_ATLAS_API = {
   modStorageDeselectMod: (category) => invoke("mod_storage_deselect_mod", { category }),
   modStorageGetSelectedMods: () => safeInvokeOrDefault("mod_storage_get_selected_mods", {}, { selectedMods: {} }),
   selectModFile: () => invoke("select_mod_file"),
+
+  // ThresholdManager — configurable injection cooldown
+  loadInjectionThreshold: () => invoke("load_injection_threshold"),
+  saveInjectionThreshold: (value) => invoke("save_injection_threshold", { value: Number(value) || 0.5 }),
+
+  // BaseSkinTracker — PATCH→confirmation latency tracking
+  startBaseSkinTracking: (skinId) => invoke("start_base_skin_tracking", { skinId: Number(skinId) || 0 }),
+  onBaseSkinConfirmed: (skinId) => invoke("on_base_skin_confirmed", { skinId: Number(skinId) || 0 }),
+  onChampSelectExit: () => invoke("on_champ_select_exit"),
+  getBaseSkinTrackerStats: () => invoke("get_base_skin_tracker_stats"),
+  clearBaseSkinTrackerSamples: () => invoke("clear_base_skin_tracker_samples"),
+
+  // LCU cache
+  clearLcuCache: () => invoke("clear_lcu_cache"),
 };
 
 // Expose as global API (same name as old preload)

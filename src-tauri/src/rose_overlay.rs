@@ -83,29 +83,49 @@ fn prepare_rose_tools(app_dir: &str, bundled_exe: &Path) -> Result<PathBuf, Stri
     let target_exe = tools_dir.join("mod-tools.exe");
     let target_dll = tools_dir.join("cslol-dll.dll");
 
-    // Copy bundled mod-tools only if not already present or different
+    // If bundled mod-tools exists (from installer), ensure it's in engine/tools.
+    // No actualizamos si el usuario ya puso uno manual (newer date wins).
     if bundled_exe.is_file() {
-        let needs_copy = !target_exe.is_file()
-            || std::fs::metadata(&target_exe)
-                .and_then(|m| Ok(m.len()))
-                .unwrap_or(0)
-                != std::fs::metadata(bundled_exe)
-                    .and_then(|m| Ok(m.len()))
-                    .unwrap_or(0);
-        if needs_copy {
+        let bundled_modified = std::fs::metadata(bundled_exe)
+            .and_then(|m| m.modified())
+            .ok();
+        let target_modified = std::fs::metadata(&target_exe)
+            .and_then(|m| m.modified())
+            .ok();
+        let needs_update = !target_exe.is_file()
+            || bundled_modified.zip(target_modified)
+                .map(|(b, t)| b > t)
+                .unwrap_or(true);
+        if needs_update {
             std::fs::copy(bundled_exe, &target_exe)
-                .map_err(|error| format!("No pude instalar mod-tools: {}", error))?;
+                .map_err(|e| format!("No pude copiar mod-tools.exe del bundle: {}", e))?;
+            // Copy companion tools too
+            if let Some(bundled_dir) = bundled_exe.parent() {
+                for tool in ["cslol-diag.exe", "wad-extract.exe", "wad-make.exe",
+                             "wad-extract-multi.bat", "wad-make-multi.bat", "wxy-extract-multi.bat"]
+                {
+                    let src = bundled_dir.join(tool);
+                    if src.is_file() {
+                        let dst = tools_dir.join(tool);
+                        if !dst.is_file() {
+                            std::fs::copy(&src, &dst).ok();
+                        }
+                    }
+                }
+            }
         }
-    } else if !target_exe.is_file() {
-        return Err(format!(
-            "mod-tools no encontrado ni empaquetado ni en engine/tools: {}",
-            bundled_exe.display()
-        ));
     }
 
+    if !target_exe.is_file() {
+        return Err(format!(
+            "mod-tools.exe no encontrado en {}. Usa el boton de descarga en la app.",
+            tools_dir.display()
+        ));
+    }
     if !target_dll.is_file() {
         return Err(format!(
-            "Falta cslol-dll.dll en engine/tools/ — descargalo primero."
+            "Falta cslol-dll.dll en {}. Pegalo manualmente (mismo archivo que usa Rose).",
+            tools_dir.display()
         ));
     }
     Ok(target_exe)
@@ -248,16 +268,15 @@ fn start_runoverlay(
     overlay_dir: &Path,
 ) -> Result<RoseRunner, String> {
     let config_path = overlay_dir.join("cslol-config.json");
+    let tools_dir = mod_tools.parent().unwrap_or_else(|| Path::new("."));
     let mut command = Command::new(mod_tools);
     command
         .arg("runoverlay")
         .arg(overlay_dir)
         .arg(&config_path)
         .arg(format!("--game:{}", game_dir.display()))
-        .arg("--opts:configless");
-    // Rose does NOT set current_dir — inherits parent CWD.
-    // Rose also discards all stdout/stderr (DEVNULL) to avoid pipe buffer
-    // deadlock that could block the DLL injection timing.
+        .arg("--opts:configless")
+        .current_dir(tools_dir);
 
     command.stdout(Stdio::null()).stderr(Stdio::null());
 
@@ -269,8 +288,8 @@ fn start_runoverlay(
 
     let pid = child.id();
 
-    // Rose-style: boost runoverlay to HIGH_PRIORITY_CLASS so DLL injection
-    // completes before League loads WAD files.
+    // Rose boosts runoverlay priority so the DLL hooks CreateFileA before
+    // League loads WAD files — without this, no WAD redirects occur.
     overlay::boost_process_priority(pid);
 
     let exited = Arc::new(AtomicBool::new(false));
@@ -452,6 +471,32 @@ pub async fn run_rose_overlay_v2(
         );
         overlay::append_overlay_log("[Engine] Early monitor iniciado desde run_rose_overlay_v2.");
     }
+    // Rose-style: esperar a que el early monitor suspenda League antes de mkoverlay
+    {
+        let wait_start = std::time::Instant::now();
+        let wait_timeout = std::time::Duration::from_secs(90);
+        loop {
+            let suspended = state.early_monitor_pid.lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if suspended {
+                break;
+            }
+            if wait_start.elapsed() >= wait_timeout {
+                overlay::stop_early_monitor(
+                    &state.early_monitor_active,
+                    &state.early_monitor_pid,
+                    &state.early_monitor_runoverlay_started,
+                );
+                *state.active_overlay_run.lock().await = false;
+                return Err(
+                    "Timeout esperando que League of Legends se suspenda.".to_string()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        overlay::append_overlay_log("[Engine] League suspendido, procediendo con mkoverlay.");
+    }
     let payload_for_build = payload.clone();
     let result = match tokio::task::spawn_blocking(move || {
         build_overlay(&payload_for_build, &app_dir, &rose_mod_tools)
@@ -497,20 +542,21 @@ pub async fn run_rose_overlay_v2(
                     }
                 };
 
-            // Rose-style resume_game() timing. Rose's Python/psutil overhead
-            // (Popen + Process.nice()) naturally provides ~200-400ms between
-            // spawn and resume. During this window, runoverlay sets up DLL
-            // injection: OpenProcess → VirtualAllocEx → WriteProcessMemory →
-            // CreateRemoteThread. The game is still frozen so the remote thread
-            // sits dormant — but it MUST be created BEFORE resume, or the DLL
-            // never loads. Rust's fast spawn gives us only ~70ms; we need at
-            // least 500ms to match Rose's overhead.
-            std::thread::sleep(Duration::from_millis(500));
+            // Rose-style: add delay after runoverlay spawn before resuming.
+            // Rose's resume_game() has time.sleep(0.1) = 100ms delay after each
+            // resume attempt, plus Python subprocess overhead (~50-200ms).
+            // Total: ~250-400ms between spawn and resume.
+            // We use 300ms to be in the middle of Rose's range.
+            // This gives runoverlay time to:
+            // 1. Initialize the process
+            // 2. Load cslol-dll.dll
+            // 3. Hook CreateFileA before League loads WADs
+            // Without this delay, Rust's fast spawn+resume lets League load
+            // WADs before the DLL hook is in place, causing intermittent failures.
+            std::thread::sleep(Duration::from_millis(300));
+            
             overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
-            overlay::append_overlay_log("[Engine] game resumed; injection setup complete.");
-            // Short post-resume: give DLL's DllMain time to hook CreateFileA
-            // before League's main thread loads WADs.
-            std::thread::sleep(Duration::from_millis(100));
+            overlay::append_overlay_log("[Engine] game resumed; runoverlay running.");
 
             *state.running_overlay_process.lock().await = Some(runner.pid);
             *state.running_overlay_alive.lock().await = Some(runner.exited.clone());

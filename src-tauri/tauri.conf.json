@@ -19,7 +19,8 @@
     "createUpdaterArtifacts": true,
     "resources": {
       "../assets/": "assets/",
-      "../Pengu Loader/plugins/": "bundled-plugins/"
+      "../Pengu Loader/plugins/": "bundled-plugins/",
+      "../rose-tools/": "rose-tools/"
     },
     "icon": [
       "icons/icon.ico"

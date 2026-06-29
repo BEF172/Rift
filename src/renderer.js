@@ -161,6 +161,22 @@ const els = {
   appDataPathLabel: document.querySelector("#appDataPathLabel"),
   openAppDataFolderButton: document.querySelector("#openAppDataFolderButton"),
   factoryResetButton: document.querySelector("#factoryResetButton"),
+  injectionThresholdSlider: document.querySelector("#injectionThresholdSlider"),
+  injectionThresholdLabel: document.querySelector("#injectionThresholdLabel"),
+  injectionThresholdHint: document.querySelector("#injectionThresholdHint"),
+  saveThresholdButton: document.querySelector("#saveThresholdButton"),
+  baseSkinStatsLabel: document.querySelector("#baseSkinStatsLabel"),
+  baseSkinStatsHint: document.querySelector("#baseSkinStatsHint"),
+  baseSkinStatsDetails: document.querySelector("#baseSkinStatsDetails"),
+  statTotalSamples: document.querySelector("#statTotalSamples"),
+  statConfirmed: document.querySelector("#statConfirmed"),
+  statTimeouts: document.querySelector("#statTimeouts"),
+  statAvg: document.querySelector("#statAvg"),
+  statP90: document.querySelector("#statP90"),
+  statMax: document.querySelector("#statMax"),
+  statRecommended: document.querySelector("#statRecommended"),
+  refreshStatsButton: document.querySelector("#refreshStatsButton"),
+  clearStatsButton: document.querySelector("#clearStatsButton"),
   selectLtkOverlaySidecarButton: document.querySelector("#selectLtkOverlaySidecarButton"),
   selectLtkOverlayDllButton: document.querySelector("#selectLtkOverlayDllButton"),
   overlayStatusIndicator: document.querySelector("#overlayStatusIndicator"),
@@ -759,6 +775,9 @@ const clearPenguSessionQueuedSkins = (reason = "game-ended") => {
     lastPenguChromaPanel = null;
     lastRosePreforceSignature = "";
     lastRosePreforceAt = 0;
+    state.roseFinalizationCommitted = false;
+    state.roseFinalizationApplyStarted = false;
+    state.lastHoverWritten = false;
     return false;
   }
 
@@ -776,6 +795,11 @@ const clearPenguSessionQueuedSkins = (reason = "game-ended") => {
   lastRosePreforceAt = 0;
   state.customOverlayPath = "";
   state.customOverlayKeys = [];
+  // Rose-style: reset FINALIZATION guards between games so the next
+  // ChampSelect can trigger a fresh injection cycle.
+  state.roseFinalizationCommitted = false;
+  state.roseFinalizationApplyStarted = false;
+  state.lastHoverWritten = false;
   saveQueuedSkins();
   renderSkinLibrary();
   renderSelectionTray();
@@ -810,10 +834,6 @@ const ROSE_SUSPEND_PHASES = new Set([
 const shouldKeepRoseEarlyMonitor = () =>
   ROSE_SUSPEND_PHASES.has(String(state.penguGameflowPhase || ""));
 
-const ROSE_INJECTION_THRESHOLD_MS = Math.max(
-  0,
-  Math.min(2000, Number(localStorage.getItem("riftAtlas:roseInjectionThresholdMs") || 500))
-);
 let roseLocalTickerGeneration = 0;
 let roseLocalTickerRunning = false;
 
@@ -893,9 +913,11 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
     const skin = resolved.skin;
     if (skin) {
       lastPenguSkinSyncPayload = { ...payload };
-      // Rose-style: LCU PATCH was already sent in queuePenguSelectionForFinalization
-      // when the skin sync first arrived. Only build the overlay now.
-      // Skip maybeForceLeagueSkinForOverlay here — it was already done.
+      // Rose-style: force LCU skin at ticker fire time (inside inject_skin,
+      // after extraction, before mkoverlay/runoverlay). This ensures the PATCH
+      // happens at the last possible moment, avoiding races where the LCU
+      // resets selectedSkinId between preforce and overlay building.
+      await maybeForceLeagueSkinForOverlay(skin, payload);
       applied = Boolean(await handlePenguSkinApply({ ...payload, key: getSkinKey(skin), type: payload.type || "loadout-finalization" }));
       if (applied) state.lastRoseInjectionTime = Date.now();
       return applied;
@@ -924,10 +946,10 @@ const startRoseLocalFinalizationTicker = () => {
   const generation = ++roseLocalTickerGeneration;
   roseLocalTickerRunning = true;
   window.riftAtlas.appendOverlayLog(
-    `[RoseTicker] local Rust/LCU monotonic iniciado; threshold=${ROSE_INJECTION_THRESHOLD_MS}ms.`
+    `[RoseTicker] local Rust/LCU monotonic iniciado; threshold=${state.skinWriteMs}ms.`
   ).catch(() => { });
-  window.riftAtlas.waitForLcuFinalizationThreshold(ROSE_INJECTION_THRESHOLD_MS)
-    .then((result) => {
+  window.riftAtlas.waitForLcuFinalizationThreshold(state.skinWriteMs)
+    .then(async (result) => {
       if (generation !== roseLocalTickerGeneration || !result?.ready) return;
       const tickerPhase = String(state.penguGameflowPhase || "");
       if (tickerPhase && !["ChampSelect", "FINALIZATION"].includes(tickerPhase)) {
@@ -937,9 +959,21 @@ const startRoseLocalFinalizationTicker = () => {
       state.penguGameflowPhase = "FINALIZATION";
       state.lastRemainMs = Math.max(0, Number(result.remainingMs || 0));
       clearRoseFinalizationTimer();
+      // Rose-style: populate from fresh LCU read at ticker time so we never
+      // rely on a stale lastPenguLcuSelection between games.
+      if (Number(result.championId || 0) > 0) {
+        lastPenguLcuSelection = {
+          championId: Number(result.championId),
+          selectedSkinId: Number(result.actualLcuSkinId || 0),
+          at: Date.now(),
+        };
+      }
       window.riftAtlas.appendOverlayLog(
         `[RoseTicker] threshold local alcanzado: remaining=${result.remainingMs}ms source=${result.source}.`
       ).catch(() => { });
+      // Rose-style (sync Python): yield so any in-flight queuePenguSelectionForFinalization
+      // (which yields at resolveRoseAuthoritativeSkinEntry) completes before apply.
+      await Promise.resolve();
       triggerRoseFinalizationApply("Rust LCU monotonic threshold").catch((error) => {
         window.riftAtlas.appendOverlayLog(`[RoseTicker] apply local fallo: ${error.message || error}`).catch(() => { });
       });
@@ -1975,6 +2009,51 @@ const isRoseOwnedSkinId = (skinId = 0) => {
   return id % 1000 === 0 || state.penguOwnedSkinIds.has(id);
 };
 
+// =============================================================================
+// Form/Chroma Special Cases (Rose-style)
+// Maps form skin IDs to their base skin IDs for proper injection.
+// Forms are special chromas that don't follow the normal chroma model.
+// =============================================================================
+const FORM_SKIN_MAP = {
+  // Elementalist Lux — 9 forms
+  99991: 99007, 99992: 99007, 99993: 99007, 99994: 99007, 99995: 99007,
+  99996: 99007, 99997: 99007, 99998: 99007, 99999: 99007,
+  // Sahn Uzal Mordekaiser — 2 forms
+  82998: 82054, 82999: 82054,
+  // Spirit Blossom Morgana — 1 form
+  25999: 25080,
+  // Radiant Sett — 2 forms
+  875998: 875066, 875999: 875066,
+  // KDA Seraphine — 2 forms
+  147002: 147001, 147003: 147001,
+  // Viego — 6 forms
+  234994: 234043, 234995: 234043, 234996: 234043,
+  234997: 234043, 234998: 234043, 234999: 234043,
+  // Gun Goddess Miss Fortune — 3 forms
+  21997: 21016, 21998: 21016, 21999: 21016,
+  // Risen Legend Kai'Sa — 1 HOL chroma
+  145071: 145070,
+  // Risen Legend Ahri — 2 HOL chromas
+  103086: 103085, 103087: 103085,
+};
+
+/**
+ * Check if a skin ID is a form skin. If so, return its base skin ID.
+ * Returns null if not a form skin.
+ */
+const getFormBaseSkinId = (skinId) => {
+  const id = Number(skinId || 0);
+  if (!id) return null;
+  return FORM_SKIN_MAP[id] || null;
+};
+
+/**
+ * Check if a skin ID is a form skin.
+ */
+const isFormSkin = (skinId) => {
+  return getFormBaseSkinId(skinId) !== null;
+};
+
 const getOverlayForceSkinId = (skin = {}, payload = {}, championId = 0) => {
   const numericChampionId = Number(championId || getSkinSyncChampionNumber(skin) || 0);
   const championBaseId = numericChampionId ? numericChampionId * 1000 : 0;
@@ -1987,6 +2066,12 @@ const getOverlayForceSkinId = (skin = {}, payload = {}, championId = 0) => {
     payloadChromaId !== championBaseId &&
     payloadChromaId !== targetSkinId
   );
+
+  // Form/Chroma special cases: if the payload chroma is a form, resolve to base
+  const formBaseId = getFormBaseSkinId(payloadChromaId);
+  if (formBaseId) {
+    return formBaseId;
+  }
 
   if (isChromaPayload && payloadChromaId > 0) {
     if (isRoseOwnedSkinId(payloadChromaId) || isRoseOwnedSkinId(baseSkinId)) {
@@ -2046,6 +2131,10 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
   }
   let result;
   if (window.riftAtlas.forceLcuSkinSelection) {
+    // BaseSkinTracker: start tracking PATCH→confirmation latency
+    if (window.riftAtlas.startBaseSkinTracking) {
+      window.riftAtlas.startBaseSkinTracking(desiredSkinId);
+    }
     result = await window.riftAtlas.forceLcuSkinSelection(championId, desiredSkinId)
       .catch((error) => ({
         forceOk: false,
@@ -2053,6 +2142,12 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
         verifiedSkinId: 0,
         forceError: error?.message || String(error),
       }));
+    // BaseSkinTracker: record confirmation
+    if (result?.forceOk && result?.verifiedSkinId === desiredSkinId) {
+      if (window.riftAtlas.onBaseSkinConfirmed) {
+        window.riftAtlas.onBaseSkinConfirmed(desiredSkinId);
+      }
+    }
   } else {
     // Legacy Electron fallback. Tauri uses the authenticated Rust command above
     // and does not depend on the Pengu websocket for LCU writes.
@@ -3259,7 +3354,7 @@ const queuePenguSelectionForFinalization = async (payload, key) => {
   // which is called synchronously inside inject_skin (after extraction, before mkoverlay).
   if (deferred) {
     window.riftAtlas.appendOverlayLog(
-      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; inyeccion diferida al ticker local monotonic de ${ROSE_INJECTION_THRESHOLD_MS}ms.`
+      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; inyeccion diferida al ticker local monotonic de ${state.skinWriteMs}ms.`
     ).catch(() => { });
     // Rose-style: do NOT start the monitor here. Rose starts the monitor in
     // inject_skin_immediately() — when injection ACTUALLY happens (at the
@@ -3416,10 +3511,13 @@ async function handlePenguSkinSync(payload = {}) {
     );
     if (pendingChampionOnly && pendingIsDefaultSelection) {
       window.riftAtlas.appendOverlayLog(`[Diagnostico] Esperando nombre de skin especifico para ${payload.skin}.`).catch(() => { });
+      // Restore previous payload so FINALIZATION doesn't see a champion-only value
+      lastPenguSkinSyncPayload = previousSkinSyncPayload;
       return;
     }
     window.riftAtlas.appendOverlayLog(`[Diagnostico] NO se encontro skin para: ${payload.skin || payload.selectedSkinId || payload.chromaId || "desconocida"}`).catch(() => { });
     clearRoseAuthoritativeSelection();
+    lastPenguSkinSyncPayload = previousSkinSyncPayload;
     await window.riftAtlas.sendPenguMessage?.({
       type: "skin-apply-result",
       ok: false,
@@ -7980,6 +8078,39 @@ const bindEvents = () => {
     });
   }
 
+  if (window.riftAtlas.onUiCommand) {
+    window.riftAtlas.onUiCommand((cmd = {}) => {
+      if (cmd.type === "show-skin") {
+        const skinName = cmd.skinName || "";
+        const champName = cmd.championName || "";
+        const skinId = Number(cmd.skinId || 0);
+        window.riftAtlas.appendOverlayLog(`[UiCommand] show-skin: ${champName} - ${skinName} (${skinId})`).catch(() => { });
+        setOverlayPanelStatus({
+          label: "Skin detectada",
+          message: `${champName} - ${skinName}`
+        });
+        if (els.skinProfilePanel && skinName) {
+          els.skinProfilePanel.innerHTML = `
+            <div class="empty-state compact">
+              <h2>${escapeHtml(champName)} - ${escapeHtml(skinName)}</h2>
+              <p>Skin seleccionada en champ select (ID: ${skinId})</p>
+            </div>
+          `;
+        }
+      } else if (cmd.type === "champion-exchange") {
+        window.riftAtlas.appendOverlayLog(`[UiCommand] champion-exchange detectado por main loop.`).catch(() => { });
+        setOverlayPanelStatus({
+          label: "Champion exchange",
+          message: "Campeon cambiado, reseteando overlay."
+        });
+      } else if (cmd.type === "hide-skin") {
+        window.riftAtlas.appendOverlayLog(`[UiCommand] hide-skin`).catch(() => { });
+      } else if (cmd.type === "reset-selection") {
+        window.riftAtlas.appendOverlayLog(`[UiCommand] reset-selection`).catch(() => { });
+      }
+    });
+  }
+
   if (window.riftAtlas.onPenguMessage) {
     window.riftAtlas.onPenguMessage((payload = {}) => {
       if (payload.source === "rift-atlas-app") return;
@@ -8037,6 +8168,23 @@ const bindEvents = () => {
               window.riftAtlas.appendOverlayLog(`[Diagnostico] replay post-lock fallo: ${error.message || error}`).catch(() => { });
             });
         }
+      }
+      if (payload.type === "champion-exchange") {
+        const oldChamp = Number(payload.oldChampionId || 0);
+        const newChamp = Number(payload.newChampionId || 0);
+        window.riftAtlas.appendOverlayLog(`[Rose] Champion exchange detectado: ${oldChamp} -> ${newChamp}. Reseteando estado de inyeccion.`).catch(() => { });
+        clearRoseAuthoritativeSelection();
+        state.roseFinalizationCommitted = false;
+        state.roseFinalizationApplyStarted = false;
+        state.roseFinalizationSignature = "";
+        state.lastHoverWritten = false;
+        state.lastRoseInjectionTime = 0;
+        state.loadoutCountdownActive = false;
+        state.loadoutT0 = 0;
+        state.loadoutLeft0Ms = 0;
+        state.lastRemainMs = 0;
+        clearPenguApplyLock();
+        clearRoseFinalizationTimer();
       }
       if (payload.type === "loadout-finalization") {
         handlePenguLoadoutFinalization(payload);
@@ -8379,6 +8527,78 @@ const bindEvents = () => {
       setConfigStatus(error.message || "No pude restablecer Rift Atlas.");
     }
   });
+
+  // ThresholdManager UI
+  const loadInjectionThresholdUI = async () => {
+    try {
+      const value = await window.riftAtlas.loadInjectionThreshold?.() ?? 0.5;
+      const ms = Math.round(value * 1000);
+      if (els.injectionThresholdSlider) els.injectionThresholdSlider.value = ms;
+      if (els.injectionThresholdLabel) els.injectionThresholdLabel.textContent = `${ms}ms`;
+    } catch (error) {
+      // ignore
+    }
+  };
+
+  const saveInjectionThresholdUI = async () => {
+    try {
+      const ms = Number(els.injectionThresholdSlider?.value || 500);
+      const seconds = ms / 1000;
+      await window.riftAtlas.saveInjectionThreshold?.(seconds);
+      state.skinWriteMs = ms;
+      if (els.injectionThresholdLabel) els.injectionThresholdLabel.textContent = `${ms}ms`;
+      setConfigStatus(`Cooldown de inyeccion actualizado: ${ms}ms`);
+    } catch (error) {
+      setConfigStatus(`Error: ${error.message || error}`);
+    }
+  };
+
+  els.injectionThresholdSlider?.addEventListener("input", (event) => {
+    const ms = Number(event.target.value || 500);
+    if (els.injectionThresholdLabel) els.injectionThresholdLabel.textContent = `${ms}ms`;
+  });
+
+  els.saveThresholdButton?.addEventListener("click", saveInjectionThresholdUI);
+
+  // BaseSkinTracker UI
+  const loadBaseSkinStatsUI = async () => {
+    try {
+      const stats = await window.riftAtlas.getBaseSkinTrackerStats?.() ?? {};
+      if (els.baseSkinStatsDetails) els.baseSkinStatsDetails.hidden = false;
+      if (els.statTotalSamples) els.statTotalSamples.textContent = stats.total_samples ?? 0;
+      if (els.statConfirmed) els.statConfirmed.textContent = stats.confirmed_count ?? 0;
+      if (els.statTimeouts) els.statTimeouts.textContent = stats.timeout_count ?? 0;
+      if (els.statAvg) els.statAvg.textContent = stats.avg_ms != null ? `${stats.avg_ms}ms` : "-";
+      if (els.statP90) els.statP90.textContent = stats.p90_ms != null ? `${stats.p90_ms}ms` : "-";
+      if (els.statMax) els.statMax.textContent = stats.max_ms != null ? `${stats.max_ms}ms` : "-";
+      if (els.statRecommended) {
+        els.statRecommended.textContent = stats.recommended_threshold_ms != null ? `${stats.recommended_threshold_ms}ms` : "-";
+      }
+      if (els.baseSkinStatsLabel) {
+        els.baseSkinStatsLabel.textContent = stats.total_samples > 0 ? `${stats.total_samples} samples` : "Sin datos";
+      }
+    } catch (error) {
+      // ignore
+    }
+  };
+
+  els.refreshStatsButton?.addEventListener("click", loadBaseSkinStatsUI);
+
+  els.clearStatsButton?.addEventListener("click", async () => {
+    const confirmed = window.confirm("Esto borra todas las muestras de confirmacion de skin base. Queres continuar?");
+    if (!confirmed) return;
+    try {
+      await window.riftAtlas.clearBaseSkinTrackerSamples?.();
+      loadBaseSkinStatsUI();
+      setConfigStatus("Samples de confirmacion borrados.");
+    } catch (error) {
+      setConfigStatus(`Error: ${error.message || error}`);
+    }
+  });
+
+  // Load threshold and stats on settings view
+  loadInjectionThresholdUI();
+  loadBaseSkinStatsUI();
 
   els.openModsFolderButton?.addEventListener("click", async () => {
     try {
@@ -8813,7 +9033,7 @@ window.riftAtlas.onDebugMode?.((payload = {}) => {
 
 bindEvents();
 window.riftAtlas.appendOverlayLog(
-  `[RoseFlow] renderer=20260625-3 ticker=rust-lcu-monotonic chroma-state=rose-base force=final-only threshold=${ROSE_INJECTION_THRESHOLD_MS}ms.`
+  `[RoseFlow] renderer=20260625-3 ticker=rust-lcu-monotonic chroma-state=rose-base force=final-only threshold=${state.skinWriteMs}ms.`
 ).catch(() => { });
 loadLibraryIndex().then(() => {
   renderPresets();

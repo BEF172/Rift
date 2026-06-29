@@ -3189,6 +3189,26 @@ pub async fn app_bootstrap_first_run(
         }),
     );
 
+    // Check for bundled rose-tools BEFORE the blocking task
+    let bundled_mod_tools = app.path().resource_dir().ok()
+        .map(|res| res.join("rose-tools").join("mod-tools.exe"))
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            // NSIS places resources alongside the exe
+            let exe_dir = crate::install_dir();
+            let f = exe_dir.join("rose-tools").join("mod-tools.exe");
+            if f.is_file() { Some(f) } else { None }
+        })
+        .or_else(|| {
+            // Dev mode (npm start): rose-tools/ at project root
+            std::env::current_exe().ok().and_then(|exe| {
+                let mut path = exe.parent()?;
+                for _ in 0..4 { path = path.parent()?; }
+                let f = path.join("rose-tools").join("mod-tools.exe");
+                if f.is_file() { Some(f) } else { None }
+            })
+        });
+
     let app_for_download = app.clone();
     let app_dir_for_download = app_dir.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -3202,13 +3222,24 @@ pub async fn app_bootstrap_first_run(
         let mut errors: Vec<String> = Vec::new();
 
         if !engine_exists {
-            let progress_app = app_for_download.clone();
-            if let Err(error) =
-                downloads::download_cslol_manager_modtools(&app_dir_for_download, move |payload| {
-                    let _ = progress_app.emit("download-progress", payload);
-                })
-            {
-                errors.push(format!("Engine mod-tools: {}", error));
+            // Try bundled rose-tools first (from NSIS installer)
+            let mut copied = false;
+            if let Some(bundled_exe) = bundled_mod_tools.as_ref() {
+                let target = engine_dir.join("mod-tools.exe");
+                std::fs::create_dir_all(&engine_dir).ok();
+                if std::fs::copy(bundled_exe, &target).is_ok() {
+                    copied = true;
+                }
+            }
+            if !copied {
+                let progress_app = app_for_download.clone();
+                if let Err(error) =
+                    downloads::download_cslol_manager_modtools(&app_dir_for_download, move |payload| {
+                        let _ = progress_app.emit("download-progress", payload);
+                    })
+                {
+                    errors.push(format!("Engine mod-tools: {}", error));
+                }
             }
         }
 
@@ -4861,7 +4892,7 @@ fn check_process_running(name: &str) -> bool {
     overlay::find_pid_by_process_name(name).is_some()
 }
 
-fn find_pengu_exe(loader_dir: &std::path::Path) -> Option<String> {
+pub fn find_pengu_exe(loader_dir: &std::path::Path) -> Option<String> {
     let names = ["Pengu Loader.exe", "PenguLoader.exe", "pengu-loader.exe"];
     for name in &names {
         let p = loader_dir.join(name);
@@ -4990,13 +5021,54 @@ fn terminate_pengu_loader_ui() {
 }
 
 fn get_rose_config_path() -> PathBuf {
-    // core.dll reads the original Rose location, regardless of where Rift
-    // Atlas itself stores its application data.
-    std::env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::install_dir())
-        .join("Rose")
-        .join("config.ini")
+    // Inside our own data dir: %LOCALAPPDATA%\Rift Atlas\Rose\config.ini
+    crate::writable_data_dir().join("Rose").join("config.ini")
+}
+
+/// Try to create a directory junction from the legacy `%LOCALAPPDATA%\Rose`
+/// to `%LOCALAPPDATA%\Rift Atlas\Rose` so that external binaries (e.g.
+/// cslol-dll.dll) can still find shared data via the old path.
+fn ensure_rose_junction() {
+    #[cfg(windows)]
+    {
+        let old_root = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::install_dir());
+        // Only bother if the old root is actually different from our data dir
+        let our_root = crate::writable_data_dir();
+        if old_root == our_root {
+            return;
+        }
+        let old_path = old_root.join("Rose");
+        let new_path = our_root.join("Rose");
+
+        if old_path.exists() {
+            // Already exists — nothing to do
+            return;
+        }
+        // Ensure target exists first
+        std::fs::create_dir_all(&new_path).ok();
+        // Try junction via cmd.exe mklink /J
+        let result = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&old_path)
+            .arg(&new_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match result {
+            Ok(status) if status.success() => {
+                eprintln!("[RoseJunction] Creado junction: {} -> {}",
+                    old_path.display(), new_path.display());
+            }
+            _ => {
+                eprintln!("[RoseJunction] No se pudo crear junction en {} (puede que necesite permisos de admin)",
+                    old_path.display());
+            }
+        }
+    }
 }
 
 fn read_ini_value(content: &str, key: &str) -> Option<String> {
@@ -5185,7 +5257,7 @@ fn clear_pengu_active_flag(app_dir: &str) {
     std::fs::remove_file(get_pengu_active_flag_path(app_dir)).ok();
 }
 
-fn run_pengu_loader_cli(executable_path: &str, args: &[&str]) -> Result<String, String> {
+pub fn run_pengu_loader_cli(executable_path: &str, args: &[&str]) -> Result<String, String> {
     let loader_dir = PathBuf::from(executable_path)
         .parent()
         .unwrap()
@@ -5244,6 +5316,7 @@ pub fn pengu_startup_init(app_dir: &str, token_dir: &str) {
         "[PenguStartup] INICIO app_dir={} token_dir={}",
         app_dir, token_dir
     );
+    ensure_rose_junction();
     // Search order: app_dir first (production), then token_dir/writable_data (dev/downloads)
     let executable_path = {
         let loader_dir_app = PathBuf::from(app_dir).join(PENGU_LOADER_DIR);
@@ -5330,6 +5403,9 @@ pub fn pengu_startup_init(app_dir: &str, token_dir: &str) {
         }
     }
 
+    // Rose-style: write active flag BEFORE --force-activate (crash safety)
+    write_pengu_active_flag(&runtime_app_dir);
+
     match run_pengu_loader_cli(&executable_path, &["--force-activate", "--silent"]) {
         Ok(stdout) => {
             eprintln!("[PenguStartup] --force-activate OK stdout={}", stdout);
@@ -5338,8 +5414,6 @@ pub fn pengu_startup_init(app_dir: &str, token_dir: &str) {
     }
 
     cleanup_legacy_pengu_ifeo();
-    write_pengu_active_flag(&runtime_app_dir);
-    terminate_pengu_loader_ui();
 
     let league_running = league_state["running"].as_bool().unwrap_or(false);
     if league_running {
@@ -5550,7 +5624,7 @@ fn get_league_client_ready_state() -> serde_json::Value {
     })
 }
 
-fn get_pengu_loader_activation_status(executable_path: &str, _app_dir: &str) -> serde_json::Value {
+pub fn get_pengu_loader_activation_status(executable_path: &str, _app_dir: &str) -> serde_json::Value {
     let league_state = get_league_client_ready_state();
     let league_client_path = league_state["leagueClientPath"]
         .as_str()
@@ -5799,4 +5873,53 @@ pub fn debug_print(message: String) {
             std::ptr::null_mut(),
         );
     }
+}
+
+// =============================================================================
+// ThresholdManager — configurable injection cooldown
+// =============================================================================
+
+#[tauri::command]
+pub fn load_injection_threshold() -> f64 {
+    crate::config::load_injection_threshold()
+}
+
+#[tauri::command]
+pub fn save_injection_threshold(value: f64) {
+    let value = value.max(0.0).min(2.0);
+    crate::config::save_injection_threshold(value);
+}
+
+// =============================================================================
+// BaseSkinTracker — PATCH→confirmation latency tracking
+// =============================================================================
+
+#[tauri::command]
+pub fn start_base_skin_tracking(skin_id: u64) {
+    crate::base_skin_tracker::start_tracking(skin_id);
+}
+
+#[tauri::command]
+pub fn on_base_skin_confirmed(skin_id: u64) -> Option<f64> {
+    crate::base_skin_tracker::on_skin_confirmed(skin_id)
+}
+
+#[tauri::command]
+pub fn on_champ_select_exit() -> Option<f64> {
+    crate::base_skin_tracker::on_champ_select_exit()
+}
+
+#[tauri::command]
+pub fn get_base_skin_tracker_stats() -> serde_json::Value {
+    crate::base_skin_tracker::get_stats()
+}
+
+#[tauri::command]
+pub fn clear_base_skin_tracker_samples() {
+    crate::base_skin_tracker::clear_samples();
+}
+
+#[tauri::command]
+pub fn clear_lcu_cache() {
+    crate::gameflow::lcu_cache_clear();
 }

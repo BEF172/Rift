@@ -329,9 +329,6 @@
   const DISCOVERY_START_PORT = 50000;
   const DISCOVERY_END_PORT = 50010;
   const BRIDGE_PORT_STORAGE_KEY = "rift_atlas_bridge_port";
-  const SWIFTPLAY_QUEUE_ID = 480;
-  const SWIFTPLAY_MODES = new Set(["SWIFTPLAY", "BRAWL"]);
-
   let lastLoggedSkin = null;
   let championLockAnnounced = false;
   let pollTimer = null;
@@ -355,12 +352,6 @@
   let flowPollTimer = null;
   let lastGameflowPhase = "";
   let lastAuthoritativePhaseAt = Date.now();
-  let lastFinalizationBucket = "";
-  let isSwiftplayMode = false;
-  let lastSwiftplaySignature = "";
-  let lastSwiftplaySearchBucket = "";
-  let findMatchObserverInstalled = false;
-  let swiftplaySkinTracking = new Map();
   let ownedSkinIds = new Set();
   let ownedSkinFetchAt = 0;
   let forcedBaseSyncSuppression = null;
@@ -655,7 +646,7 @@
       clearTimeout(logHoverDebounceTimer);
       logHoverDebounceTimer = null;
     }
-    if (lastGameflowPhase && lastGameflowPhase !== "ChampSelect" && !isSwiftplayMode) return;
+    if (lastGameflowPhase && lastGameflowPhase !== "ChampSelect") return;
     const stableName = String(cleanName || readCurrentSkin() || logHoverLastSkin || "").trim();
     if (!stableName) return;
     if (forcedBaseSyncSuppression && Date.now() > forcedBaseSyncSuppression.until) {
@@ -683,9 +674,6 @@
     if (!cleanName) return;
     console.log(`${LOG_PREFIX} Hovered skin: ${cleanName}`);
     dbg("skin:" + cleanName);
-    if (isSwiftplayMode && lastWsChampId && lastWsSkinId) {
-      swiftplaySkinTracking.set(Number(lastWsChampId), Number(lastWsSkinId));
-    }
     logHoverLastSkin = cleanName;
     // Rose never couples the DOM name with selectedSkinId: the LCU ID can still
     // describe the previously equipped owned skin. The desktop resolves this
@@ -966,26 +954,8 @@
     return text.replace(/^"|"$/g, "").trim();
   }
 
-  async function readGameflowSession() {
-    const resp = await window.fetch("/lol-gameflow/v1/session", { credentials: "include" });
-    if (!resp.ok) return null;
-    return resp.json();
-  }
-
   async function readSkinSelectorInfo() {
     const resp = await window.fetch("/lol-champ-select/v1/skin-selector-info", { credentials: "include" });
-    if (!resp.ok) return null;
-    return resp.json();
-  }
-
-  async function readLobbyData() {
-    const resp = await window.fetch("/lol-lobby/v2/lobby", { credentials: "include" });
-    if (!resp.ok) return null;
-    return resp.json();
-  }
-
-  async function readLobbySearchState() {
-    const resp = await window.fetch("/lol-lobby/v2/lobby/matchmaking/search-state", { credentials: "include" });
     if (!resp.ok) return null;
     return resp.json();
   }
@@ -1000,145 +970,6 @@
   function getMyTeamSelection(session = {}) {
     const myCellId = session.localPlayerCellId;
     return session.myTeam?.find((player) => player.cellId === myCellId) || null;
-  }
-
-  function getGameflowModeInfo(session = {}, lobby = {}) {
-    const gameData = session?.gameData || {};
-    const queueFromSession = session?.queue || gameData?.queue || {};
-    const gameConfig = lobby?.gameConfig || {};
-    const mode = String(
-      gameData?.gameMode ||
-      queueFromSession?.gameMode ||
-      gameConfig?.gameMode ||
-      lobby?.gameMode ||
-      ""
-    ).toUpperCase();
-    const mapId = Number(gameData?.mapId || queueFromSession?.mapId || gameConfig?.mapId || lobby?.mapId || 0);
-    const queueId = Number(
-      session?.queue?.id ||
-      session?.queue?.queueId ||
-      queueFromSession?.id ||
-      queueFromSession?.queueId ||
-      gameConfig?.queueId ||
-      lobby?.queueId ||
-      0
-    );
-    return { mode, mapId, queueId };
-  }
-
-  function isSwiftplayFromData(session = {}, lobby = {}) {
-    const info = getGameflowModeInfo(session, lobby);
-    return SWIFTPLAY_MODES.has(info.mode) || info.queueId === SWIFTPLAY_QUEUE_ID;
-  }
-
-  function extractSwiftplayChampions(lobby = {}) {
-    const localMember = lobby?.localMember && typeof lobby.localMember === "object"
-      ? lobby.localMember
-      : null;
-    if (!localMember) return [];
-
-    const slots = Array.isArray(localMember.playerSlots) ? localMember.playerSlots : [];
-    const champions = [];
-    const pushChampion = (championId, fallbackSkinId, slotIndex) => {
-      const numericChampionId = Number(championId || 0);
-      if (!numericChampionId || champions.some((entry) => entry.championId === numericChampionId)) return;
-      const slot = slots[slotIndex] && typeof slots[slotIndex] === "object" ? slots[slotIndex] : {};
-      const skinId = Number(slot.skinId || fallbackSkinId || numericChampionId * 1000 || 0);
-      champions.push({
-        championId: numericChampionId,
-        skinId,
-        baseSkinId: numericChampionId * 1000,
-        slotIndex,
-        position: slot.positionPreference || "",
-        spell1: Number(slot.spell1 || 0),
-        spell2: Number(slot.spell2 || 0)
-      });
-    };
-
-    pushChampion(localMember.primaryChampionId, localMember.primarySkinId || localMember.selectedSkinId, 0);
-    pushChampion(localMember.secondaryChampionId, localMember.secondarySkinId, 1);
-
-    slots.forEach((slot, index) => {
-      if (!slot || typeof slot !== "object") return;
-      pushChampion(slot.championId, slot.skinId, index);
-    });
-
-    return champions;
-  }
-
-  function syncSwiftplayActiveChampion(champions = []) {
-    const active = champions.find((entry) => entry.championId === lastWsChampId)
-      || champions.find((entry) => entry.skinId && entry.skinId % 1000 !== 0)
-      || champions[0]
-      || null;
-    if (!active) return;
-
-    const skinChanged = active.skinId && active.skinId !== lastWsSkinId;
-    const champChanged = active.championId !== lastWsChampId;
-    lastWsChampId = active.championId;
-    lastWsSkinId = active.skinId;
-
-    if (!championLockAnnounced) {
-      championLockAnnounced = true;
-      sendBridgePayload({ type: "champion-locked", locked: true, mode: "SWIFTPLAY" });
-      fetchOwnedSkinIds({ force: true }).catch(() => null);
-    }
-
-    champions.forEach((entry) => {
-      if (entry.championId && entry.skinId && entry.skinId !== entry.baseSkinId) {
-        swiftplaySkinTracking.set(entry.championId, entry.skinId);
-      }
-    });
-
-    if (skinChanged || champChanged) {
-      dispatchSkinState({
-        championId: active.championId,
-        skinId: active.skinId,
-        name: readCurrentSkin() || null,
-        mode: "SWIFTPLAY"
-      });
-    }
-  }
-
-  async function forceSwiftplayBaseSkinSlots(lobby = null) {
-    if (!isSwiftplayMode || !window.fetch) return false;
-    const data = lobby || await readLobbyData().catch(() => null);
-    const localMember = data?.localMember;
-    const slots = Array.isArray(localMember?.playerSlots) ? localMember.playerSlots : null;
-    if (!slots?.length) return false;
-
-    let modified = false;
-    const nextSlots = slots.map((slot) => {
-      if (!slot || typeof slot !== "object") return slot;
-      const championId = Number(slot.championId || 0);
-      if (!championId) return slot;
-      const trackedSkin = Number(swiftplaySkinTracking.get(championId) || slot.skinId || 0);
-      if (trackedSkin && ownedSkinIds.has(trackedSkin)) return slot;
-      const baseSkinId = championId * 1000;
-      if (Number(slot.skinId || 0) === baseSkinId) return slot;
-      modified = true;
-      return { ...slot, skinId: baseSkinId };
-    });
-
-    if (!modified) return true;
-
-    const resp = await window.fetch("/lol-lobby/v1/lobby/members/localMember/player-slots", {
-      method: "PUT",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        "x-riot-source": "rcp-fe-lol-parties"
-      },
-      body: JSON.stringify(nextSlots)
-    });
-    sendBridgePayload({
-      type: "swiftplay-base-skins",
-      ok: resp.ok,
-      status: resp.status,
-      tracked: Object.fromEntries(swiftplaySkinTracking),
-      timestamp: Date.now()
-    });
-    return resp.ok;
   }
 
   function extractInventorySkinId(item) {
@@ -1230,17 +1061,10 @@
     }
   }
 
-  async function pollGameflowAndLoadout() {
+  async function pollGameflowPhase() {
     if (stopped || !window.fetch) return;
     try {
-      const [phase, gameflowSession, lobby] = await Promise.all([
-        readGameflowPhase().catch(() => ""),
-        readGameflowSession().catch(() => null),
-        readLobbyData().catch(() => null)
-      ]);
-      // Rust's authenticated LCU monitor is the normal phase authority. Keep a
-      // guarded fallback for the legacy Electron entrypoint or a failed Rust
-      // monitor; it stays silent while authoritative snapshots are arriving.
+      const phase = await readGameflowPhase().catch(() => "");
       if (phase && phase !== lastGameflowPhase && Date.now() - lastAuthoritativePhaseAt > 5000) {
         const previousPhase = lastGameflowPhase || "";
         lastGameflowPhase = phase;
@@ -1252,107 +1076,8 @@
           timestamp: Date.now()
         });
       }
-
-      const swiftplayNow = isSwiftplayFromData(gameflowSession || {}, lobby || {});
-      if (swiftplayNow) {
-        const modeInfo = getGameflowModeInfo(gameflowSession || {}, lobby || {});
-        const champions = extractSwiftplayChampions(lobby || {});
-        const signature = JSON.stringify({
-          phase,
-          mode: modeInfo.mode || "SWIFTPLAY",
-          queueId: modeInfo.queueId,
-          champions: champions.map((entry) => [entry.championId, entry.skinId])
-        });
-
-        isSwiftplayMode = true;
-        syncSwiftplayActiveChampion(champions);
-
-        if (signature !== lastSwiftplaySignature) {
-          lastSwiftplaySignature = signature;
-          sendBridgePayload({
-            type: "swiftplay-state",
-            phase,
-            mode: modeInfo.mode || "SWIFTPLAY",
-            mapId: modeInfo.mapId,
-            queueId: modeInfo.queueId || SWIFTPLAY_QUEUE_ID,
-            champions,
-            tracking: Object.fromEntries(swiftplaySkinTracking),
-            timestamp: Date.now()
-          });
-          sendBridgePayload({
-            type: "lobby-state",
-            mode: modeInfo.mode || "SWIFTPLAY",
-            queueId: modeInfo.queueId || SWIFTPLAY_QUEUE_ID,
-            champions,
-            timestamp: Date.now()
-          });
-        }
-
-        const searchState = await readLobbySearchState().catch(() => null);
-        const searchBucket = `${searchState?.searchState || ""}:${phase || ""}`;
-        if (searchState?.searchState === "Searching" && searchBucket !== lastSwiftplaySearchBucket) {
-          lastSwiftplaySearchBucket = searchBucket;
-          await forceSwiftplayBaseSkinSlots(lobby).catch((err) => dbg("swift-force-err", err));
-          sendBridgePayload({
-            type: "loadout-finalization",
-            phase: "SWIFTPLAY_SEARCHING",
-            mode: "SWIFTPLAY",
-            adjustedTimeLeftInPhase: 0,
-            champions,
-            timestamp: Date.now()
-          });
-        } else if (searchState?.searchState !== "Searching" && lastSwiftplaySearchBucket) {
-          lastSwiftplaySearchBucket = "";
-        }
-      } else if (isSwiftplayMode && ["None", "Lobby", "EndOfGame", ""].includes(String(phase || ""))) {
-        isSwiftplayMode = false;
-        lastSwiftplaySignature = "";
-        lastSwiftplaySearchBucket = "";
-        swiftplaySkinTracking.clear();
-      }
-
-      if (phase === "ChampSelect") {
-        const session = await readChampSelectSession().catch(() => null);
-        const timer = session?.timer || {};
-        const timerPhase = String(timer.phase || "").toUpperCase();
-        const leftMs = Number(timer.adjustedTimeLeftInPhase || 0);
-        if (timerPhase === "FINALIZATION") {
-          const bucket = `${timerPhase}:${Math.max(0, Math.floor(leftMs / 100))}`;
-          if (bucket !== lastFinalizationBucket) {
-            lastFinalizationBucket = bucket;
-            sendBridgePayload({
-              type: "loadout-finalization",
-              phase: timerPhase,
-              adjustedTimeLeftInPhase: Math.max(0, leftMs),
-              timestamp: Date.now()
-            });
-          }
-        } else if (lastFinalizationBucket) {
-          lastFinalizationBucket = "";
-        }
-      } else if (lastFinalizationBucket) {
-        lastFinalizationBucket = "";
-      }
     } catch (err) {
       dbg("flow-poll-err", err);
-    }
-  }
-
-  function installFindMatchObserver() {
-    if (findMatchObserverInstalled || typeof PerformanceObserver === "undefined") return;
-    findMatchObserverInstalled = true;
-    try {
-      const observer = new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) {
-          if (String(entry.name || "").includes("sfx-lobby-button-find-match-hover")) {
-            sendBridgePayload({ type: "find-match-hover", mode: isSwiftplayMode ? "SWIFTPLAY" : "", timestamp: Date.now() });
-            forceSwiftplayBaseSkinSlots().catch((err) => dbg("find-match-force-err", err));
-          }
-        }
-      });
-      observer.observe({ type: "resource", buffered: false });
-    } catch (err) {
-      dbg("find-match-observer-err", err);
     }
   }
 
@@ -1541,12 +1266,11 @@
     });
     startMonitoring();
     interceptChampSelectWs();
-    installFindMatchObserver();
     fetchOwnedSkinIds({ force: true }).catch(() => null);
     setInterval(fetchSessionSkin, 3000);
     if (!flowPollTimer) {
-      flowPollTimer = setInterval(pollGameflowAndLoadout, FLOW_POLL_INTERVAL_MS);
-      pollGameflowAndLoadout().catch(() => null);
+      flowPollTimer = setInterval(pollGameflowPhase, FLOW_POLL_INTERVAL_MS);
+      pollGameflowPhase().catch(() => null);
     }
   }
 

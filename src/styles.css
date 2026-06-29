@@ -3727,6 +3727,74 @@ body.rift-atlas-tutorial-active .sidebar:focus-within {
     padding-inline: 8px;
   }
 
+}
+
+/* ThresholdManager slider */
+.slider-container {
+  margin: 12px 0;
+}
+
+.threshold-slider {
+  width: 100%;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(130, 88, 214, 0.2);
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+.threshold-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #8258d6;
+  cursor: pointer;
+  border: 2px solid rgba(173, 139, 234, 0.8);
+}
+
+.threshold-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #8258d6;
+  cursor: pointer;
+  border: 2px solid rgba(173, 139, 234, 0.8);
+}
+
+.slider-labels {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+/* BaseSkinTracker stats */
+.stats-details {
+  margin: 12px 0;
+  padding: 12px;
+  background: rgba(130, 88, 214, 0.08);
+  border-radius: 8px;
+  border: 1px solid rgba(130, 88, 214, 0.2);
+}
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.stat-row strong {
+  color: rgba(255, 255, 255, 0.95);
+  font-weight: 600;
+}
+
   .window-controls {
     margin-left: auto;
   }
