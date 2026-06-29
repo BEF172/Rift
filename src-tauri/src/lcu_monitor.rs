@@ -576,30 +576,71 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
             }
 
             // Rose-style: detect champion exchange for local player
-            if let Ok(cell_id) = LOCAL_CELL_ID.lock() {
-                if let Some(my_cell) = *cell_id {
-                    if let Some(&new_champ) = new_locks.get(&my_cell) {
-                        if let Ok(prev_locks) = LAST_LOCKS.lock() {
-                            if let Some(ref locks) = *prev_locks {
-                                if let Some(&old_champ) = locks.get(&my_cell) {
-                                    if old_champ != new_champ && old_champ > 0 && new_champ > 0 {
-                                        eprintln!("[LCU-WS] Champion exchange detected: {} -> {}", old_champ, new_champ);
-                                        // Rose-style: set UI overlay state
-                                        if let Ok(mut overlay) = handle.state::<AppState>().ui_overlay.write() {
-                                            overlay.champion_exchange_triggered = true;
-                                        }
-                                        let _ = handle.emit("pengu:message", serde_json::json!({
-                                            "type": "champion-exchange",
-                                            "oldChampionId": old_champ,
-                                            "newChampionId": new_champ,
-                                            "source": "lcu-ws",
-                                        }));
-                                    }
-                                }
-                            }
-                        }
-                    }
+            let exchange = (|| -> Option<(u64, u64)> {
+                let cell_id = LOCAL_CELL_ID.lock().ok()?;
+                let my_cell = (*cell_id)?;
+                let new_locks_snap = new_locks.clone();
+                let prev_locks = LAST_LOCKS.lock().ok()?;
+                let locks = prev_locks.as_ref()?;
+                let &new_champ = new_locks_snap.get(&my_cell)?;
+                let &old_champ = locks.get(&my_cell)?;
+                if old_champ != new_champ && old_champ > 0 && new_champ > 0 {
+                    Some((old_champ, new_champ))
+                } else {
+                    None
                 }
+            })();
+
+            if let Some((old_champ, new_champ)) = exchange {
+                eprintln!("[LCU-WS] Champion exchange detected: {} -> {}", old_champ, new_champ);
+                let state = handle.state::<AppState>();
+
+                // Rose-style: reset UI overlay state (skin, chroma, etc.)
+                if let Ok(mut ui) = state.ui_overlay.write() {
+                    ui.ui_skin_id = None;
+                    ui.ui_skin_name = None;
+                    ui.last_hovered_skin_id = None;
+                    ui.last_hovered_skin_key = None;
+                    ui.selected_skin_id = None;
+                    ui.selected_chroma_id = None;
+                    ui.locked_champ_id = Some(new_champ as i32);
+                    ui.locked_champ_name = None;
+                    ui.own_champion_locked = true;
+                    ui.champion_exchange_triggered = true;
+                    ui.reset_skin_notification = true;
+                    ui.pending_chroma_selection = false;
+                    ui.chroma_panel_open = false;
+                    ui.last_notified_skin_id = None;
+                }
+
+                // Rose-style: kill running overlay + cancel builds
+                state.overlay_cancel_epoch.fetch_add(1, Ordering::SeqCst);
+                let pid = state.running_overlay_process.lock().await.take();
+                let overlay_path = state.current_overlay_path.lock().await.clone();
+                if let Some(pid) = pid {
+                    overlay::stop_patcher(pid, &overlay_path);
+                    state.running_overlay_alive.lock().await.take();
+                    state.running_overlay_ready.lock().await.take();
+                    let _ = handle.emit("patcher-died", serde_json::json!({
+                        "pid": pid,
+                        "reason": "champion-exchange",
+                        "oldChampionId": old_champ,
+                        "newChampionId": new_champ,
+                    }));
+                }
+                *state.active_overlay_run.lock().await = false;
+                *state.current_overlay_path.lock().await = String::new();
+                let _ = tokio::task::spawn_blocking(overlay::kill_all_runoverlay_processes).await;
+                if !overlay_path.is_empty() {
+                    overlay::wipe_overlay_dir(&overlay_path);
+                }
+
+                let _ = handle.emit("pengu:message", serde_json::json!({
+                    "type": "champion-exchange",
+                    "oldChampionId": old_champ,
+                    "newChampionId": new_champ,
+                    "source": "lcu-ws",
+                }));
             }
 
             // Persist current locks for next comparison
