@@ -75,7 +75,7 @@ const state = {
   lastHoverWritten: false,
   tickerSeq: 0,
   currentTicker: 0,
-  skinWriteMs: Math.max(0, Math.min(2000, Number(localStorage.getItem("riftAtlas:roseInjectionThresholdMs") || 500))),
+  skinWriteMs: 500,
   penguApplyLockedKey: "",
   penguApplyLockedAt: 0,
   lastRoseInjectionTime: 0,
@@ -888,7 +888,10 @@ const stopRoseEarlyMonitor = async (reason = "release") => {
 };
 
 const triggerRoseFinalizationApply = async (reason = "finalization") => {
-  if (state.lastHoverWritten || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted || state.importingQueue) return false;
+  if (state.lastHoverWritten || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted || state.importingQueue) {
+    window.riftAtlas.appendOverlayLog(`[TrackerDiag] triggerRoseFinalizationApply early skip: lastHoverWritten=${state.lastHoverWritten} committed=${state.roseFinalizationCommitted} applyStarted=${state.roseFinalizationApplyStarted} importing=${state.importingQueue}`).catch(() => {});
+    return false;
+  }
   const injectPhase = String(state.penguGameflowPhase || "");
   if (injectPhase && !["ChampSelect", "FINALIZATION", "GameStart"].includes(injectPhase)) {
     window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION apply saltado: fase=${injectPhase} (${reason}).`).catch(() => { });
@@ -1077,6 +1080,12 @@ const handlePenguPhaseChange = (payload = {}) => {
     }
   }
   if (GAMEFLOW_ACTIVE_PHASES.has(phase)) {
+    if (["ChampSelect", "FINALIZATION"].includes(previousPhase) && !["ChampSelect", "FINALIZATION"].includes(phase)) {
+      if (window.riftAtlas.onChampSelectExit) {
+        window.riftAtlas.appendOverlayLog(`[TrackerDiag] onChampSelectExit from phase transition ${previousPhase}->${phase}`).catch(() => {});
+        window.riftAtlas.onChampSelectExit().catch(() => {});
+      }
+    }
     state.penguSessionActive = true;
     state.penguHadInGamePhase = true;
     if (phase === "InProgress") {
@@ -1097,6 +1106,12 @@ const handlePenguPhaseChange = (payload = {}) => {
     ["ChampSelect", "FINALIZATION", "GameStart", "Reconnect"].includes(previousPhase)
   );
   if (explicitGameEnd || returningFromSession) {
+    if (["ChampSelect", "FINALIZATION"].includes(previousPhase)) {
+      if (window.riftAtlas.onChampSelectExit) {
+        window.riftAtlas.appendOverlayLog(`[TrackerDiag] onChampSelectExit from session end ${previousPhase}->${phase}`).catch(() => {});
+        window.riftAtlas.onChampSelectExit().catch(() => {});
+      }
+    }
     clearRoseFinalizationTimer();
     cancelRoseLocalFinalizationTicker();
     clearPenguApplyLock();
@@ -2116,6 +2131,7 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
   const desiredSkinId = getOverlayForceSkinId(skin, payload, championId);
   const ownedTarget = targetSkinId > 0 && isRoseOwnedSkinId(targetSkinId);
 
+  window.riftAtlas.appendOverlayLog(`[TrackerDiag] maybeForce: championId=${championId} selectedSkinId=${selectedSkinId} desiredSkinId=${desiredSkinId} targetSkinId=${targetSkinId} hasTracker=${Boolean(window.riftAtlas.startBaseSkinTracking)}`).catch(() => {});
   if (!desiredSkinId || selectedSkinId === desiredSkinId) return true;
   window.riftAtlas.appendOverlayLog(`[Diagnostico] force-skin estilo Rose: championId=${championId} selected=${selectedSkinId || "?"} target=${targetSkinId || "?"} owned=${ownedTarget ? "si" : "no"} ownedReady=${state.penguOwnedSkinsReady ? "si" : "no"} desired=${desiredSkinId}`).catch(() => { });
   const forcingUnownedBase = !ownedTarget && desiredSkinId !== targetSkinId;
@@ -2135,6 +2151,7 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
   if (window.riftAtlas.forceLcuSkinSelection) {
     // BaseSkinTracker: start tracking PATCH→confirmation latency
     if (window.riftAtlas.startBaseSkinTracking) {
+      window.riftAtlas.appendOverlayLog(`[TrackerDiag] calling startBaseSkinTracking(${desiredSkinId})`).catch(() => {});
       window.riftAtlas.startBaseSkinTracking(desiredSkinId);
     }
     result = await window.riftAtlas.forceLcuSkinSelection(championId, desiredSkinId)
@@ -2145,9 +2162,16 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
         forceError: error?.message || String(error),
       }));
     // BaseSkinTracker: record confirmation
+    window.riftAtlas.appendOverlayLog(`[TrackerDiag] forceLcuSkinSelection result: forceOk=${result?.forceOk} verifiedSkinId=${result?.verifiedSkinId} desiredSkinId=${desiredSkinId}`).catch(() => {});
     if (result?.forceOk && result?.verifiedSkinId === desiredSkinId) {
       if (window.riftAtlas.onBaseSkinConfirmed) {
+        window.riftAtlas.appendOverlayLog(`[TrackerDiag] calling onBaseSkinConfirmed(${desiredSkinId})`).catch(() => {});
         window.riftAtlas.onBaseSkinConfirmed(desiredSkinId);
+      }
+    } else {
+      if (window.riftAtlas.onChampSelectExit) {
+        window.riftAtlas.appendOverlayLog(`[TrackerDiag] calling onChampSelectExit (force failed/verified mismatch)`).catch(() => {});
+        window.riftAtlas.onChampSelectExit().catch(() => {});
       }
     }
   } else {
@@ -8575,6 +8599,7 @@ const bindEvents = () => {
     try {
       const value = await window.riftAtlas.loadInjectionThreshold?.() ?? 0.5;
       const ms = Math.round(value * 1000);
+      state.skinWriteMs = ms;
       if (els.injectionThresholdSlider) els.injectionThresholdSlider.value = ms;
       if (els.injectionThresholdLabel) els.injectionThresholdLabel.textContent = `${ms}ms`;
     } catch (error) {
@@ -8584,7 +8609,7 @@ const bindEvents = () => {
 
   const saveInjectionThresholdUI = async () => {
     try {
-      const ms = Number(els.injectionThresholdSlider?.value || 500);
+        const ms = Number(els.injectionThresholdSlider?.value || 500);
       const seconds = ms / 1000;
       await window.riftAtlas.saveInjectionThreshold?.(seconds);
       state.skinWriteMs = ms;

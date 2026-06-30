@@ -5896,16 +5896,19 @@ pub fn save_injection_threshold(value: f64) {
 
 #[tauri::command]
 pub fn start_base_skin_tracking(skin_id: u64) {
+    eprintln!("[TRACKER_CMD] start_base_skin_tracking skinId={}", skin_id);
     crate::base_skin_tracker::start_tracking(skin_id);
 }
 
 #[tauri::command]
 pub fn on_base_skin_confirmed(skin_id: u64) -> Option<f64> {
+    eprintln!("[TRACKER_CMD] on_base_skin_confirmed skinId={}", skin_id);
     crate::base_skin_tracker::on_skin_confirmed(skin_id)
 }
 
 #[tauri::command]
 pub fn on_champ_select_exit() -> Option<f64> {
+    eprintln!("[TRACKER_CMD] on_champ_select_exit");
     crate::base_skin_tracker::on_champ_select_exit()
 }
 
