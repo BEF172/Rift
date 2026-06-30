@@ -2880,6 +2880,8 @@ const resolveRoseAuthoritativeSkinEntry = async (payload = {}, fallbackSkin = nu
     resolvedPayload.selectedChromaId ||
     resolvedPayload.resolvedSkinId ||
     resolvedPayload.requestedSkinId ||
+    resolvedPayload.selectedSkinId ||
+    resolvedPayload.skinId ||
     0
   );
   const resolvedBaseSkinId = Number(
@@ -2953,8 +2955,30 @@ const resolveRoseAuthoritativeSkinEntry = async (payload = {}, fallbackSkin = nu
   if (!skin) {
     skin = findQueuedCustomSkinForPenguPayload(resolvedPayload) ||
       findSkinFromPenguSync(resolvedPayload) ||
-      fallbackSkin ||
       null;
+    // Rose does NOT fall back to a previously selected skin. Only reuse
+    // the fallback when its target matches the exact requested skin ID.
+    // This prevents stale selections (e.g. cosplay 518022) from winning
+    // when the user selects a different skin (e.g. Coven Neeko 518040).
+    if (!skin && fallbackSkin) {
+      const fallbackTarget = getOverlayTargetSkinId(fallbackSkin, championId);
+      const fallbackChampion = getSkinSyncChampionNumber(fallbackSkin);
+      if (fallbackTarget && requestedSkinId && fallbackTarget === requestedSkinId) {
+        skin = fallbackSkin;
+        window.riftAtlas.appendOverlayLog(
+          `[RoseResolver] fallback aceptado: fallbackTarget=${fallbackTarget} === requestedSkinId=${requestedSkinId}`
+        ).catch(() => { });
+      } else if (fallbackChampion && championId && fallbackChampion === championId && !requestedSkinId) {
+        skin = fallbackSkin;
+        window.riftAtlas.appendOverlayLog(
+          `[RoseResolver] fallback aceptado (sin requestedSkinId): championId=${championId} fallbackTarget=${fallbackTarget}`
+        ).catch(() => { });
+      } else {
+        window.riftAtlas.appendOverlayLog(
+          `[RoseResolver] fallback descartado: fallbackTarget=${fallbackTarget} requestedSkinId=${requestedSkinId} fallbackChampion=${fallbackChampion} championId=${championId}`
+        ).catch(() => { });
+      }
+    }
   }
 
   if (skin) {
@@ -3561,7 +3585,9 @@ async function handlePenguSkinSync(payload = {}) {
     }
     window.riftAtlas.appendOverlayLog(`[Diagnostico] NO se encontro skin para: ${payload.skin || payload.selectedSkinId || payload.chromaId || "desconocida"}`).catch(() => { });
     clearRoseAuthoritativeSelection();
-    lastPenguSkinSyncPayload = previousSkinSyncPayload;
+    window.riftAtlas.appendOverlayLog(
+      `[RoseResolver] skin no encontrada: selectedSkinId=${payload.selectedSkinId || "?"} skin=${payload.skin || "?"}; NO se reutiliza la seleccion anterior para evitar aplicar una skin equivocada.`
+    ).catch(() => { });
     await window.riftAtlas.sendPenguMessage?.({
       type: "skin-apply-result",
       ok: false,

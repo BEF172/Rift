@@ -110,6 +110,18 @@ pub fn on_champ_select_exit() -> Option<f64> {
 
     let elapsed = state.pending_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
     let target = state.pending_skin_id.unwrap_or(0);
+
+    // If the PATCH was sent less than 200ms ago, the forceLcuSkinSelection is
+    // likely still in-flight.  Don't clobber pending — let on_skin_confirmed
+    // record the real sample instead.
+    if elapsed < 0.2 {
+        eprintln!(
+            "[TRACKER] on_champ_select_exit deferring (skinId={}) — PATCH only {:.0}ms old, waiting for confirmation.",
+            target, elapsed * 1000.0
+        );
+        return None;
+    }
+
     state.pending_skin_id = None;
     state.pending_start = None;
 
