@@ -94,23 +94,13 @@ Var RiftAtlasProcessCheckOutput
 
 !macro NSIS_HOOK_POSTINSTALL
   SetShellVarContext all
-  CreateShortCut "$DESKTOP\Rift Atlas.lnk" "$INSTDIR\Rift Atlas.exe"
+  CreateShortCut "$DESKTOP\Rift Atlas.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro RIFT_ATLAS_ABORT_IF_LEAGUE_RUNNING
   !insertmacro RIFT_ATLAS_STOP_RUNTIME
   !insertmacro RIFT_ATLAS_REMOVE_LEAGUE_PROXY
-
-  ${If} $DeleteAppDataCheckboxState = 1
-  ${AndIf} $UpdateMode <> 1
-    DetailPrint "Eliminando datos de Rift Atlas..."
-    RMDir /r "$LOCALAPPDATA\Rift Atlas"
-    RMDir /r "$APPDATA\Rift Atlas"
-    !insertmacro RIFT_ATLAS_DELETE_LEGACY_INSTALL_DATA
-  ${Else}
-    DetailPrint "Se conservaran los datos de Rift Atlas."
-  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
@@ -119,8 +109,9 @@ Var RiftAtlasProcessCheckOutput
 
   ${If} $DeleteAppDataCheckboxState = 1
   ${AndIf} $UpdateMode <> 1
+    SetShellVarContext current
     RMDir /r "$LOCALAPPDATA\Rift Atlas"
     RMDir /r "$APPDATA\Rift Atlas"
-    RMDir /r "$INSTDIR"
+    !insertmacro RIFT_ATLAS_DELETE_LEGACY_INSTALL_DATA
   ${EndIf}
 !macroend
