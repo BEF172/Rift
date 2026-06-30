@@ -92,6 +92,11 @@ Var RiftAtlasProcessCheckOutput
   !insertmacro RIFT_ATLAS_STOP_RUNTIME
 !macroend
 
+!macro NSIS_HOOK_POSTINSTALL
+  SetShellVarContext all
+  CreateShortCut "$DESKTOP\Rift Atlas.lnk" "$INSTDIR\Rift Atlas.exe"
+!macroend
+
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro RIFT_ATLAS_ABORT_IF_LEAGUE_RUNNING
   !insertmacro RIFT_ATLAS_STOP_RUNTIME
@@ -109,6 +114,9 @@ Var RiftAtlasProcessCheckOutput
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
+  SetShellVarContext all
+  Delete "$DESKTOP\Rift Atlas.lnk"
+
   ${If} $DeleteAppDataCheckboxState = 1
   ${AndIf} $UpdateMode <> 1
     RMDir /r "$LOCALAPPDATA\Rift Atlas"

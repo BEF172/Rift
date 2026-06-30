@@ -31,10 +31,6 @@
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "startMenuFolder": "Rift Atlas",
-        "shortcuts": {
-          "desktop": true,
-          "startMenu": true
-        },
         "installerHooks": "../build/installer.nsh"
       }
     },
