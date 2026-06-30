@@ -471,18 +471,21 @@ pub async fn run_rose_overlay_v2(
         );
         overlay::append_overlay_log("[Engine] Early monitor iniciado desde run_rose_overlay_v2.");
     }
-    // Rose-style: esperar a que el early monitor suspenda League antes de mkoverlay
+    // Rose-style: esperar a que el early monitor suspenda League antes de mkoverlay.
+    // Si el early monitor no puede suspender (Vanguard/anti-cheat), proceder igual tras 5s.
     {
         let wait_start = std::time::Instant::now();
-        let wait_timeout = std::time::Duration::from_secs(90);
+        let hard_timeout = std::time::Duration::from_secs(90);
+        let soft_timeout = std::time::Duration::from_secs(5);
         loop {
             let suspended = state.early_monitor_pid.lock()
                 .map(|g| g.is_some())
                 .unwrap_or(false);
             if suspended {
+                overlay::append_overlay_log("[Engine] League suspendido, procediendo con mkoverlay.");
                 break;
             }
-            if wait_start.elapsed() >= wait_timeout {
+            if wait_start.elapsed() >= hard_timeout {
                 overlay::stop_early_monitor(
                     &state.early_monitor_active,
                     &state.early_monitor_pid,
@@ -493,9 +496,14 @@ pub async fn run_rose_overlay_v2(
                     "Timeout esperando que League of Legends se suspenda.".to_string()
                 );
             }
+            if wait_start.elapsed() >= soft_timeout {
+                overlay::append_overlay_log(
+                    "[Engine] Early monitor no pudo suspender (probable anti-cheat). Procediendo sin suspension (estilo Rose)."
+                );
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        overlay::append_overlay_log("[Engine] League suspendido, procediendo con mkoverlay.");
     }
     let payload_for_build = payload.clone();
     let result = match tokio::task::spawn_blocking(move || {

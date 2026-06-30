@@ -248,12 +248,23 @@ pub fn start_early_monitor(
                             ));
                         }
                         Err(e) => {
+                            // Rose-style: ACCESS DENIED means anti-cheat blocks suspension.
+                            // Stop immediately — don't spam retries.
+                            let err_str = e.to_string();
+                            if err_str.contains("NTSTATUS=3221225506")
+                                || err_str.contains("STATUS_ACCESS_DENIED")
+                                || err_str.contains("0xC0000022")
+                            {
+                                append_overlay_log(
+                                    "[EarlyMonitor] ACCESS DENIED (anti-cheat); deteniendo monitor.",
+                                );
+                                active.store(false, Ordering::SeqCst);
+                                break;
+                            }
                             append_overlay_log(&format!(
                                 "[EarlyMonitor] ERROR suspendiendo pid={}: {} (continuando)",
                                 pid, e
                             ));
-                            // Don't break — Rose continues the loop and retries.
-                            // Only break if the process is gone entirely.
                             if !is_process_alive(pid) {
                                 append_overlay_log(&format!(
                                     "[EarlyMonitor] pid={} no existe; limpiando estado.",

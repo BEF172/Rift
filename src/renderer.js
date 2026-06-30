@@ -888,9 +888,9 @@ const stopRoseEarlyMonitor = async (reason = "release") => {
 };
 
 const triggerRoseFinalizationApply = async (reason = "finalization") => {
-  if (state.lastHoverWritten || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted || state.importingQueue || state.overlayRunning) return false;
+  if (state.lastHoverWritten || state.roseFinalizationCommitted || state.roseFinalizationApplyStarted || state.importingQueue) return false;
   const injectPhase = String(state.penguGameflowPhase || "");
-  if (injectPhase && !["ChampSelect", "FINALIZATION"].includes(injectPhase)) {
+  if (injectPhase && !["ChampSelect", "FINALIZATION", "GameStart"].includes(injectPhase)) {
     window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION apply saltado: fase=${injectPhase} (${reason}).`).catch(() => { });
     return false;
   }
@@ -952,7 +952,7 @@ const startRoseLocalFinalizationTicker = () => {
     .then(async (result) => {
       if (generation !== roseLocalTickerGeneration || !result?.ready) return;
       const tickerPhase = String(state.penguGameflowPhase || "");
-      if (tickerPhase && !["ChampSelect", "FINALIZATION"].includes(tickerPhase)) {
+      if (tickerPhase && !["ChampSelect", "FINALIZATION", "GameStart"].includes(tickerPhase)) {
         window.riftAtlas.appendOverlayLog(`[RoseTicker] ticker resuelto DEMASIADO TARDE; fase=${tickerPhase}. Abortando.`).catch(() => { });
         return;
       }
@@ -1875,6 +1875,8 @@ let penguBackgroundApplyAt = 0;
 let penguBackgroundApplyPromise = Promise.resolve();
 let penguBackgroundApplyInFlightKey = "";
 let penguSkinSyncQueue = Promise.resolve();
+let penguApplyGeneration = 0;
+let penguSkinSyncGeneration = 0;
 const pendingPenguForceSkinRequests = new Map();
 
 const waitForPrebuildOverlay = async (timeoutMs = 90000) => {
@@ -2274,6 +2276,7 @@ const getSelectedRoseExtraMods = async () => {
 const applyPenguSelectedSkin = async (key = "") => {
   if (!key) return false;
   const now = Date.now();
+  const applyGen = penguApplyGeneration;
   state.penguApplyLockedKey = key;
   state.penguApplyLockedAt = now;
   if (key === penguBackgroundApplyInFlightKey) {
@@ -2289,7 +2292,10 @@ const applyPenguSelectedSkin = async (key = "") => {
   penguBackgroundApplyPromise = penguBackgroundApplyPromise
     .catch(() => null)
     .then(async () => {
-      // Saltar si ya se pidio una skin mas nueva mientras esperabamos
+      if (applyGen !== penguApplyGeneration) {
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: abandonado por champion exchange (gen ${applyGen} != ${penguApplyGeneration})`).catch(() => { });
+        return false;
+      }
       if (key !== penguBackgroundApplyKey) return false;
       penguBackgroundApplyInFlightKey = key;
 
@@ -2413,6 +2419,13 @@ const shouldIgnorePenguSwitchDuringApply = (nextKey = "", payload = {}) => {
   const lockedChampId = extractChampionIdFromSkinKey(lockedKey);
   const nextChampId = extractChampionIdFromSkinKey(nextKey) || Number(payload.championId || 0);
   if (lockedChampId && nextChampId && lockedChampId === nextChampId) return false;
+  if (lockedChampId && nextChampId && lockedChampId !== nextChampId) {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync champion cambio ${lockedChampId}->${nextChampId}; limpiando apply stale (estilo Rose exchange).`).catch(() => { });
+    penguBackgroundApplyKey = "";
+    penguBackgroundApplyInFlightKey = "";
+    clearPenguApplyLock();
+    return false;
+  }
   const lockAge = Date.now() - Number(state.penguApplyLockedAt || 0);
   const applyIsHot = Boolean(
     penguBackgroundApplyInFlightKey ||
@@ -2480,7 +2493,7 @@ async function handlePenguSkinApply(payload = {}) {
         await refreshOverlayStatus();
       }
     } catch (error) {
-      applyMessage = error.message || "No pude aplicar la skin en background.";
+      applyMessage = String(error?.message || error || "No pude aplicar la skin en background.");
       window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin ERROR: ${applyMessage}`).catch(() => { });
     }
   }
@@ -3167,14 +3180,7 @@ const findSkinFromPenguSync = (payload = {}) => {
   }
 
   if (championOnlyText && isDefaultSelection) {
-    const queuedChampionMatch = findQueuedCustomSkinForPenguPayload({
-      ...payload,
-      championId: championId || Number(textChampion?.key || 0)
-    });
-    if (queuedChampionMatch) {
-      window.riftAtlas.appendOverlayLog(`[RoseSuspend] skin base detectada; usando mod propio en cola para championId=${championId || Number(textChampion?.key || 0)}: ${getSkinKey(queuedChampionMatch)}`).catch(() => { });
-      return queuedChampionMatch;
-    }
+    window.riftAtlas.appendOverlayLog(`[Rose] skin base detectada (championId=${championId || Number(textChampion?.key || 0)}); sin inyeccion (estilo Rose).`).catch(() => { });
     return null;
   }
 
@@ -3368,20 +3374,22 @@ const queuePenguSelectionForFinalization = async (payload, key) => {
 async function handlePenguSkinSync(payload = {}) {
   const syncLogSignature = `${payload.type || ""}:${payload.championId || ""}:${payload.selectedSkinId || payload.skinId || ""}:${payload.skin || ""}:${payload.chromaId || payload.selectedChromaId || ""}`;
   const syncLogNow = Date.now();
+  const syncGen = penguSkinSyncGeneration;
   if (syncLogSignature !== lastPenguSyncLogSignature || syncLogNow - lastPenguSyncLogAt > 5000) {
     lastPenguSyncLogSignature = syncLogSignature;
     lastPenguSyncLogAt = syncLogNow;
     window.riftAtlas.appendOverlayLog(`[Diagnostico] handlePenguSkinSync recibio payload: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin} type=${payload.type}`).catch(() => { });
   }
 
-  // Rose FlowController gate: only process after champion lock or in FINALIZATION.
-  // Always remember the latest payload (like Rose saves ui_last_text) but don't
-  // process it until the champion is locked.
   const previousSkinSyncPayload = lastPenguSkinSyncPayload;
   if (payload.skin || payload.championId || payload.selectedSkinId || payload.skinId) {
     lastPenguSkinSyncPayload = { ...payload };
   }
   if (payload.type === "skin-sync" && !state.penguChampionLocked && state.penguGameflowPhase !== "FINALIZATION") {
+    return;
+  }
+  if (syncGen !== penguSkinSyncGeneration) {
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync descartado por champion exchange (gen ${syncGen} != ${penguSkinSyncGeneration})`).catch(() => { });
     return;
   }
 
@@ -3510,8 +3518,20 @@ async function handlePenguSkinSync(payload = {}) {
       pendingSkinText === normalizeSkinSyncText(pendingChampion?.id || "")
     );
     if (pendingChampionOnly && pendingIsDefaultSelection) {
-      window.riftAtlas.appendOverlayLog(`[Diagnostico] Esperando nombre de skin especifico para ${payload.skin}.`).catch(() => { });
-      // Restore previous payload so FINALIZATION doesn't see a champion-only value
+      window.riftAtlas.appendOverlayLog(`[Rose] skin base detectada para championId=${pendingChampionId}; limpiando cola de skins de este champion (estilo Rose: sin inyeccion para skin default).`).catch(() => { });
+      if (pendingChampionId) {
+        const toRemove = [...state.queuedSkins].filter((queuedKey) => {
+          const queuedSkin = getSkinByKey(queuedKey);
+          return queuedSkin && getSkinSyncChampionNumber(queuedSkin) === pendingChampionId;
+        });
+        toRemove.forEach((key) => removeQueuedSkinKey(key));
+        if (toRemove.length) {
+          saveQueuedSkins();
+          renderSkinLibrary();
+          renderSelectionTray();
+        }
+      }
+      clearRoseAuthoritativeSelection();
       lastPenguSkinSyncPayload = previousSkinSyncPayload;
       return;
     }
@@ -8173,6 +8193,9 @@ const bindEvents = () => {
         const oldChamp = Number(payload.oldChampionId || 0);
         const newChamp = Number(payload.newChampionId || 0);
         window.riftAtlas.appendOverlayLog(`[Rose] Champion exchange detectado: ${oldChamp} -> ${newChamp}. Reseteando estado de inyeccion.`).catch(() => { });
+        penguApplyGeneration += 1;
+        penguSkinSyncGeneration += 1;
+        penguSkinSyncQueue = Promise.resolve();
         clearRoseAuthoritativeSelection();
         state.roseFinalizationCommitted = false;
         state.roseFinalizationApplyStarted = false;
@@ -8185,6 +8208,25 @@ const bindEvents = () => {
         state.lastRemainMs = 0;
         clearPenguApplyLock();
         clearRoseFinalizationTimer();
+        penguBackgroundApplyKey = "";
+        penguBackgroundApplyInFlightKey = "";
+        lastPenguSkinSyncPayload = null;
+        lastPenguSkinSyncKey = "";
+        lastPenguSkinSyncAt = 0;
+        lastPenguLcuSelection = null;
+        lastPenguChromaSelection = null;
+        lastPenguChromaPanel = null;
+        state.penguChampionLocked = false;
+        state.penguSessionQueuedSkins.clear();
+        state.queuedSkins.clear();
+        saveQueuedSkins();
+        renderSkinLibrary();
+        renderSelectionTray();
+        if (state.overlayRunning && window.riftAtlas.stopOverlay) {
+          window.riftAtlas.stopOverlay().catch(() => { });
+          state.overlayRunning = false;
+        }
+        window.riftAtlas.appendOverlayLog(`[Rose] Exchange: overlay detenido, queued skins limpiados, apply locks reiniciados (gen=${penguApplyGeneration}).`).catch(() => { });
       }
       if (payload.type === "loadout-finalization") {
         handlePenguLoadoutFinalization(payload);

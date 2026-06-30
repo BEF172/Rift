@@ -496,7 +496,8 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
             }
 
             // Rose-style: track local cell ID and compute locks
-            if let Some(local_cell) = event_data.get("localPlayerCellId").and_then(|v| v.as_u64()) {
+            let local_cell_opt = event_data.get("localPlayerCellId").and_then(|v| v.as_u64());
+            if let Some(local_cell) = local_cell_opt {
                 if let Ok(mut cell_id) = LOCAL_CELL_ID.lock() {
                     *cell_id = Some(local_cell);
                 }
@@ -526,6 +527,21 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                     }
                 }
             }
+
+            // Rose: count visible players from session data
+            let visible = {
+                let mut cells = std::collections::HashSet::new();
+                for side in &["myTeam", "theirTeam"] {
+                    if let Some(team) = event_data.get(side).and_then(|v| v.as_array()) {
+                        for p in team {
+                            if let Some(c) = p.get("cellId").and_then(|v| v.as_u64()) {
+                                cells.insert(c);
+                            }
+                        }
+                    }
+                }
+                cells.len()
+            };
 
             // Rose-style: compute locked champions from actions (compute_locked)
             let mut new_locks = HashMap::new();
@@ -593,47 +609,28 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
 
             if let Some((old_champ, new_champ)) = exchange {
                 eprintln!("[LCU-WS] Champion exchange detected: {} -> {}", old_champ, new_champ);
-                let state = handle.state::<AppState>();
 
-                // Rose-style: reset UI overlay state (skin, chroma, etc.)
-                if let Ok(mut ui) = state.ui_overlay.write() {
-                    ui.ui_skin_id = None;
-                    ui.ui_skin_name = None;
-                    ui.last_hovered_skin_id = None;
-                    ui.last_hovered_skin_key = None;
-                    ui.selected_skin_id = None;
-                    ui.selected_chroma_id = None;
-                    ui.locked_champ_id = Some(new_champ as i32);
-                    ui.locked_champ_name = None;
-                    ui.own_champion_locked = true;
-                    ui.champion_exchange_triggered = true;
-                    ui.reset_skin_notification = true;
-                    ui.pending_chroma_selection = false;
-                    ui.chroma_panel_open = false;
-                    ui.last_notified_skin_id = None;
+                // Rose handle_champion_exchange 1:1:
+                //   Reset UI state + flag, cancel builds, emit event.
+                {
+                    if let Ok(mut ui) = handle.state::<AppState>().ui_overlay.write() {
+                        ui.ui_skin_id = None;
+                        ui.ui_skin_name = None;
+                        ui.last_hovered_skin_id = None;
+                        ui.last_hovered_skin_key = None;
+                        ui.selected_skin_id = None;
+                        ui.selected_chroma_id = None;
+                        ui.locked_champ_id = Some(new_champ as i32);
+                        ui.locked_champ_name = None;
+                        ui.own_champion_locked = true;
+                        ui.champion_exchange_triggered = true;
+                        ui.reset_skin_notification = true;
+                        ui.pending_chroma_selection = false;
+                        ui.chroma_panel_open = false;
+                        ui.last_notified_skin_id = None;
+                    }
                 }
-
-                // Rose-style: kill running overlay + cancel builds
-                state.overlay_cancel_epoch.fetch_add(1, Ordering::SeqCst);
-                let pid = state.running_overlay_process.lock().await.take();
-                let overlay_path = state.current_overlay_path.lock().await.clone();
-                if let Some(pid) = pid {
-                    overlay::stop_patcher(pid, &overlay_path);
-                    state.running_overlay_alive.lock().await.take();
-                    state.running_overlay_ready.lock().await.take();
-                    let _ = handle.emit("patcher-died", serde_json::json!({
-                        "pid": pid,
-                        "reason": "champion-exchange",
-                        "oldChampionId": old_champ,
-                        "newChampionId": new_champ,
-                    }));
-                }
-                *state.active_overlay_run.lock().await = false;
-                *state.current_overlay_path.lock().await = String::new();
-                let _ = tokio::task::spawn_blocking(overlay::kill_all_runoverlay_processes).await;
-                if !overlay_path.is_empty() {
-                    overlay::wipe_overlay_dir(&overlay_path);
-                }
+                handle.state::<AppState>().overlay_cancel_epoch.fetch_add(1, Ordering::SeqCst);
 
                 let _ = handle.emit("pengu:message", serde_json::json!({
                     "type": "champion-exchange",
@@ -641,15 +638,48 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                     "newChampionId": new_champ,
                     "source": "lcu-ws",
                 }));
+
+                // Rose: skin scraper runs after exchange. Emit champion-locked
+                // with LCU skin data so frontend can resolve without waiting for DOM.
+                let new_skin_id = extract_skin_id_for_cell(&event_data, LOCAL_CELL_ID.lock().ok().and_then(|g| *g));
+                let _ = handle.emit("pengu:message", serde_json::json!({
+                    "type": "champion-locked",
+                    "championId": new_champ,
+                    "selectedSkinId": new_skin_id,
+                    "source": "lcu-ws-exchange",
+                }));
             }
 
             // Persist current locks for next comparison
             if let Ok(mut locks) = LAST_LOCKS.lock() {
-                *locks = Some(new_locks);
+                *locks = Some(new_locks.clone());
+            }
+
+            // Rose: all-locked announcement
+            if visible > 0 && new_locks.len() >= visible {
+                eprintln!("[LCU-WS] ALL LOCKED ({}/{})", new_locks.len(), visible);
             }
         }
         _ => {}
     }
+}
+
+/// Rose-style: extract selectedSkinId from myTeam for a given cellId.
+/// Falls back to championId * 1000 (base skin).
+fn extract_skin_id_for_cell(event_data: &serde_json::Value, my_cell: Option<u64>) -> u64 {
+    let my_cell = match my_cell {
+        Some(c) => c,
+        None => return 0,
+    };
+    event_data
+        .get("myTeam")
+        .and_then(|v| v.as_array())
+        .and_then(|team| {
+            team.iter().find(|p| p.get("cellId").and_then(|v| v.as_u64()) == Some(my_cell))
+        })
+        .and_then(|p| p.get("selectedSkinId").and_then(|v| v.as_u64()))
+        .filter(|&id| id > 0)
+        .unwrap_or(0)
 }
 
 /// Rose-style HTTP phase polling (fallback for when WS is not connected)
@@ -868,14 +898,21 @@ async fn check_initial_champion_state(handle: &AppHandle) {
                     "[LCUMonitor] Late-lock recovery: champion {} already locked.",
                     champ_id
                 );
-                // Rose-style: update UI overlay state
+                // Rose-style: full bootstrap (update UI state, locks, skin ID)
+                let skin_id = extract_skin_id_for_cell(&session, Some(my_cell));
                 if let Ok(mut overlay) = handle.state::<AppState>().ui_overlay.write() {
                     overlay.own_champion_locked = true;
                     overlay.locked_champ_id = Some(champ_id as i32);
                 }
+                let mut lk = HashMap::new();
+                lk.insert(my_cell, champ_id);
+                if let Ok(mut locks) = LAST_LOCKS.lock() {
+                    *locks = Some(lk);
+                }
                 let _ = handle.emit("pengu:message", serde_json::json!({
                     "type": "champion-locked",
                     "championId": champ_id,
+                    "selectedSkinId": skin_id,
                     "source": "lcu-monitor-late-lock",
                     "cellId": my_cell,
                 }));
