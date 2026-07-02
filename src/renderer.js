@@ -41,7 +41,6 @@ const state = {
   partyLink: "",
   partyStatus: "disconnected",
   selectedPartyFile: null,
-  partyAutoApply: localStorage.getItem("riftAtlas:partyAutoApply") === "1",
   penguBridgeConnected: false,
   penguLobby: null,
   penguGameflowPhase: "",
@@ -203,11 +202,9 @@ const els = {
   partyReadySummary: document.querySelector("#partyReadySummary"),
   partyReadyDetails: document.querySelector("#partyReadyDetails"),
   partyTransferList: document.querySelector("#partyTransferList"),
-  partyAutoApplyCheckbox: document.querySelector("#partyAutoApplyCheckbox"),
   penguBridgeLabel: document.querySelector("#penguBridgeLabel"),
   penguLobbyLabel: document.querySelector("#penguLobbyLabel"),
   penguAutoPartyCheckbox: document.querySelector("#penguAutoPartyCheckbox"),
-  applyPartyButton: document.querySelector("#applyPartyButton"),
   partyShareLinkLabel: document.querySelector("#partyShareLinkLabel"),
   copyPartyLinkButton: document.querySelector("#copyPartyLinkButton"),
   partyMembersList: document.querySelector("#partyMembersList"),
@@ -1396,13 +1393,14 @@ const getQueueChampionKey = (skin = {}) => {
   return champion;
 };
 
-const removeQueuedSkinsForChampion = (championKey, exceptKey = "") => {
+const removeQueuedSkinsForChampion = (championKey, exceptKey = "", options = {}) => {
   if (!championKey) return 0;
   const normalizedExceptKey = normalizeSkinKey(exceptKey);
   let removed = 0;
   [...state.queuedSkins].forEach((queuedKey) => {
     if (queuedKey === exceptKey || normalizeSkinKey(queuedKey) === normalizedExceptKey) return;
     const queuedSkin = getSkinByKey(queuedKey);
+    if (options.preserveUserCustomMods && isUserCustomSkin(queuedSkin)) return;
     if (queuedSkin && getQueueChampionKey(queuedSkin) === championKey) {
       state.queuedSkins.delete(queuedKey);
       state.penguSessionQueuedSkins.delete(queuedKey);
@@ -1417,7 +1415,11 @@ const queueSkinKey = (key, options = {}) => {
   const skin = getSkinByKey(key);
   if (!skin) return { queued: false, replaced: 0 };
   const canonicalKey = getSkinKey(skin);
-  const replaced = options.preserveExistingChampion ? 0 : removeQueuedSkinsForChampion(getQueueChampionKey(skin), canonicalKey);
+  const replaced = options.preserveExistingChampion
+    ? 0
+    : removeQueuedSkinsForChampion(getQueueChampionKey(skin), canonicalKey, {
+      preserveUserCustomMods: options.sessionSource === "pengu"
+    });
   [...state.queuedSkins].forEach((queuedKey) => {
     if (normalizeSkinKey(queuedKey) === normalizeSkinKey(canonicalKey) && queuedKey !== canonicalKey) {
       state.queuedSkins.delete(queuedKey);
@@ -5406,7 +5408,7 @@ const getPartyReadiness = () => {
 
 const maybeAutoApplyParty = () => {
   const readiness = getPartyReadiness();
-  if (!state.partyAutoApply || partyAutoApplyTriggered || !readiness.allReady || state.importingQueue || getPartyApplyKeys().length === 0) return;
+  if (partyAutoApplyTriggered || !readiness.allReady || state.importingQueue || getPartyApplyKeys().length === 0) return;
   partyAutoApplyTriggered = true;
   applyPartyQueue();
 };
@@ -5590,8 +5592,8 @@ const renderParty = () => {
   if (els.partyReadyDetails) {
     els.partyReadyDetails.textContent = connected
       ? state.overlayRunning
-        ? "Deten el overlay activo antes de usar Aplicar party."
-        : `${readyMembers}/${members.length} miembro(s) listos. ${state.partyAutoApply ? "Auto-ejecutar esta activado." : "Auto-ejecutar apagado."}`
+        ? "Deten el overlay activo para que Party pueda aplicar la siguiente sincronizacion."
+        : `${readyMembers}/${members.length} miembro(s) listos. Party se ejecuta automaticamente al terminar sync.`
       : "Enable Party Mode para generar tu token.";
   }
   if (els.partyShareLinkLabel) {
@@ -5610,8 +5612,6 @@ const renderParty = () => {
   if (els.joinPartyButton) els.joinPartyButton.disabled = !connected || state.partyStatus === "connecting";
   if (els.leavePartyButton) els.leavePartyButton.disabled = !connected;
   if (els.copyPartyLinkButton) els.copyPartyLinkButton.disabled = !state.partyLink;
-  if (els.applyPartyButton) els.applyPartyButton.disabled = !allReady || state.importingQueue || (getPartySharedKeys().length === 0 && getPartyPeerExtraMods().length === 0);
-  if (els.partyAutoApplyCheckbox) els.partyAutoApplyCheckbox.checked = state.partyAutoApply;
   if (els.partyTransferList) {
     const transfers = [...partyTransferStatus.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 5);
     els.partyTransferList.innerHTML = transfers.length
@@ -6143,7 +6143,7 @@ const renderCompactLauncher = () => {
     state.presets.map((preset) => `<option value="${escapeHtml(preset.id)}">${escapeHtml(preset.name)} (${preset.skinKeys.length})</option>`).join("");
   if (els.compactStatusLabel) {
     els.compactStatusLabel.textContent = partyConnected
-      ? "Party activa: usa Aplicar party para ejecutar la combinacion sincronizada."
+      ? "Party activa: se ejecuta automaticamente cuando todos terminan de sincronizar."
       : `${selectedCount} mod(s) en cola${state.activePresetId ? " - preset activo disponible" : ""}.`;
   }
   if (els.compactOverlayPill) {
@@ -6152,7 +6152,7 @@ const renderCompactLauncher = () => {
   }
   if (els.compactRunButton) {
     els.compactRunButton.disabled = partyConnected || selectedCount === 0 || state.importingQueue || state.overlayRunning;
-    els.compactRunButton.title = partyConnected ? "Party activa: usa Aplicar party." : "";
+    els.compactRunButton.title = partyConnected ? "Party activa: aplicacion automatica al terminar sync." : "";
   }
 };
 
@@ -6188,7 +6188,7 @@ const renderSelectionTray = () => {
     const miniList = bar.querySelector(".selection-mini-list");
 
     applyButton.textContent = partyConnected
-      ? "Usa Apply Party"
+      ? "Party auto"
       : selectedCount
         ? state.overlayRunning
           ? "Overlay activo"
@@ -6196,7 +6196,7 @@ const renderSelectionTray = () => {
         : "Sin skins";
     applyButton.disabled = partyConnected || selectedCount === 0 || state.importingQueue || state.overlayRunning;
     applyButton.title = partyConnected
-      ? "Party activa: usa Aplicar party para aplicar la cola sincronizada."
+      ? "Party activa: se aplica automaticamente cuando todos estan listos."
       : state.overlayRunning
         ? "Deten el overlay antes de ejecutar otra vez."
         : "";
@@ -7654,7 +7654,7 @@ const applyQueuedSkins = async (skinKeysOverride = null, options = {}) => {
   if (isPartyConnected() && !isPartyApply) {
     setOverlayPanelStatus({
       label: "Party activa",
-      message: "Usa Aplicar party para ejecutar la seleccion sincronizada."
+      message: "Party ejecuta automaticamente la seleccion sincronizada cuando todos estan listos."
     });
     renderSelectionTray();
     renderCompactLauncher();
@@ -8733,15 +8733,6 @@ const bindEvents = () => {
 
   els.leavePartyButton?.addEventListener("click", () => {
     leaveParty();
-  });
-
-  els.applyPartyButton?.addEventListener("click", applyPartyQueue);
-
-  els.partyAutoApplyCheckbox?.addEventListener("change", (event) => {
-    state.partyAutoApply = event.target.checked;
-    localStorage.setItem("riftAtlas:partyAutoApply", state.partyAutoApply ? "1" : "0");
-    partyAutoApplyTriggered = false;
-    renderParty();
   });
 
   els.penguAutoPartyCheckbox?.addEventListener("change", (event) => {
