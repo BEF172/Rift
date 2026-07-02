@@ -11,6 +11,15 @@ use tauri::{AppHandle, Emitter, Manager};
 static LAST_LOCKS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
 static LOCAL_CELL_ID: Mutex<Option<u64>> = Mutex::new(None);
 
+fn reset_champ_select_lock_tracking() {
+    if let Ok(mut locks) = LAST_LOCKS.lock() {
+        *locks = None;
+    }
+    if let Ok(mut cell_id) = LOCAL_CELL_ID.lock() {
+        *cell_id = None;
+    }
+}
+
 // =============================================================================
 // LCU Monitor — Rose-style direct WAMP WebSocket connection + health monitor
 //
@@ -104,6 +113,9 @@ pub async fn start(handle: AppHandle) {
                     *state.current_gameflow_phase.lock().await = ph.clone();
                     broadcast_phase(&handle, &ph, &prev).await;
                     crate::overlay::check_cleanup(&handle, &ph, &prev).await;
+                    if ph != "ChampSelect" {
+                        reset_champ_select_lock_tracking();
+                    }
 
                     // Reset SwiftPlay state when leaving relevant phases
                     if prev != ph {
@@ -462,6 +474,9 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                     *state.current_gameflow_phase.lock().await = phase.to_string();
                     broadcast_phase(handle, phase, &prev).await;
                     crate::overlay::check_cleanup(handle, phase, &prev).await;
+                    if phase != "ChampSelect" {
+                        reset_champ_select_lock_tracking();
+                    }
                 }
             }
         }
@@ -514,11 +529,10 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                                     }
                                 }
                                 let _ = handle.emit("pengu:message", serde_json::json!({
-                                    "type": "skin-sync",
-                                    "payload": {
-                                        "selectedSkinId": skin_id,
-                                        "cellId": local_cell,
-                                    },
+                                    "type": "lcu-selection-state",
+                                    "selectedSkinId": skin_id,
+                                    "championId": player.get("championId").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    "cellId": local_cell,
                                     "source": "lcu-ws",
                                 }));
                             }

@@ -3095,7 +3095,7 @@ const getLeagueClientReadyState = async () => {
   };
 };
 
-const getRosePenguConfigPath = () => path.join(getAppDataDir(), "Rose", "config.ini");
+const getRosePenguConfigPath = () => path.join(process.env.LOCALAPPDATA || getAppDataDir(), "Rift Atlas", "Rose", "config.ini");
 
 const setIniValue = (content, section, key, value) => {
   const lines = String(content || "").replace(/^\uFEFF/, "").split(/\r?\n/);
@@ -3339,7 +3339,13 @@ const getPenguLoaderActivationStatus = async (executablePath) => {
 const runPenguLoaderCli = async (executablePath, args = []) =>
   execFileText(executablePath, args, {
     cwd: path.dirname(executablePath),
-    timeout: 30000
+    timeout: 30000,
+    env: {
+      ...process.env,
+      // ROSE-Pengu hardcodes its config dir under %LOCALAPPDATA%\Rose.
+      // Point LOCALAPPDATA at Rift Atlas so it writes to Rift Atlas\Rose.
+      LOCALAPPDATA: path.join(process.env.LOCALAPPDATA || "", "Rift Atlas")
+    }
   });
 
 const launchPenguLoader = async ({ allowElevation = false, requireLeagueReady = false, source = "manual" } = {}) => {
@@ -5733,7 +5739,14 @@ const execToolWithTimeout = (command, args, timeout, options = {}) => {
       reject(new Error(runToken.reason || "Ejecucion cancelada por el usuario."));
       return;
     }
-    const proc = spawn(command, args, { windowsHide: true, ...spawnOptions });
+    const spawnEnv = { ...process.env, ...spawnOptions.env };
+    // mod-tools.exe (Rose/cslol-manager) hardcodes its data dir under
+    // %LOCALAPPDATA%\Rose. By pointing LOCALAPPDATA at Rift Atlas we force it
+    // to use Rift Atlas\Rose and avoid creating a second Rose folder.
+    if (path.basename(command).toLowerCase() === "mod-tools.exe") {
+      spawnEnv.LOCALAPPDATA = path.join(process.env.LOCALAPPDATA || "", "Rift Atlas");
+    }
+    const proc = spawn(command, args, { windowsHide: true, ...spawnOptions, env: spawnEnv });
     runToken?.processes?.add(proc);
     let stdout = "";
     let stderr = "";

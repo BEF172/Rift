@@ -13,6 +13,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
+use zip::ZipArchive;
 
 static PENGU_PLUGIN_RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -34,6 +35,11 @@ pub async fn wait_for_lcu_finalization_threshold(
     threshold_ms: u64,
 ) -> Result<serde_json::Value, String> {
     gameflow::wait_for_finalization_threshold(threshold_ms).await
+}
+
+#[tauri::command]
+pub async fn check_champion_lock() -> Result<serde_json::Value, String> {
+    gameflow::check_champion_lock().await
 }
 
 #[tauri::command]
@@ -454,6 +460,60 @@ pub async fn select_bocchi_dll(app: AppHandle) -> Result<String, String> {
     std::fs::copy(&selected, &installed_dll)
         .map_err(|e| format!("Error copiando DLL a engine/tools: {}", e))?;
     Ok(installed_dll.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn prepare_skin_mod(skin_key: String, state: State<'_, AppState>) -> Result<String, String> {
+    let path = std::path::PathBuf::from(&skin_key);
+    if !path.exists() {
+        return Err(format!("Mod file not found: {}", skin_key));
+    }
+    let app_dir = state.app_data_dir.lock().await.clone();
+    let mods_cache_dir = std::path::PathBuf::from(&app_dir).join("cache").join("mods-prepared");
+    std::fs::create_dir_all(&mods_cache_dir)
+        .map_err(|e| format!("Error creating mods cache dir: {}", e))?;
+    let _metadata = std::fs::metadata(&path)
+        .map_err(|e| format!("Error reading mod file: {}", e))?;
+    // Rose: extraer el .fantome al seleccionar (no al inyectar)
+    let extract_dir = mods_cache_dir.join(path.file_stem().unwrap_or_default());
+    if !extract_dir.join(".extracted").exists() {
+        std::fs::create_dir_all(&extract_dir)
+            .map_err(|e| format!("Error creating extract dir: {}", e))?;
+        // El .fantome es un ZIP, extraerlo
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("Error opening mod: {}", e))?;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|e| format!("Error reading mod zip: {}", e))?;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)
+                .map_err(|e| format!("Error reading zip entry {}: {}", i, e))?;
+            if entry.is_dir() {
+                let dir_path = extract_dir.join(entry.name());
+                std::fs::create_dir_all(&dir_path)
+                    .map_err(|e| format!("Error creating extract dir {}: {}", dir_path.display(), e))?;
+            } else {
+                let file_path = extract_dir.join(entry.name());
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("Error creating parent dir: {}", e))?;
+                }
+                let mut output = std::fs::File::create(&file_path)
+                    .map_err(|e| format!("Error creating extract file: {}", e))?;
+                std::io::copy(&mut entry, &mut output)
+                    .map_err(|e| format!("Error extracting file: {}", e))?;
+            }
+        }
+        // Mark as extracted
+        std::fs::write(extract_dir.join(".extracted"), b"ok")
+            .map_err(|e| format!("Error writing extract marker: {}", e))?;
+        overlay::append_overlay_log(&format!("[Rose] Mod extraido: {} -> {}", skin_key, extract_dir.display()));
+    }
+    let dest = mods_cache_dir.join(path.file_name().unwrap_or_default());
+    if !dest.exists() {
+        std::fs::copy(&path, &dest)
+            .map_err(|e| format!("Error caching mod file: {}", e))?;
+    }
+    Ok(dest.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -5025,10 +5085,12 @@ fn get_rose_config_path() -> PathBuf {
     crate::writable_data_dir().join("Rose").join("config.ini")
 }
 
-/// Try to create a directory junction from the legacy `%LOCALAPPDATA%\Rose`
-/// to `%LOCALAPPDATA%\Rift Atlas\Rose` so that external binaries (e.g.
-/// cslol-dll.dll) can still find shared data via the old path.
-fn ensure_rose_junction() {
+/// Migrate any data from the legacy `%LOCALAPPDATA%\Rose` folder into our
+/// unified `%LOCALAPPDATA%\Rift Atlas\Rose` folder. After a successful copy we
+/// delete the old folder (or rename it to `Rose.old` if something still holds
+/// it open). We no longer create a junction here so Rift Atlas only owns one
+/// Rose data directory.
+fn migrate_rose_data() {
     #[cfg(windows)]
     {
         let old_root = std::env::var_os("LOCALAPPDATA")
@@ -5042,31 +5104,62 @@ fn ensure_rose_junction() {
         let old_path = old_root.join("Rose");
         let new_path = our_root.join("Rose");
 
-        if old_path.exists() {
-            // Already exists — nothing to do
+        if !old_path.exists() {
             return;
         }
-        // Ensure target exists first
-        std::fs::create_dir_all(&new_path).ok();
-        // Try junction via cmd.exe mklink /J
-        let result = std::process::Command::new("cmd")
-            .arg("/c")
-            .arg("mklink")
-            .arg("/J")
-            .arg(&old_path)
-            .arg(&new_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match result {
-            Ok(status) if status.success() => {
-                eprintln!("[RoseJunction] Creado junction: {} -> {}",
-                    old_path.display(), new_path.display());
+
+        // If the old path is already a junction/symlink pointing at new_path,
+        // leave it alone.
+        if let (Ok(old_canon), Ok(new_canon)) = (
+            std::fs::canonicalize(&old_path),
+            std::fs::canonicalize(&new_path),
+        ) {
+            if old_canon == new_canon {
+                return;
             }
-            _ => {
-                eprintln!("[RoseJunction] No se pudo crear junction en {} (puede que necesite permisos de admin)",
-                    old_path.display());
+        }
+
+        fn copy_dir_no_overwrite(
+            src: &std::path::Path,
+            dst: &std::path::Path,
+        ) -> std::io::Result<()> {
+            std::fs::create_dir_all(dst)?;
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let src_path = entry.path();
+                let dst_path = dst.join(entry.file_name());
+                if src_path.is_dir() {
+                    copy_dir_no_overwrite(&src_path, &dst_path)?;
+                } else if !dst_path.exists() {
+                    std::fs::copy(&src_path, &dst_path)?;
+                }
             }
+            Ok(())
+        }
+
+        if let Err(error) = copy_dir_no_overwrite(&old_path, &new_path) {
+            eprintln!(
+                "[RoseMigrate] Error copiando {} -> {}: {}",
+                old_path.display(),
+                new_path.display(),
+                error
+            );
+            return;
+        }
+
+        if std::fs::remove_dir_all(&old_path).is_ok() {
+            eprintln!("[RoseMigrate] Migrado y eliminado: {}", old_path.display());
+        } else if std::fs::rename(&old_path, new_path.with_extension("old")).is_ok() {
+            eprintln!(
+                "[RoseMigrate] Migrado y renombrado a {}.old: {}",
+                new_path.display(),
+                old_path.display()
+            );
+        } else {
+            eprintln!(
+                "[RoseMigrate] Migrado pero no se pudo eliminar/renombrar: {}",
+                old_path.display()
+            );
         }
     }
 }
@@ -5316,7 +5409,7 @@ pub fn pengu_startup_init(app_dir: &str, token_dir: &str) {
         "[PenguStartup] INICIO app_dir={} token_dir={}",
         app_dir, token_dir
     );
-    ensure_rose_junction();
+    migrate_rose_data();
     // Search order: app_dir first (production), then token_dir/writable_data (dev/downloads)
     let executable_path = {
         let loader_dir_app = PathBuf::from(app_dir).join(PENGU_LOADER_DIR);

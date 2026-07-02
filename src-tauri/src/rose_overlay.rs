@@ -1,4 +1,4 @@
-use crate::{junction, overlay, AppState};
+use crate::{gameflow, junction, overlay, AppState};
 use std::collections::HashSet;
 
 use std::path::{Path, PathBuf};
@@ -278,6 +278,10 @@ fn start_runoverlay(
         .arg("--opts:configless")
         .current_dir(tools_dir);
 
+    // Force mod-tools.exe to use Rift Atlas\Rose instead of AppData\Local\Rose.
+    let app_data = crate::writable_data_dir().to_string_lossy().to_string();
+    command.env("LOCALAPPDATA", &app_data);
+
     command.stdout(Stdio::null()).stderr(Stdio::null());
 
     #[cfg(windows)]
@@ -336,6 +340,21 @@ fn build_overlay(
     if paths.is_empty() {
         return Err("No hay mods para construir el overlay.".to_string());
     }
+
+    // Rose: reemplazar .fantome paths con directorios pre-extraidos (preparados
+    // por prepareSkinMod al seleccionar la skin, no al inyectar).
+    let prepped_dir = PathBuf::from(app_dir).join("cache").join("mods-prepared");
+    let paths: Vec<String> = paths.iter().map(|path| {
+        let p = PathBuf::from(path);
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            let extract_dir = prepped_dir.join(stem);
+            if extract_dir.join(".extracted").exists() {
+                overlay::append_overlay_log(&format!("[Rose] Usando mod pre-extraido: {} -> {}", path, extract_dir.display()));
+                return extract_dir.to_string_lossy().to_string();
+            }
+        }
+        path.clone()
+    }).collect();
 
     let injection_root = PathBuf::from(app_dir).join("engine").join("injection");
     let mods_dir = injection_root.join("mods");
@@ -475,8 +494,8 @@ pub async fn run_rose_overlay_v2(
     // Si el early monitor no puede suspender (Vanguard/anti-cheat), proceder igual tras 5s.
     {
         let wait_start = std::time::Instant::now();
-        let hard_timeout = std::time::Duration::from_secs(90);
-        let soft_timeout = std::time::Duration::from_secs(5);
+        let hard_timeout = std::time::Duration::from_secs(120);
+        let soft_timeout = std::time::Duration::from_secs(15);
         loop {
             let suspended = state.early_monitor_pid.lock()
                 .map(|g| g.is_some())
@@ -497,14 +516,49 @@ pub async fn run_rose_overlay_v2(
                 );
             }
             if wait_start.elapsed() >= soft_timeout {
-                overlay::append_overlay_log(
-                    "[Engine] Early monitor no pudo suspender (probable anti-cheat). Procediendo sin suspension (estilo Rose)."
+                overlay::stop_early_monitor(
+                    &state.early_monitor_active,
+                    &state.early_monitor_pid,
+                    &state.early_monitor_runoverlay_started,
                 );
-                break;
+                *state.active_overlay_run.lock().await = false;
+                return Err(
+                    "Early monitor no pudo suspender League; abortando inyeccion.".to_string()
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
+
+    // Rose-style: forzar la seleccion LCU ANTES de construir el overlay. Si el
+    // usuario cambio de skin (ej. Callejera -> Embrujada), esto asegura que el
+    // LCU refleje el objetivo correcto y el overlay no herede un ID stale.
+    if let (Some(champion_id), Some(selected_skin_id)) = (
+        payload.get("championId").and_then(|value| value.as_u64()),
+        payload.get("selectedSkinId").and_then(|value| value.as_u64()),
+    ) {
+        if champion_id > 0 && selected_skin_id > 0 {
+            overlay::append_overlay_log(&format!(
+                "[Engine] Forzando LCU skin antes de mkoverlay: champion={} skin={}",
+                champion_id, selected_skin_id
+            ));
+            match gameflow::force_selected_skin(champion_id, selected_skin_id).await {
+                Ok(force_result) => {
+                    overlay::append_overlay_log(&format!(
+                        "[Engine] LCU force result: {}",
+                        serde_json::to_string(&force_result).unwrap_or_default()
+                    ));
+                }
+                Err(error) => {
+                    overlay::append_overlay_log(&format!(
+                        "[Engine] LCU force fallo (continuando): {}",
+                        error
+                    ));
+                }
+            }
+        }
+    }
+
     let payload_for_build = payload.clone();
     let result = match tokio::task::spawn_blocking(move || {
         build_overlay(&payload_for_build, &app_dir, &rose_mod_tools)

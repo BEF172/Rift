@@ -549,6 +549,24 @@
   }
 
   function readCurrentSkin() {
+    // Rose reads the visible skin label directly. Do this before relying on
+    // carousel offset classes, which can lag while the carousel animates.
+    for (const selector of [".skin-name-text", ".skin-name"]) {
+      const nodes = document.querySelectorAll(selector);
+      if (!nodes.length) continue;
+      let candidate = null;
+      nodes.forEach((node) => {
+        const name = node.textContent.trim();
+        if (!name) return;
+        if (isVisible(node)) {
+          candidate = name;
+        } else if (!candidate) {
+          candidate = name;
+        }
+      });
+      if (candidate) return candidate;
+    }
+
     const centerItem = document.querySelector(".skin-selection-item.skin-carousel-offset-2");
     if (centerItem) {
       const centerSelectors = [
@@ -660,13 +678,31 @@
       dbg(`skin-sync-base-suppressed:${forcedBaseSyncSuppression.baseSkinId}`);
       return;
     }
-    sendBridgePayload({
-      type: "skin-sync",
-      skin: stableName,
-      originalName: stableName,
-      championId: lastWsChampId,
-      timestamp: Date.now()
-    });
+    // Rose-style: enviar solo el nombre textual del DOM. El backend resuelve
+    // la skin a partir de este nombre usando el catalogo LCU. NO enviamos
+    // championId ni selectedSkinId aqui, porque si el LCU aun no actualizo el
+    // ID (skin no owned / animacion del carrusel), esos IDs pueden ser stale y
+    // sobrescribir el nombre correcto.
+    // Usamos un debounce muy corto (100ms) para no saturar con frames intermedios.
+    const debounceMs = 100;
+    const captureName = String(skinName || "").trim();
+    logHoverDebounceTimer = setTimeout(() => {
+      logHoverDebounceTimer = null;
+      const currentName = String(readCurrentSkin() || "").trim();
+      const explicitName = captureName || logHoverLastSkin || stableName;
+      // Rose treats the visible carousel text as the authoritative skin. If
+      // the DOM changed during the debounce window, send that latest value
+      // instead of the stale name captured by an older event.
+      const finalName = currentName || explicitName;
+      if (!finalName) return;
+      logHoverLastSkin = finalName;
+      sendBridgePayload({
+        type: "skin-sync",
+        skin: finalName,
+        originalName: finalName,
+        timestamp: Date.now()
+      });
+    }, debounceMs);
   }
 
   function logHover(skinName) {
@@ -885,10 +921,6 @@
 
     dispatchLcuSelectionState(championId, skinId, { name });
 
-    // Emitir siempre una instantanea nueva cuando cambia el ID. Antes se
-    // omitia si el MutationObserver ya habia visto el mismo nombre.
-    scheduleStableSkinSync(name || logHoverLastSkin);
-
     if (name && name !== lastLoggedSkin) {
       lastLoggedSkin = name;
       logHover(name);
@@ -1050,7 +1082,6 @@
       }
 
       dispatchLcuSelectionState(championId, skinId, { name });
-      scheduleStableSkinSync(name || logHoverLastSkin);
 
       if (name && name !== lastLoggedSkin) {
         lastLoggedSkin = name;

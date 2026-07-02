@@ -299,6 +299,55 @@ pub async fn force_selected_skin(
     }))
 }
 
+/// Rose-style: check if the local player's champion is locked in champ select.
+/// Returns { championId, selectedSkinId } or 0s if not locked.
+pub async fn check_champion_lock() -> Result<serde_json::Value, String> {
+    let lockfile = match read_lockfile() {
+        Some(lf) => lf,
+        None => return Ok(serde_json::json!({"championId": 0, "selectedSkinId": 0})),
+    };
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| format!("LCU client: {}", e))?;
+    let response = client
+        .get(lcu_url(&lockfile, "/lol-champ-select/v1/session"))
+        .header("Authorization", lcu_auth(&lockfile))
+        .send()
+        .await
+        .map_err(|e| format!("LCU session: {}", e))?;
+    if !response.status().is_success() {
+        return Ok(serde_json::json!({"championId": 0, "selectedSkinId": 0}));
+    }
+    let session: serde_json::Value = response.json().await.map_err(|e| format!("LCU json: {}", e))?;
+    let local_cell = session.get("localPlayerCellId").and_then(|v| v.as_i64()).unwrap_or(0);
+    if local_cell == 0 {
+        return Ok(serde_json::json!({"championId": 0, "selectedSkinId": 0}));
+    }
+    // Find completed pick action for local cell
+    if let Some(actions) = session.get("actions").and_then(|v| v.as_array()) {
+        for round in actions {
+            if let Some(round_arr) = round.as_array() {
+                for action in round_arr {
+                    let actor = action.get("actorCellId").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if actor != local_cell { continue; }
+                    let completed = action.get("completed").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if completed {
+                        let champion_id = action.get("championId").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let selected_skin_id = action.get("selectedSkinId").and_then(|v| v.as_u64()).unwrap_or(0);
+                        return Ok(serde_json::json!({
+                            "championId": champion_id,
+                            "selectedSkinId": selected_skin_id
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({"championId": 0, "selectedSkinId": 0}))
+}
+
 /// Rose-style countdown ticker: polls LCU timer to set/resync a local
 /// monotonic deadline, fires when remaining <= threshold.
 ///

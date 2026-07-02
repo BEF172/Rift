@@ -96,10 +96,14 @@ const RIFT_ATLAS_API = {
   waitForLcuFinalizationThreshold: (thresholdMs) => invoke("wait_for_lcu_finalization_threshold", {
     thresholdMs: Number(thresholdMs) || 500,
   }),
+  checkChampionLock: () => invoke("check_champion_lock"),
   resolveLeagueSkinPackage: (championId, skinId, baseSkinId) => invoke("resolve_league_skin_package", {
     championId: Number(championId) || 0,
     skinId: Number(skinId) || 0,
     baseSkinId: Number(baseSkinId) || null,
+  }),
+  prepareSkinMod: (skinKey) => invoke("prepare_skin_mod", {
+    skinKey,
   }),
 
   // Updates

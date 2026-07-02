@@ -79,6 +79,10 @@ const state = {
   penguApplyLockedKey: "",
   penguApplyLockedAt: 0,
   lastRoseInjectionTime: 0,
+  injectionInProgress: false,
+  penguProcessingLocked: false,
+  selectedCustomMod: null,
+  lastLockedChampionId: 0,
 };
 
 const lcuChampionSkinCache = new Map(); // championId -> Map(full skin/chroma ID -> localized name)
@@ -723,6 +727,16 @@ const resolveSkinLibraryNames = () => {
   });
 };
 
+const cleanupStaleQueueKeys = () => {
+  const staleKeys = [...state.queuedSkins].filter((key) =>
+    !isUserCustomModKey(key) && isDownloadedLeagueSkinsPath(key)
+  );
+  if (staleKeys.length) {
+    staleKeys.forEach((key) => state.queuedSkins.delete(key));
+    saveQueuedSkins();
+  }
+};
+
 const setSkinLibrary = (result) => {
   if (!result) return;
   state.skinLibrary = result.skins || [];
@@ -743,6 +757,7 @@ const setSkinLibrary = (result) => {
   persistLibraryIndex();
   sendPenguSkinCatalog("library-updated");
   syncUserModsFolder("library-updated", { silent: true }).catch(() => null);
+  cleanupStaleQueueKeys();
 };
 
 const clearSkinSelection = () => {
@@ -778,6 +793,20 @@ const clearPenguSessionQueuedSkins = (reason = "game-ended") => {
     state.roseFinalizationCommitted = false;
     state.roseFinalizationApplyStarted = false;
     state.lastHoverWritten = false;
+    // Rose-style: incluso si penguSessionQueuedSkins esta vacio, barrer
+    // queuedSkins en busca de LeagueSkins packages y limpiarlos.
+    // Esto evita que skins compradas queden "pegadas" en la cola cuando
+    // penguSessionQueuedSkins ya fue limpiado previamente.
+    const staleLeagueSkins = [...state.queuedSkins].filter((queuedKey) => {
+      const skin = getSkinByKey(queuedKey);
+      return skin && isDownloadedLeagueSkinsPath(queuedKey) && !isUserCustomModKey(queuedKey);
+    });
+    if (staleLeagueSkins.length) {
+      staleLeagueSkins.forEach((key) => removeQueuedSkinKey(key));
+      saveQueuedSkins();
+      renderSkinLibrary();
+      renderSelectionTray();
+    }
     return false;
   }
 
@@ -897,11 +926,41 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
     window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION apply saltado: fase=${injectPhase} (${reason}).`).catch(() => { });
     return false;
   }
-  // Rose-style cooldown guard: prevent re-injection within threshold window
   const now = Date.now();
   const elapsed = now - state.lastRoseInjectionTime;
   if (state.lastRoseInjectionTime && elapsed < state.skinWriteMs) {
     window.riftAtlas.appendOverlayLog(`[Rose] Cooldown activo (${state.skinWriteMs - elapsed}ms restantes); saltando inyeccion.`).catch(() => { });
+    return false;
+  }
+  // Rose 1:1: si last_hovered_skin_id es None, saltar.
+  // Rose: target_skin_id = selected_custom_mod.get("skin_id", ui_skin_id)
+  // Primero usar la skin resuelta del hover (effectiveSkinId), luego
+  // selectedCustomMod SOLO si su target coincide con el hover.
+  let skinToInject = null;
+  // 1. Usar la skin resuelta via hover (effectiveSkinId) — como Rose usa ui_skin_id
+  if (roseAuthoritativeSelection.effectiveSkinId > 0) {
+    skinToInject = roseAuthoritativeSelection.skinKey ? getSkinByKey(roseAuthoritativeSelection.skinKey) : null;
+  }
+  // 2. selectedCustomMod SOLO si su target coincide con effectiveSkinId (Rose: custom_mod gana)
+  if (skinToInject && state.selectedCustomMod?.skinKey) {
+    const modSkin = getSkinByKey(state.selectedCustomMod.skinKey);
+    if (modSkin && state.queuedSkins.has(getSkinKey(modSkin))) {
+      const modTarget = getOverlayTargetSkinId(modSkin, getSkinSyncChampionNumber(modSkin) || 0);
+      if (modTarget && modTarget === roseAuthoritativeSelection.effectiveSkinId) {
+        skinToInject = modSkin;
+      }
+    }
+  }
+  // Fallback: si no hay hover pero hay selectedCustomMod, usarlo
+  if (!skinToInject && state.selectedCustomMod?.skinKey) {
+    const modSkin = getSkinByKey(state.selectedCustomMod.skinKey);
+    if (modSkin && state.queuedSkins.has(getSkinKey(modSkin))) {
+      skinToInject = modSkin;
+    }
+  }
+  // Rose 1:1: si no hay skin resuelta, saltar
+  if (!skinToInject) {
+    window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION: no hay skin resuelta; saltando inyeccion (Rose: last_hovered_skin_id is None).").catch(() => { });
     return false;
   }
   state.lastHoverWritten = true;
@@ -909,29 +968,21 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
   state.roseFinalizationApplyStarted = true;
   let applied = false;
   try {
-    let payload = roseAuthoritativeSelection.payload || lastPenguSkinSyncPayload || {};
-    const fallbackSkin = roseAuthoritativeSelection.skinKey ? getSkinByKey(roseAuthoritativeSelection.skinKey) : null;
-    const resolved = await resolveRoseAuthoritativeSkinEntry(payload, fallbackSkin);
-    payload = resolved.payload || payload;
-    const skin = resolved.skin;
-    if (skin) {
-      lastPenguSkinSyncPayload = { ...payload };
-      // Rose-style: force LCU skin at ticker fire time (inside inject_skin,
-      // after extraction, before mkoverlay/runoverlay). This ensures the PATCH
-      // happens at the last possible moment, avoiding races where the LCU
-      // resets selectedSkinId between preforce and overlay building.
-      await maybeForceLeagueSkinForOverlay(skin, payload);
-      applied = Boolean(await handlePenguSkinApply({ ...payload, key: getSkinKey(skin), type: payload.type || "loadout-finalization" }));
-      if (applied) state.lastRoseInjectionTime = Date.now();
-      return applied;
+    // Rose 1:1: usar la skin ya resuelta. NO re-resolver.
+    const skin = skinToInject;
+    if (!skin) {
+      window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION: skin resuelta no encontrada en libreria.").catch(() => { });
+      return false;
     }
-    window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION sin una skin solicitada y resuelta; no se reutiliza la seleccion anterior.").catch(() => { });
-    return false;
+    const payload = roseAuthoritativeSelection.payload || lastPenguSkinSyncPayload || {};
+    lastPenguSkinSyncPayload = { ...payload };
+    await maybeForceLeagueSkinForOverlay(skin, payload);
+    applied = Boolean(await handlePenguSkinApply({ ...payload, key: getSkinKey(skin), type: payload.type || "loadout-finalization" }));
+    if (applied) state.lastRoseInjectionTime = now;
+    return applied;
   } finally {
     if (!applied) {
-      state.lastHoverWritten = false;
-      state.roseFinalizationCommitted = false;
-      await stopRoseEarlyMonitor("finalization-no-apply");
+      window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION: inyeccion no aplicada (Rose: no resetea estado en fallo).").catch(() => { });
     }
     state.roseFinalizationApplyStarted = false;
   }
@@ -1063,6 +1114,10 @@ const handlePenguPhaseChange = (payload = {}) => {
       lastPenguLcuSelection = null;
       lastPenguSkinSyncPayload = null;
       clearRoseAuthoritativeSelection();
+      state.selectedCustomMod = null;
+      lastPenguChromaSelection = null;
+      lastPenguChromaPanel = null;
+      cleanupStaleQueueKeys();
       lastPenguSkinSyncKey = "";
       lastPenguSkinSyncAt = 0;
       state.roseFinalizationApplyStarted = false;
@@ -1077,6 +1132,36 @@ const handlePenguPhaseChange = (payload = {}) => {
       state.currentTicker = 0;
       clearPenguApplyLock();
       startRoseLocalFinalizationTicker();
+      // Rose: start the early suspend monitor as soon as we enter ChampSelect so
+      // the game is already frozen when FINALIZATION begins. This prevents the
+      // race where League starts loading before we can suspend it.
+      startRoseEarlyMonitor("ChampSelect");
+      // Rose: dual detection for champion lock (polling LCU + WS). Poll the LCU
+      // session every 2s until either champion-locked arrives or lock confirmed.
+      if (!state.penguChampionLocked && window.riftAtlas.checkChampionLock) {
+        const pollLock = async () => {
+          if (state.penguChampionLocked) return;
+          try {
+            const result = await window.riftAtlas.checkChampionLock();
+            const champId = Number(result?.championId || 0);
+            const skinId = Number(result?.selectedSkinId || 0);
+            if (champId && skinId) {
+              state.penguChampionLocked = true;
+              state.lastLockedChampionId = champId;
+              window.riftAtlas.appendOverlayLog(`[Rose] Lock detectado via polling LCU: champion ${champId} skin ${skinId} (Rose: dual detection).`).catch(() => { });
+              if (lastPenguSkinSyncPayload) {
+                handlePenguSkinSync(lastPenguSkinSyncPayload).catch(() => {});
+              }
+              return;
+            }
+          } catch (error) {
+            window.riftAtlas.appendOverlayLog(`[Rose] Polling lock fallo: ${error.message || error}`).catch(() => { });
+          }
+          // Retry in 2s
+          setTimeout(pollLock, 2000);
+        };
+        setTimeout(pollLock, 2000);
+      }
     }
   }
   if (GAMEFLOW_ACTIVE_PHASES.has(phase)) {
@@ -1345,6 +1430,36 @@ const queueSkinKey = (key, options = {}) => {
   } else {
     state.penguSessionQueuedSkins.delete(canonicalKey);
   }
+  // Rose-style: selected_custom_mod solo se actualiza desde seleccion explicita
+  // del usuario en la UI, no desde skin-syncs automaticos de Pugu.
+  if (!isDownloadedLeagueSkinsPath(canonicalKey) && options.sessionSource !== "pengu") {
+    const championId = getSkinSyncChampionNumber(skin);
+    if (championId) {
+      state.selectedCustomMod = { championId, skinKey: canonicalKey };
+    }
+    // Rose-style: preparar mod para inyeccion mas rapida (extraer al seleccionar, no al inyectar)
+    if (window.riftAtlas.prepareSkinMod) {
+      window.riftAtlas.prepareSkinMod(canonicalKey).catch(() => {});
+    }
+  }
+  // Rose-style: si la skin fue seleccionada desde la app UI (no Pugu),
+  // actualizar roseAuthoritativeSelection para que triggerRoseFinalizationApply
+  // la encuentre (Rose: selected_custom_mod gana sobre ui_skin_id).
+  if (options.sessionSource !== "pengu") {
+    const champId = getSkinSyncChampionNumber(skin);
+    if (champId) {
+      const targetSkinId = getOverlayTargetSkinId(skin, champId);
+      if (targetSkinId) {
+        const uiPayload = {
+          championId: champId,
+          selectedSkinId: targetSkinId,
+          resolvedSkinId: targetSkinId,
+          skin: skin.skin || skin.name || String(targetSkinId),
+        };
+        commitRoseAuthoritativeSelection(uiPayload, skin);
+      }
+    }
+  }
   return { queued: true, replaced, key: canonicalKey };
 };
 
@@ -1367,6 +1482,9 @@ const removeP2PFileIfUnused = async (key = "") => {
 const removeQueuedSkinKey = (key = "") => {
   if (!key || !state.queuedSkins.delete(key)) return false;
   state.penguSessionQueuedSkins.delete(key);
+  if (state.selectedCustomMod?.skinKey === key) {
+    state.selectedCustomMod = null;
+  }
   removeP2PFileIfUnused(key);
   return true;
 };
@@ -2121,9 +2239,13 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
     return;
   }
   const championId = Number(payloadChampionId || skinChampionId || 0);
-  const actualSelection = lastPenguLcuSelection?.championId === championId
-    ? Number(lastPenguLcuSelection.selectedSkinId || 0)
-    : 0;
+  // Rose-style: verificar stale de lastPenguLcuSelection (>60s o champion mismatch)
+  const lcuSelectionStale = !lastPenguLcuSelection ||
+    lastPenguLcuSelection.championId !== championId ||
+    (Date.now() - lastPenguLcuSelection.at) > 60000;
+  const actualSelection = lcuSelectionStale
+    ? 0
+    : Number(lastPenguLcuSelection.selectedSkinId || 0);
   const selectedSkinId = Number(actualSelection || payload.actualLcuSkinId || 0);
   if (!championId) return true;
 
@@ -2161,6 +2283,41 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
         verifiedSkinId: 0,
         forceError: error?.message || String(error),
       }));
+    // Rose-style: si el comando Rust falla, reintentar via Pengu WebSocket
+    if (!result?.forceOk && window.riftAtlas.sendPenguMessage) {
+      window.riftAtlas.appendOverlayLog(`[Rose] force Rust fallo; reintento via Pengu WebSocket (estilo Rose dos intentos).`).catch(() => { });
+      const forceRequestId = `force-${championId}-${desiredSkinId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const confirmation = new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          pendingPenguForceSkinRequests.delete(forceRequestId);
+          resolve({ forceOk: false, forceError: `Timeout esperando confirmacion LCU para ${desiredSkinId}.` });
+        }, 12000);
+        pendingPenguForceSkinRequests.set(forceRequestId, {
+          resolve: (confirmationResult) => {
+            clearTimeout(timeout);
+            resolve(confirmationResult);
+          }
+        });
+      });
+      const sendResult = await window.riftAtlas.sendPenguMessage?.({
+        type: "force-skin",
+        championId,
+        selectedSkinId: desiredSkinId,
+        targetSkinId,
+        owned: ownedTarget,
+        forceRequestId,
+        reason: ownedTarget ? "owned-skin-overlay" : "unowned-overlay-base-skin"
+      }).catch((error) => ({ sent: false, error: error?.message || String(error) }));
+      const messageSent = sendResult?.sent === true || Number(sendResult?.sent || 0) > 0;
+      if (!messageSent) {
+        pendingPenguForceSkinRequests.get(forceRequestId)?.resolve?.({
+          forceOk: false,
+          forceError: sendResult?.error || "Pengu no esta conectado; no se pudo enviar el cambio de skin."
+        });
+      }
+      result = await confirmation;
+      pendingPenguForceSkinRequests.delete(forceRequestId);
+    }
     // BaseSkinTracker: record confirmation
     window.riftAtlas.appendOverlayLog(`[TrackerDiag] forceLcuSkinSelection result: forceOk=${result?.forceOk} verifiedSkinId=${result?.verifiedSkinId} desiredSkinId=${desiredSkinId}`).catch(() => {});
     if (result?.forceOk && result?.verifiedSkinId === desiredSkinId) {
@@ -2299,6 +2456,30 @@ const getSelectedRoseExtraMods = async () => {
 
 const applyPenguSelectedSkin = async (key = "") => {
   if (!key) return false;
+  // Rose: si hay una inyeccion en curso para una skin DIFERENTE, cancelarla
+  // y arrancar la nueva inmediatamente. Esto evita que la skin vieja se vea
+  // por segundos mientras la nueva se construye.
+  if (state.injectionInProgress && key !== penguBackgroundApplyInFlightKey) {
+    if (penguBackgroundApplyInFlightKey) {
+      window.riftAtlas.appendOverlayLog(`[Rose] Cancelando inyeccion anterior (${penguBackgroundApplyInFlightKey}) para ${key}.`).catch(() => { });
+      if (window.riftAtlas.stopOverlay) {
+        window.riftAtlas.stopOverlay().catch(() => {});
+      }
+      state.overlayRunning = false;
+    }
+  } else if (state.injectionInProgress) {
+    window.riftAtlas.appendOverlayLog(`[Rose] Inyeccion en progreso; espero hasta 2s por la anterior para ${key}.`).catch(() => { });
+    await new Promise((resolve) => {
+      const check = setInterval(() => {
+        if (!state.injectionInProgress) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 100);
+      setTimeout(() => { clearInterval(check); resolve(); }, 2000);
+    });
+  }
+  state.injectionInProgress = true;
   const now = Date.now();
   const applyGen = penguApplyGeneration;
   state.penguApplyLockedKey = key;
@@ -2313,6 +2494,8 @@ const applyPenguSelectedSkin = async (key = "") => {
 
   penguBackgroundApplyKey = key;
   penguBackgroundApplyAt = now;
+  // Rose-style force_disconnect: pausa procesamiento de payloads durante inyeccion
+  state.penguProcessingLocked = true;
   penguBackgroundApplyPromise = penguBackgroundApplyPromise
     .catch(() => null)
     .then(async () => {
@@ -2327,6 +2510,15 @@ const applyPenguSelectedSkin = async (key = "") => {
       if (!skin?.path) {
         window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: skin sin path. key=${key} skin=`, skin).catch(() => { });
         throw new Error("La skin seleccionada no tiene archivo local.");
+      }
+      // Rose-style base skin guard: reject injection for base skins (champion * 1000)
+      const skinChampion = getSkinSyncChampionNumber(skin);
+      if (skinChampion > 0) {
+        const rawSkinId = Number(skin.skinId || skin.fileBaseId || 0);
+        if (!isUserCustomSkin(skin) && rawSkinId === skinChampion * 1000) {
+          window.riftAtlas.appendOverlayLog("[Rose] Base skin detectada; no se inyecta overlay (Rose: ui_skin_id==0 skip).").catch(() => { });
+          return false;
+        }
       }
 
       window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: overlayRunning=${state.overlayRunning} customOverlayPath=${!!state.customOverlayPath} ltkSidecar=${!!state.ltkOverlaySidecarPath} ltkDll=${!!state.ltkOverlayDllPath}`).catch(() => { });
@@ -2380,7 +2572,16 @@ const applyPenguSelectedSkin = async (key = "") => {
       for (const supportEntry of supportEntries) {
         await maybeForceLeagueSkinForOverlay(supportEntry, lateAuthoritativePayload);
       }
-      await maybeForceLeagueSkinForOverlay(penguSkin, lateAuthoritativePayload);
+      // Rose Branch 1: When a custom mod targets an owned skin, Rose does NOT
+      // force the LCU selection — it injects only the custom mod overlay and
+      // returns immediately. The user's LCU selection stays untouched.
+      if (selectedIsCustomSkin && customTargetOwned) {
+        window.riftAtlas.appendOverlayLog(
+          `[Rose] Mod propio para skin owned (target=${customTargetSkinId}); salto force frontend, backend confirmara el target antes de mkoverlay.`
+        ).catch(() => { });
+      } else {
+        await maybeForceLeagueSkinForOverlay(penguSkin, lateAuthoritativePayload);
+      }
       if (key !== penguBackgroundApplyKey) {
         window.riftAtlas.appendOverlayLog(`[Diagnostico] applyPenguSelectedSkin: cancelado por seleccion mas nueva ${penguBackgroundApplyKey}`).catch(() => { });
         return false;
@@ -2416,11 +2617,22 @@ const applyPenguSelectedSkin = async (key = "") => {
         gamePath: state.leagueGamePath,
         skinEntries: selectedEntries,
         extraMods,
-        roseMode: true
+        roseMode: true,
+        // Rose-style: enviamos el ID objetivo al backend para que fuerce la
+        // seleccion LCU ANTES de mkoverlay. Esto evita que una skin previa
+        // (ej. Callejera) quede "pegada" cuando cambiamos a otra (Embrujada).
+        championId: championIdForOwnedCheck,
+        selectedSkinId: targetSkinId
       });
+      if (result?.success) {
+        state.lastHoverWritten = true;
+        state.lastRoseInjectionTime = Date.now();
+      }
       return Boolean(result?.success);
     })
     .finally(async () => {
+      state.injectionInProgress = false;
+      state.penguProcessingLocked = false;
       if (penguBackgroundApplyInFlightKey === key) {
         penguBackgroundApplyInFlightKey = "";
       }
@@ -2622,17 +2834,6 @@ const getSkinSyncTokens = (value = "") =>
     .split(/\s+/)
     .filter((token) => token.length > 1);
 
-const tokenSimilarity = (left = "", right = "") => {
-  const leftTokens = new Set(getSkinSyncTokens(left));
-  const rightTokens = new Set(getSkinSyncTokens(right));
-  if (!leftTokens.size || !rightTokens.size) return 0;
-  let shared = 0;
-  leftTokens.forEach((token) => {
-    if (rightTokens.has(token)) shared += 1;
-  });
-  return (2 * shared) / (leftTokens.size + rightTokens.size);
-};
-
 const levenshteinSimilarity = (left = "", right = "") => {
   const a = normalizeSkinSyncText(left);
   const b = normalizeSkinSyncText(right);
@@ -2733,6 +2934,41 @@ const resolveSkinSyncPayloadWithLcu = async (payload = {}) => {
     });
   }
 
+  // Rose-style: para skin-sync, el nombre del DOM es la fuente de verdad.
+  // NO usamos selectedSkinId del payload porque puede ser stale (skin no owned,
+  // animacion del carrusel, eco del force anterior). Para chroma-selection u
+  // otros eventos con ID explicito, si permitimos el atajo por ID.
+  const isNameDrivenSync = payload.type === "skin-sync" && !payload.chromaId && !payload.selectedChromaId;
+  const syntheticSkin = parseSyntheticSkinSyncText(payload.skin || payload.originalName || "");
+  if (
+    isNameDrivenSync &&
+    syntheticSkin?.skinId &&
+    (!syntheticSkin.championId || syntheticSkin.championId === championId) &&
+    skinMap.has(String(syntheticSkin.skinId))
+  ) {
+    const resolvedBaseSkinId = Number(skinMap.baseSkinByChroma?.get(syntheticSkin.skinId) || syntheticSkin.skinId);
+    return attachResolvedPackage({
+      ...payload,
+      resolvedSkinId: syntheticSkin.skinId,
+      resolvedBaseSkinId,
+      resolvedSkinName: skinMap.get(String(syntheticSkin.skinId)),
+      resolutionSource: "lcu-synthetic"
+    });
+  }
+  if (!isNameDrivenSync) {
+    const explicitSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
+    if (explicitSkinId && skinMap.has(String(explicitSkinId))) {
+      const baseSkinId = Number(skinMap.baseSkinByChroma?.get(explicitSkinId) || payload.baseSkinId || 0);
+      return attachResolvedPackage({
+        ...payload,
+        resolvedSkinId: explicitSkinId,
+        resolvedBaseSkinId: Number(skinMap.baseSkinByChroma?.get(explicitSkinId) || baseSkinId || 0),
+        resolvedSkinName: skinMap.get(String(explicitSkinId)),
+        resolutionSource: "lcu-direct"
+      });
+    }
+  }
+
   const requestedName = String(payload.skin || payload.originalName || "").trim();
   if (!requestedName) return payload;
   const minimumFullId = championId * 1000;
@@ -2745,10 +2981,7 @@ const resolveSkinSyncPayloadWithLcu = async (payload = {}) => {
   const requestedCandidates = getRoseSkinNameCandidates(requestedName);
   const normalizedRequestedCandidates = requestedCandidates.map(normalizeSkinSyncText).filter(Boolean);
   const isChromaEvent = payload.type === "chroma-selection";
-  const baseCandidates = isChromaEvent
-    ? candidates
-    : candidates.filter((entry) => !skinMap.baseSkinByChroma?.has(entry.id));
-  const pool = baseCandidates.length ? baseCandidates : candidates;
+  const pool = candidates;
 
   // Exact match always wins, including the suffix-stripped chroma form.
   for (const requestedCandidate of normalizedRequestedCandidates) {
@@ -2806,10 +3039,13 @@ const canonicalizePenguSkinPayload = (payload = {}, skin = null) => {
     getSkinSyncChampionNumber(skin || {}) ||
     0
   );
+  const isNameDrivenSync = payload.type === "skin-sync" && !payload.chromaId && !payload.selectedChromaId;
   const requestedSkinId = Number(
     payload.chromaId ||
     payload.selectedChromaId ||
-    payload.resolvedSkinId ||
+    (isNameDrivenSync ? payload.resolvedSkinId : payload.selectedSkinId) ||
+    (isNameDrivenSync ? payload.selectedSkinId : payload.resolvedSkinId) ||
+    payload.skinId ||
     (skin ? getOverlayTargetSkinId(skin, championId) : 0) ||
     0
   );
@@ -2878,9 +3114,13 @@ const resolveRoseAuthoritativeSkinEntry = async (payload = {}, fallbackSkin = nu
   const requestedSkinId = Number(
     resolvedPayload.chromaId ||
     resolvedPayload.selectedChromaId ||
-    resolvedPayload.resolvedSkinId ||
+    (resolvedPayload.type === "skin-sync" && !resolvedPayload.chromaId && !resolvedPayload.selectedChromaId
+      ? resolvedPayload.resolvedSkinId
+      : resolvedPayload.selectedSkinId) ||
+    (resolvedPayload.type === "skin-sync" && !resolvedPayload.chromaId && !resolvedPayload.selectedChromaId
+      ? resolvedPayload.selectedSkinId
+      : resolvedPayload.resolvedSkinId) ||
     resolvedPayload.requestedSkinId ||
-    resolvedPayload.selectedSkinId ||
     resolvedPayload.skinId ||
     0
   );
@@ -3067,15 +3307,29 @@ const getSelectedSkinNumCandidates = (selectedSkinId = 0, championId = 0) => {
   return Number.isFinite(num) ? [num] : [];
 };
 
+const parseSyntheticSkinSyncText = (value = "") => {
+  const raw = String(value || "");
+  const direct = raw.match(/champion\D+(\d+)\D+skin\D+(\d+)/i);
+  if (direct?.[1] && direct?.[2]) {
+    return { championId: Number(direct[1]), skinId: Number(direct[2]) };
+  }
+  const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const compactMatch = compact.match(/champion(\d+)skin(\d+)/);
+  if (compactMatch?.[1] && compactMatch?.[2]) {
+    return { championId: Number(compactMatch[1]), skinId: Number(compactMatch[2]) };
+  }
+  return null;
+};
+
 const getChampionIdFromSkinSyncPayload = (payload = {}) => {
   const explicitChampionId = Number(payload.championId || payload.champion?.id || 0);
   if (Number.isFinite(explicitChampionId) && explicitChampionId > 0) return explicitChampionId;
   const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || payload.baseSkinId || 0);
   if (Number.isFinite(selectedSkinId) && selectedSkinId > 0) return Math.floor(selectedSkinId / 1000);
+  const synthetic = parseSyntheticSkinSyncText(payload.skin || payload.originalName || "");
+  if (synthetic?.championId) return synthetic.championId;
   const skinText = normalizeSkinSyncText(payload.skin || payload.originalName || "");
   if (!skinText) return 0;
-  const syntheticMatch = skinText.match(/\bchampion\s+(\d+)\s+skin\s+\d+\b/);
-  if (syntheticMatch?.[1]) return Number(syntheticMatch[1]);
   const champion = state.champions.find((entry) =>
     skinText === normalizeSkinSyncText(entry.name) ||
     skinText === normalizeSkinSyncText(entry.id)
@@ -3088,63 +3342,6 @@ const isBaseSkinSyncPayload = (payload = {}) => {
   const championId = getChampionIdFromSkinSyncPayload(payload);
   const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || payload.baseSkinId || 0);
   return championId > 0 && selectedSkinId === championId * 1000;
-};
-
-const shouldIgnoreBaseSyncAfterChroma = (payload = {}) => {
-  if (payload.type === "chroma-selection") return false;
-  if (!lastPenguChromaSelection) return false;
-  if (Date.now() - lastPenguChromaSelection.at > 120000) {
-    lastPenguChromaSelection = null;
-    return false;
-  }
-  const championId = getChampionIdFromSkinSyncPayload(payload);
-  if (!championId || championId !== lastPenguChromaSelection.championId) return false;
-  const explicitSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
-  const stickyBaseSkinId = Number(lastPenguChromaSelection.baseSkinId || 0);
-  // An explicit selection of the base skin means the user really left the
-  // chroma. A name-only DOM echo does not: League emits those immediately after
-  // a chroma click and Rose keeps selected_chroma_id authoritative.
-  if (explicitSkinId && stickyBaseSkinId && explicitSkinId === stickyBaseSkinId) {
-    lastPenguChromaSelection = null;
-    return false;
-  }
-  if (lastPenguChromaSelection.skinKey && payload.skin) {
-    const chromaSkin = getSkinByKey(lastPenguChromaSelection.skinKey);
-    if (!chromaSkin) return isBaseSkinSyncPayload(payload);
-    const payloadText = normalizeSkinSyncText(payload.skin || payload.originalName || "");
-    const names = [
-      chromaSkin?.skin,
-      chromaSkin?.name,
-      chromaSkin?.variant,
-      getSkinDisplayName(chromaSkin)
-    ].map(normalizeSkinSyncText).filter(Boolean);
-    if (payloadText && names.length) {
-      const matchesStickyChromaBase = names.some((name) =>
-        name.includes(payloadText) || payloadText.includes(name)
-      );
-      if (!matchesStickyChromaBase) return false;
-      // The DOM payload often has no selectedSkinId (as in the Neeko log). Its
-      // matching base name is still a stale echo and must not replace the
-      // explicit chroma-selection event.
-      return true;
-    }
-  }
-  return isBaseSkinSyncPayload(payload);
-};
-
-const shouldHoldBaseSyncForChromaPanel = (payload = {}) => {
-  if (payload.type === "chroma-selection") return false;
-  if (!lastPenguChromaPanel) return false;
-  const age = Date.now() - lastPenguChromaPanel.at;
-  if (age > 15000) {
-    lastPenguChromaPanel = null;
-    return false;
-  }
-  const championId = getChampionIdFromSkinSyncPayload(payload);
-  if (championId && lastPenguChromaPanel.championId && championId !== lastPenguChromaPanel.championId) {
-    return false;
-  }
-  return lastPenguChromaPanel.open && isBaseSkinSyncPayload(payload);
 };
 
 const findQueuedCustomModForChampionId = (championId = 0) => {
@@ -3171,12 +3368,31 @@ const findQueuedCustomSkinForPenguPayload = (payload = {}) => {
     0
   );
   if (!championId || !targetSkinId) return null;
-  return state.customMods.find((skin) => {
+  // Rose-style: match exacto por targetSkinId entre custom mods encolados
+  const exactMatch = state.customMods.find((skin) => {
     const key = getSkinKey(skin);
     if (!state.queuedSkins.has(key) || isDownloadedLeagueSkinsPath(key)) return false;
     if (getSkinSyncChampionNumber(skin) !== championId) return false;
     return getOverlayTargetSkinId(skin, championId) === targetSkinId;
   }) || null;
+  if (exactMatch) {
+    state.selectedCustomMod = { championId, skinKey: getSkinKey(exactMatch) };
+    return exactMatch;
+  }
+  // Rose-style: si el singleton selectedCustomMod existe para este champion
+  // y EXACTAMENTE coincide con el targetSkinId, usarlo.
+  if (state.selectedCustomMod?.championId === championId) {
+    const singletonSkin = getSkinByKey(state.selectedCustomMod.skinKey);
+    if (singletonSkin && state.queuedSkins.has(getSkinKey(singletonSkin)) &&
+        getSkinSyncChampionNumber(singletonSkin) === championId &&
+        !isDownloadedLeagueSkinsPath(getSkinKey(singletonSkin)) &&
+        getOverlayTargetSkinId(singletonSkin, championId) === targetSkinId) {
+      return singletonSkin;
+    }
+    // Singleton stale, limpiar
+    state.selectedCustomMod = null;
+  }
+  return null;
 };
 
 const findSkinFromPenguSync = (payload = {}) => {
@@ -3186,7 +3402,8 @@ const findSkinFromPenguSync = (payload = {}) => {
   const championId = getChampionIdFromSkinSyncPayload(payload);
 
   const queuedCustomMods = state.customMods.filter((skin) => state.queuedSkins.has(getSkinKey(skin)));
-  const candidates = [...queuedCustomMods, ...state.skinLibrary]
+  const nonQueuedCustomMods = state.customMods.filter((skin) => !state.queuedSkins.has(getSkinKey(skin)));
+  const candidates = [...queuedCustomMods, ...nonQueuedCustomMods, ...state.skinLibrary]
     .filter((skin) => getSkinKey(skin) && skin.path)
     .filter((skin, index, array) => array.findIndex((entry) => getSkinKey(entry) === getSkinKey(skin)) === index);
   if (payload.resolvedPackagePath) {
@@ -3194,14 +3411,19 @@ const findSkinFromPenguSync = (payload = {}) => {
     if (directPackage) return directPackage;
   }
   const resolvedSkinId = Number(payload.resolvedSkinId || 0);
-  const selectedIds = [...new Set([resolvedSkinId, chromaId, selectedSkinId, baseSkinId].filter((value) => Number.isFinite(value) && value > 0))];
+  // Rose-style: para skin-sync, no confiamos en selectedSkinId del payload
+  // porque puede ser stale. Solo usamos IDs que vengan de chroma-selection o
+  // de la resolucion por nombre (resolvedSkinId).
+  const isNameDrivenSync = payload.type === "skin-sync" && !payload.chromaId && !payload.selectedChromaId;
+  const trustedSelectedSkinId = isNameDrivenSync ? 0 : selectedSkinId;
+  const selectedIds = [...new Set([resolvedSkinId, chromaId, trustedSelectedSkinId, baseSkinId].filter((value) => Number.isFinite(value) && value > 0))];
   const skinText = payload.skin || payload.originalName || "";
   const normalizedSkinText = normalizeSkinSyncText(skinText);
   // DOM-only payloads often omit selectedSkinId. Once LCU resolved the name,
   // use that ID to recognize the champion base skin; otherwise a queued paid
   // skin of the same champion can win by name/queue bias (for example "Briar"
   // incorrectly resolving to 233020).
-  const effectiveSelectedSkinId = selectedSkinId || resolvedSkinId;
+  const effectiveSelectedSkinId = trustedSelectedSkinId || resolvedSkinId;
   const isDefaultSelection = effectiveSelectedSkinId > 0 &&
     effectiveSelectedSkinId % 1000 === 0 &&
     chromaId === 0 &&
@@ -3227,8 +3449,23 @@ const findSkinFromPenguSync = (payload = {}) => {
     return null;
   }
 
-  if (championOnlyText && isDefaultSelection) {
-    window.riftAtlas.appendOverlayLog(`[Rose] skin base detectada (championId=${championId || Number(textChampion?.key || 0)}); sin inyeccion (estilo Rose).`).catch(() => { });
+  if (championOnlyText && (isDefaultSelection || selectedSkinId === 0)) {
+    const baseChampionId = championId || Number(textChampion?.key || 0);
+    const baseSkinIdValue = baseChampionId * 1000;
+    // Rose-style: a queued custom mod that targets the champion's base skin
+    // should still be injected. Only skip when no custom base mod is selected.
+    const baseCustomMatch = findQueuedCustomSkinForPenguPayload({
+      ...payload,
+      championId: baseChampionId,
+      resolvedSkinId: baseSkinIdValue,
+      selectedSkinId: baseSkinIdValue,
+      baseSkinId: baseSkinIdValue
+    }) || findQueuedCustomModForChampionId(baseChampionId);
+    if (baseCustomMatch) {
+      window.riftAtlas.appendOverlayLog(`[RoseResolver] mod propio para skin base encontrado: ${getSkinKey(baseCustomMatch)}`).catch(() => { });
+      return baseCustomMatch;
+    }
+    window.riftAtlas.appendOverlayLog(`[Rose] skin base detectada (championId=${baseChampionId}); sin inyeccion (estilo Rose).`).catch(() => { });
     return null;
   }
 
@@ -3250,8 +3487,7 @@ const findSkinFromPenguSync = (payload = {}) => {
       const normalizedName = normalizeSkinSyncText(name);
       if (!normalizedName) return 0;
       if (normalizedName === normalizedSkinText) return 1;
-      if (normalizedName.includes(normalizedSkinText) || normalizedSkinText.includes(normalizedName)) return 0.92;
-      return tokenSimilarity(normalizedSkinText, normalizedName);
+      return levenshteinSimilarity(normalizedSkinText, normalizedName);
     }));
   };
 
@@ -3266,23 +3502,8 @@ const findSkinFromPenguSync = (payload = {}) => {
           .some((num) => idCandidates.has(num));
       });
     });
-    // El DOM y el endpoint de champ select no cambian atomicamente. Si el ID
-    // todavia apunta a Beeko pero el nombre ya dice Embrujada, no aceptar el
-    // match viejo: continuar con la resolucion por nombre al estilo Rose.
-    // However, if the ID match is EXACT (fileBaseId matches the resolved ID),
-    // the LCU-resolved ID is authoritative — bypass the name filter. The skin
-    // name in the library may not be resolved yet if the user doesn't own it.
-    const coherentIdMatches = normalizedSkinText && !championOnlyText
-      ? idMatches.filter((entry) => {
-        if (payloadNameScore(entry) >= 0.85) return true;
-        window.riftAtlas.appendOverlayLog(
-          `[RoseResolver] descarto match por ID incoherente: id=${selectedSkinId || chromaId || resolvedSkinId || "?"} nombre="${skinText}" candidato="${entry.skin || entry.name || getSkinKey(entry)}"`
-        ).catch(() => { });
-        return false;
-      })
-      : idMatches;
-    if (coherentIdMatches.length > 1) {
-      coherentIdMatches.sort((a, b) => {
+    if (idMatches.length > 1) {
+      idMatches.sort((a, b) => {
         const aPackageId = Number(a.fileBaseId || 0);
         const bPackageId = Number(b.fileBaseId || 0);
         const preferredId = resolvedSkinId || chromaId || selectedSkinId;
@@ -3296,22 +3517,20 @@ const findSkinFromPenguSync = (payload = {}) => {
         return bIsChroma - aIsChroma;
       });
     }
-    const byId = coherentIdMatches.find((skin) => !state.queuedSkins.has(getSkinKey(skin))) || coherentIdMatches[0];
+    const byId = idMatches.find((skin) => !state.queuedSkins.has(getSkinKey(skin))) || idMatches[0];
     if (byId) return byId;
+    // Rose-style: cuando tenemos un ID explicito (selectedSkinId o resolvedSkinId)
+    // y NO hay ningun match por ID, NO caemos en busqueda por nombre.
+    if (effectiveSelectedSkinId > 0) {
+      window.riftAtlas.appendOverlayLog(
+        `[RoseResolver] No ID match para effectiveSelectedSkinId=${effectiveSelectedSkinId}; descarto busqueda por nombre para evitar skin equivocada.`
+      ).catch(() => { });
+      return null;
+    }
   }
 
   if (!normalizedSkinText) {
-    const queuedPathMatch = [...state.queuedSkins].find((path) => {
-      const fn = path.split(/[/\\]/).pop().toLowerCase().replace(/\.(fantome|zip|wad|rse)$/, "");
-      const tokens = getSkinSyncTokens(fn);
-      if (!tokens.length) return false;
-      return championId > 0 && tokens.some((t) => t.includes(`champion${championId}`) || championId.toString().includes(t));
-    });
-    if (queuedPathMatch) {
-      const skin = getSkinByKey(queuedPathMatch);
-      if (skin) return skin;
-      return { path: queuedPathMatch, name: queuedPathMatch.split(/[/\\]/).pop() };
-    }
+    // Rose: no hay nombre de skin, no se puede resolver.
     return null;
   }
 
@@ -3332,31 +3551,20 @@ const findSkinFromPenguSync = (payload = {}) => {
       const normalizedName = normalizeSkinSyncText(name);
       if (!normalizedName) return 0;
       if (normalizedName === normalizedSkinText) return 1;
-      if (normalizedName.includes(normalizedSkinText) || normalizedSkinText.includes(normalizedName)) return 0.92;
-      return tokenSimilarity(normalizedSkinText, normalizedName);
+      return levenshteinSimilarity(normalizedSkinText, normalizedName);
     }));
-    const scoreWithQueueBias = score + (state.queuedSkins.has(getSkinKey(entry)) ? 0.08 : 0);
-    if (scoreWithQueueBias > bestScore) {
-      bestScore = scoreWithQueueBias;
+    if (score > bestScore) {
+      bestScore = score;
       best = entry;
     }
   };
 
   candidates.forEach(matchAgainst);
 
-  if (bestScore < 0.85) {
-    const queuedPaths = [...state.queuedSkins].filter((path) => !getSkinByKey(path));
-    for (const path of queuedPaths) {
-      const fn = path.split(/[/\\]/).pop().toLowerCase().replace(/\.(fantome|zip|wad|rse)$/, "");
-      const normalizedFn = normalizeSkinSyncText(fn);
-      if (normalizedSkinText.includes(normalizedFn) || normalizedFn.includes(normalizedSkinText)) {
-        const entry = getSkinByKey(path) || { path, name: fn, skin: fn, champion: "Custom" };
-        matchAgainst(entry);
-      }
-    }
+  if (bestScore < 0.4) {
   }
 
-  return bestScore >= 0.85 ? best : null;
+  return bestScore >= 0.4 ? best : null;
 };
 
 const hasContradictoryChampionOnlyPayload = (payload = {}) => {
@@ -3389,8 +3597,14 @@ const scheduleAutoApplyQueuedFromPengu = (reason = "queue-selected") => {
   }, 150);
 };
 
-const shouldDeferPenguApplyToFinalization = () =>
-  ["ChampSelect", "FINALIZATION"].includes(String(state.penguGameflowPhase || ""));
+const shouldDeferPenguApplyToFinalization = () => {
+  // Rose-style: durante ChampSelect/FINALIZATION no inyectar inmediatamente.
+  // Esperar al threshold de FINALIZATION para evitar inyectar skins de hover
+  // o frames intermedios del carrusel. Las aplicaciones manuales desde la UI
+  // usan applyQueuedSkins, no este camino.
+  const phase = String(state.penguGameflowPhase || "");
+  return phase === "ChampSelect" || phase === "FINALIZATION";
+};
 
 const queuePenguSelectionForFinalization = async (payload, key) => {
   const deferred = shouldDeferPenguApplyToFinalization();
@@ -3406,15 +3620,12 @@ const queuePenguSelectionForFinalization = async (payload, key) => {
   // Rose-style: do NOT force LCU skin here. The PATCH happens at FINALIZATION
   // threshold inside triggerRoseFinalizationApply, same as Rose's _force_owned_skin
   // which is called synchronously inside inject_skin (after extraction, before mkoverlay).
+  // Rose-style: inyeccion inmediata durante ChampSelect (como Rose trigger_injection).
+  // Solo diferir a FINALIZATION para que el ticker maneje el threshold.
   if (deferred) {
     window.riftAtlas.appendOverlayLog(
-      `[Rose] Seleccion actualizada durante ${state.penguGameflowPhase}; inyeccion diferida al ticker local monotonic de ${state.skinWriteMs}ms.`
+      `[Rose] Seleccion actualizada durante FINALIZATION; inyeccion diferida al ticker local monotonic de ${state.skinWriteMs}ms.`
     ).catch(() => { });
-    // Rose-style: do NOT start the monitor here. Rose starts the monitor in
-    // inject_skin_immediately() — when injection ACTUALLY happens (at the
-    // FINALIZATION threshold), not when the skin sync first arrives. Starting
-    // too early wastes monitor lifetime and causes it to exit before League.exe
-    // appears. The monitor starts in applyPenguSelectedSkin instead.
   }
   return handlePenguSkinApply({ ...preparedPayload, key: finalKey, apply: !deferred });
 };
@@ -3433,12 +3644,71 @@ async function handlePenguSkinSync(payload = {}) {
   if (payload.skin || payload.championId || payload.selectedSkinId || payload.skinId) {
     lastPenguSkinSyncPayload = { ...payload };
   }
-  if (payload.type === "skin-sync" && !state.penguChampionLocked && state.penguGameflowPhase !== "FINALIZATION") {
-    return;
+  // Rose-style gate: si champion no esta locked y no es FINALIZATION, bloquear.
+  // Pero en ChampSelect, permitir si el payload tiene datos de champion (fallback
+  // para cuando el mensaje champion-locked se pierde — Rose gate #4).
+  if (payload.type === "skin-sync" && !state.penguChampionLocked) {
+    // Rose gate #4: ChampSelect con locked_champ_id seteado (reconnect window)
+    if (state.penguGameflowPhase === "ChampSelect" && state.lastLockedChampionId > 0) {
+      const payloadChampion = getChampionIdFromSkinSyncPayload(payload);
+      if (!payloadChampion || payloadChampion !== state.lastLockedChampionId) return;
+    } else if (state.penguGameflowPhase !== "FINALIZATION") {
+      // Rose: si el gate bloquea, revertir al payload anterior para no
+      // almacenar un skin-sync stale de antes del lock que luego seria
+      // replayeado por champion-locked.
+      lastPenguSkinSyncPayload = previousSkinSyncPayload;
+      return;
+    }
   }
   if (syncGen !== penguSkinSyncGeneration) {
     window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync descartado por champion exchange (gen ${syncGen} != ${penguSkinSyncGeneration})`).catch(() => { });
     return;
+  }
+  // Rose-style injection disconnect: pausa procesamiento de payloads durante inyeccion.
+  // Si el payload entrante es una seleccion DIFERENTE a la que esta inyectando,
+  // cancelamos la anterior para no quedar pegados con la skin equivocada.
+  if (state.penguProcessingLocked && state.penguGameflowPhase !== "FINALIZATION") {
+    const incomingName = normalizeSkinSyncText(payload.skin || payload.originalName || "");
+    const currentName = normalizeSkinSyncText(
+      previousSkinSyncPayload?.resolvedSkinName ||
+      previousSkinSyncPayload?.skin ||
+      previousSkinSyncPayload?.originalName ||
+      ""
+    );
+    const incomingSkinId = Number(payload.selectedSkinId || payload.skinId || payload.resolvedSkinId || 0);
+    const previousSkinId = Number(previousSkinSyncPayload?.selectedSkinId || previousSkinSyncPayload?.skinId || previousSkinSyncPayload?.resolvedSkinId || 0);
+    const sameSelection = incomingName && currentName && incomingName === currentName &&
+      (!incomingSkinId || !previousSkinId || incomingSkinId === previousSkinId);
+    if (sameSelection) {
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync descartado por processingLocked (misma seleccion en curso)`).catch(() => { });
+      return;
+    }
+    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync diferente durante apply; limpiando locks para permitir cambio a ${payload.skin || incomingSkinId || "?"}`).catch(() => { });
+    penguBackgroundApplyKey = "";
+    penguBackgroundApplyInFlightKey = "";
+    clearPenguApplyLock();
+    state.injectionInProgress = false;
+    state.penguProcessingLocked = false;
+    state.lastHoverWritten = false;
+  }
+
+  // Si la seleccion cambio respecto a la anterior, limpiar lastHoverWritten
+  // para que FINALIZATION pueda re-inyectar la nueva skin.
+  if (payload.type === "skin-sync" && previousSkinSyncPayload) {
+    const incomingName = normalizeSkinSyncText(payload.skin || payload.originalName || "");
+    const previousName = normalizeSkinSyncText(
+      previousSkinSyncPayload.resolvedSkinName ||
+      previousSkinSyncPayload.skin ||
+      previousSkinSyncPayload.originalName ||
+      ""
+    );
+    const incomingSkinId = Number(payload.selectedSkinId || payload.skinId || payload.resolvedSkinId || 0);
+    const previousSkinId = Number(previousSkinSyncPayload.selectedSkinId || previousSkinSyncPayload.skinId || previousSkinSyncPayload.resolvedSkinId || 0);
+    if ((incomingName && previousName && incomingName !== previousName) ||
+        (incomingSkinId && previousSkinId && incomingSkinId !== previousSkinId)) {
+      state.lastHoverWritten = false;
+      window.riftAtlas.appendOverlayLog(`[Diagnostico] seleccion cambiada; limpiando lastHoverWritten para permitir re-inyeccion en FINALIZATION`).catch(() => { });
+    }
   }
 
   if (
@@ -3456,12 +3726,18 @@ async function handlePenguSkinSync(payload = {}) {
       previousSkinSyncPayload?.originalName ||
       ""
     );
+    // Rose: si el selectedSkinId cambio, no es una repeticion canonica.
+    // El nombre puede ser el mismo pero el ID de sesion LCU cambio.
+    const incomingSelectedSkinId = Number(payload.selectedSkinId || 0);
+    const previousSelectedSkinId = Number(previousSkinSyncPayload?.selectedSkinId || 0);
+    const selectedSkinIdChanged = incomingSelectedSkinId > 0 && incomingSelectedSkinId !== previousSelectedSkinId;
     const repeatsCanonicalSelection = Boolean(
       previousSkinSyncPayload?.canonical &&
       incomingName &&
       currentName &&
       incomingName === currentName &&
-      (!incomingChampionId || !currentChampionId || incomingChampionId === currentChampionId)
+      (!incomingChampionId || !currentChampionId || incomingChampionId === currentChampionId) &&
+      !selectedSkinIdChanged
     );
     if (repeatsCanonicalSelection) {
       // Keep the richer canonical snapshot. Critically, never clear the latest
@@ -3472,6 +3748,30 @@ async function handlePenguSkinSync(payload = {}) {
       // the same cached selection; resolving it through LCU again only delays
       // the threshold and can make the force happen after ChampSelect closes.
       return;
+    }
+  }
+
+  // Rose: si la skin entrante NO es un chroma de la skin actual, limpiar
+  // el chroma sticky y el panel (Rose: selected_chroma_id = None cuando
+  // se selecciona una skin base diferente).
+  if (lastPenguChromaSelection && payload.type !== "chroma-selection") {
+    const newSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
+    const oldChromaId = lastPenguChromaSelection.chromaId;
+    const oldBaseId = lastPenguChromaSelection.baseSkinId;
+    if (newSkinId && oldChromaId && oldBaseId) {
+      const isChromaOfOldSkin = newSkinId > oldBaseId && newSkinId < oldBaseId + 100;
+      const isOldChromaOfNewSkin = oldChromaId > newSkinId && oldChromaId < newSkinId + 100;
+      if (!isChromaOfOldSkin && !isOldChromaOfNewSkin) {
+        lastPenguChromaSelection = null;
+        window.riftAtlas.appendOverlayLog(`[Diagnostico] chroma limpiado: nueva skin ${newSkinId} no es chroma de la anterior (base=${oldBaseId} chroma=${oldChromaId})`).catch(() => { });
+      }
+    }
+  }
+  // Rose: limpiar chroma panel si la skin cambio
+  if (lastPenguChromaPanel && payload.type !== "chroma-selection") {
+    const newSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
+    if (newSkinId && lastPenguChromaPanel.skinId && newSkinId !== lastPenguChromaPanel.skinId) {
+      lastPenguChromaPanel = null;
     }
   }
 
@@ -3489,21 +3789,23 @@ async function handlePenguSkinSync(payload = {}) {
       };
       window.riftAtlas.appendOverlayLog(`[Diagnostico] chroma sticky activo: championId=${championId} chromaId=${chromaId}`).catch(() => { });
     }
-  } else if (shouldIgnoreBaseSyncAfterChroma(payload)) {
-    lastPenguSkinSyncPayload = previousSkinSyncPayload;
-    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync base ignorado porque hay chroma reciente: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin || ""}`).catch(() => { });
-    return;
-  } else if (shouldHoldBaseSyncForChromaPanel(payload)) {
-    lastPenguSkinSyncPayload = previousSkinSyncPayload;
-    window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync base ignorado porque el panel de chromas esta abierto: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin || ""}`).catch(() => { });
-    return;
   } else if (isBaseSkinSyncPayload(payload)) {
-    await new Promise((resolve) => setTimeout(resolve, 750));
-    if (shouldIgnoreBaseSyncAfterChroma(payload) || shouldHoldBaseSyncForChromaPanel(payload)) {
-      lastPenguSkinSyncPayload = previousSkinSyncPayload;
-      window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync base cancelado tras espera de chroma: championId=${payload.championId} selectedSkinId=${payload.selectedSkinId || payload.skinId} skin=${payload.skin || ""}`).catch(() => { });
+    const baseChampionId = getChampionIdFromSkinSyncPayload(payload);
+    const baseSkinId = Number(payload.selectedSkinId || payload.skinId || payload.baseSkinId || 0);
+    const baseCustomMatch = findQueuedCustomSkinForPenguPayload({
+      ...payload,
+      championId: baseChampionId,
+      resolvedSkinId: baseSkinId,
+      selectedSkinId: baseSkinId,
+      baseSkinId
+    }) || findQueuedCustomModForChampionId(baseChampionId);
+    if (!baseCustomMatch) {
+      // Rose: ignorar base skin echos (skin=champion name). Suelen ser ecos
+      // stale de la sesion LCU que llegan tarde y sobreescriben la seleccion actual.
+      window.riftAtlas.appendOverlayLog(`[Rose] Base skin echo ignorado: selectedSkinId=${payload.selectedSkinId || "?"} skin=${payload.skin || "?"} (Rose: no procesa ecos base).`).catch(() => { });
       return;
     }
+    window.riftAtlas.appendOverlayLog(`[RoseResolver] skin base con mod propio detectada: ${getSkinKey(baseCustomMatch)}.`).catch(() => { });
   }
   if (hasContradictoryChampionOnlyPayload(payload)) {
     window.riftAtlas.appendOverlayLog(`[Diagnostico] skin-sync ignorado por championId/nombre contradictorios: championId=${payload.championId} skin=${payload.skin}`).catch(() => { });
@@ -3566,25 +3868,15 @@ async function handlePenguSkinSync(payload = {}) {
       pendingSkinText === normalizeSkinSyncText(pendingChampion?.id || "")
     );
     if (pendingChampionOnly && pendingIsDefaultSelection) {
-      window.riftAtlas.appendOverlayLog(`[Rose] skin base detectada para championId=${pendingChampionId}; limpiando cola de skins de este champion (estilo Rose: sin inyeccion para skin default).`).catch(() => { });
-      if (pendingChampionId) {
-        const toRemove = [...state.queuedSkins].filter((queuedKey) => {
-          const queuedSkin = getSkinByKey(queuedKey);
-          return queuedSkin && getSkinSyncChampionNumber(queuedSkin) === pendingChampionId;
-        });
-        toRemove.forEach((key) => removeQueuedSkinKey(key));
-        if (toRemove.length) {
-          saveQueuedSkins();
-          renderSkinLibrary();
-          renderSelectionTray();
-        }
-      }
+      window.riftAtlas.appendOverlayLog(`[Rose] skin base detectada para championId=${pendingChampionId}; sin inyeccion (Rose: ui_skin_id==0 skip).`).catch(() => { });
       clearRoseAuthoritativeSelection();
-      lastPenguSkinSyncPayload = previousSkinSyncPayload;
       return;
     }
     window.riftAtlas.appendOverlayLog(`[Diagnostico] NO se encontro skin para: ${payload.skin || payload.selectedSkinId || payload.chromaId || "desconocida"}`).catch(() => { });
     clearRoseAuthoritativeSelection();
+    window.riftAtlas.appendOverlayLog(
+      `[RoseResolver] skin no encontrada: selectedSkinId=${payload.selectedSkinId || "?"} skin=${payload.skin || "?"}; mantengo overlay anterior (estilo Rose: no se limpia estado cuando la skin no se resuelve).`
+    ).catch(() => { });
     window.riftAtlas.appendOverlayLog(
       `[RoseResolver] skin no encontrada: selectedSkinId=${payload.selectedSkinId || "?"} skin=${payload.skin || "?"}; NO se reutiliza la seleccion anterior para evitar aplicar una skin equivocada.`
     ).catch(() => { });
@@ -8192,6 +8484,7 @@ const bindEvents = () => {
       }
       if (payload.type === "dismiss-custom-mod") {
         lastCustomModStateSignature = "";
+        state.selectedCustomMod = null;
         clearRoseAuthoritativeSelection();
         window.riftAtlas.appendOverlayLog("[Rose] custom mod descartado desde el popup de Pengu.").catch(() => { });
         return;
@@ -8212,6 +8505,7 @@ const bindEvents = () => {
       if (payload.type === "champion-locked") {
         state.penguChampionLocked = true;
         const lockedChampionId = Number(payload.championId || 0);
+        state.lastLockedChampionId = lockedChampionId;
         const lockedSelectedSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
         if (lockedChampionId && lockedSelectedSkinId) {
           lastPenguLcuSelection = { championId: lockedChampionId, selectedSkinId: lockedSelectedSkinId, at: Date.now() };
@@ -8226,7 +8520,15 @@ const bindEvents = () => {
         const replayPayload = {
           ...pendingLockedPayload,
           championId: Number(pendingLockedPayload.championId || lockedChampionId || 0) || undefined,
-          selectedSkinId: Number(pendingLockedPayload.selectedSkinId || pendingLockedPayload.skinId || lockedSelectedSkinId || 0) || undefined,
+          // Rose: if the monitor already saw a carousel/DOM skin text, that text
+          // is the source of truth. The lock event can still contain the skin
+          // League selected on entry (for example Neeko Cosplay before the user
+          // moves to Bewitching).
+          selectedSkinId: Number(
+            (pendingLockedPayload.skin || pendingLockedPayload.originalName
+              ? (pendingLockedPayload.selectedSkinId || pendingLockedPayload.skinId || lockedSelectedSkinId)
+              : lockedSelectedSkinId) || 0
+          ) || undefined,
           skin: pendingLockedPayload.skin || pendingLockedPayload.originalName || payload.name || undefined,
           originalName: pendingLockedPayload.originalName || pendingLockedPayload.skin || payload.name || undefined,
         };
@@ -8247,6 +8549,7 @@ const bindEvents = () => {
         penguSkinSyncGeneration += 1;
         penguSkinSyncQueue = Promise.resolve();
         clearRoseAuthoritativeSelection();
+        state.lastLockedChampionId = 0;
         state.roseFinalizationCommitted = false;
         state.roseFinalizationApplyStarted = false;
         state.roseFinalizationSignature = "";
@@ -8267,6 +8570,8 @@ const bindEvents = () => {
         lastPenguChromaSelection = null;
         lastPenguChromaPanel = null;
         state.penguChampionLocked = false;
+        // Rose: en exchange se limpia TODO, incluyendo selected_custom_mod.
+        state.selectedCustomMod = null;
         state.penguSessionQueuedSkins.clear();
         state.queuedSkins.clear();
         saveQueuedSkins();
@@ -9163,7 +9468,7 @@ setTimeout(() => {
   startupDependenciesReady.finally(() => scheduleTutorialAutostart());
 }, 1200);
 refreshOverlayStatus();
-startupDependenciesReady.finally(() => ensureSkinLibraryLoaded().catch(showError));
+startupDependenciesReady.finally(() => ensureSkinLibraryLoaded().catch(showError).finally(cleanupStaleQueueKeys));
 ensureUserModsLoaded().catch(() => null);
 renderBaseOverlayStatus();
 setInterval(refreshOverlayStatus, 3000);

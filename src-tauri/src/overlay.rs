@@ -1123,6 +1123,20 @@ pub fn exec_tool_with_timeout(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Rose-style: mod-tools.exe hardcodes its data dir under %LOCALAPPDATA%\Rose.
+    // By pinning LOCALAPPDATA to our app dir (Rift Atlas) we force it to write
+    // to %LOCALAPPDATA%\Rift Atlas\Rose instead of creating a second Rose folder.
+    let is_mod_tools = Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("mod-tools.exe"))
+        .unwrap_or(false);
+    if is_mod_tools {
+        let app_data = crate::writable_data_dir().to_string_lossy().to_string();
+        builder.env("LOCALAPPDATA", &app_data);
+    }
+
     #[cfg(windows)]
     {
         builder.creation_flags(CREATE_NO_WINDOW);

@@ -786,6 +786,7 @@ pub fn run() {
             commands::get_lcu_champion_skins,
             commands::force_lcu_skin_selection,
             commands::wait_for_lcu_finalization_threshold,
+            commands::check_champion_lock,
             commands::resolve_league_skin_package,
             // File dialogs & mods
             commands::select_mod_folder,
@@ -805,6 +806,7 @@ pub fn run() {
             commands::detect_league_path,
             commands::select_bocchi_sidecar,
             commands::select_bocchi_dll,
+            commands::prepare_skin_mod,
             commands::select_library_preview_image,
             commands::select_skin_library,
             // Library
