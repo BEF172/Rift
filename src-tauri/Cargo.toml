@@ -1,6 +1,6 @@
 [package]
 name = "rift-atlas"
-version = "2.1.6"
+version = "2.1.7"
 description = "Aplicacion de League of Legends basada en Data Dragon."
 authors = ["BEF172"]
 license = "MIT"

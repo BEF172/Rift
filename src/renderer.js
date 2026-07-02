@@ -3441,8 +3441,8 @@ const findQueuedCustomSkinForPenguPayload = (payload = {}) => {
         getOverlayTargetSkinId(singletonSkin, championId) === targetSkinId) {
       return singletonSkin;
     }
-    // Singleton stale, limpiar
-    state.selectedCustomMod = null;
+    // Rose keeps selected_custom_mod as the user's explicit app selection.
+    // A different carousel skin simply means it does not win this payload.
   }
   return null;
 };
@@ -3933,13 +3933,22 @@ async function handlePenguSkinSync(payload = {}) {
       pendingSkinText === normalizeSkinSyncText(pendingChampion?.name || "") ||
       pendingSkinText === normalizeSkinSyncText(pendingChampion?.id || "")
     );
+    const pendingCustomMod = findQueuedCustomModForChampionId(pendingChampionId);
     if (pendingChampionOnly && pendingIsDefaultSelection) {
       window.riftAtlas.appendOverlayLog(`[Rose] skin base detectada para championId=${pendingChampionId}; sin inyeccion (Rose: ui_skin_id==0 skip).`).catch(() => { });
-      clearRoseAuthoritativeSelection();
+      if (!pendingCustomMod) {
+        clearRoseAuthoritativeSelection();
+      }
       return;
     }
     window.riftAtlas.appendOverlayLog(`[Diagnostico] NO se encontro skin para: ${payload.skin || payload.selectedSkinId || payload.chromaId || "desconocida"}`).catch(() => { });
-    clearRoseAuthoritativeSelection();
+    if (!pendingCustomMod) {
+      clearRoseAuthoritativeSelection();
+    } else {
+      window.riftAtlas.appendOverlayLog(
+        `[RoseResolver] skin no encontrada, pero mantengo custom mod seleccionado para championId=${pendingChampionId}: ${getSkinKey(pendingCustomMod)}.`
+      ).catch(() => { });
+    }
     window.riftAtlas.appendOverlayLog(
       `[RoseResolver] skin no encontrada: selectedSkinId=${payload.selectedSkinId || "?"} skin=${payload.skin || "?"}; mantengo overlay anterior (estilo Rose: no se limpia estado cuando la skin no se resuelve).`
     ).catch(() => { });

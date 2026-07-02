@@ -1260,6 +1260,40 @@
     return false;
   }
 
+  function hasChromasForSkin(skinId) {
+    const numericId = getNumericId(skinId);
+    if (!Number.isFinite(numericId) || numericId <= 0) return false;
+    if (numericId % 1000 === 0) return false;
+
+    const stateSkinId = getNumericId(skinMonitorState?.skinId);
+    if (
+      Number.isFinite(stateSkinId) &&
+      stateSkinId === numericId &&
+      skinMonitorState?.canonical === true &&
+      skinMonitorState?.hasChromas === false
+    ) {
+      return false;
+    }
+
+    if (skinChromaCache.has(numericId) && skinChromaCache.get(numericId) === false) {
+      return false;
+    }
+
+    const baseSkinId = chromaParentMap.get(numericId);
+    if (
+      Number.isFinite(baseSkinId) &&
+      skinChromaCache.has(baseSkinId) &&
+      skinChromaCache.get(baseSkinId) === false
+    ) {
+      return false;
+    }
+
+    return Boolean(
+      (Number.isFinite(stateSkinId) && stateSkinId === numericId && skinMonitorState?.hasChromas === true) ||
+      hasKnownChromas(numericId)
+    );
+  }
+
   function registerChromaChildren(baseSkinId, childSkins) {
     const numericBaseId = getNumericId(baseSkinId);
     if (!Number.isFinite(numericBaseId) || !Array.isArray(childSkins)) {
@@ -1919,12 +1953,7 @@
       }
       return;
     }
-    const isDefaultSkin = Number.isFinite(Number(currentSkinId)) && Number(currentSkinId) > 0 && Number(currentSkinId) % 1000 === 0;
-
-    const hasChromas = Boolean(
-      !isDefaultSkin && (skinMonitorState?.hasChromas || hasKnownChromas(currentSkinId))
-      // Note: Mordekaiser (82054), Spirit Blossom Morgana (25080), and HOL skins removed - handled by ROSE-FormsWheel
-    );
+    const hasChromas = hasChromasForSkin(currentSkinId);
 
     // Check if button already exists
     let existingButton = skinItem.querySelector(BUTTON_SELECTOR);
@@ -3383,8 +3412,7 @@
       buttonElement.style.display !== "none" &&
       buttonElement.style.opacity !== "0";
     const hasChromas =
-      skinMonitorState?.hasChromas ||
-      buttonElement._luLastVisibilityState === true;
+      hasChromasForSkin(currentSkinId);
 
     if (!buttonVisible || !hasChromas) {
       log.warn(
@@ -3497,7 +3525,7 @@
           championId,
           skinId: openingSkinId,
           name: skinData?.name || skinMonitorState?.name || null,
-          hasChromas: skinMonitorState?.hasChromas || buttonElement._luLastVisibilityState === true || hasKnownChromas(openingSkinId),
+          hasChromas: hasChromasForSkin(openingSkinId),
         };
         updateChromaButtonColor();
         log.info("[ChromaWheel] Panel context updated from current skin data", {
