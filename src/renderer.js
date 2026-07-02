@@ -880,6 +880,56 @@ const clearPenguApplyLock = () => {
   state.penguApplyLockedAt = 0;
 };
 
+const resetPenguChampionExchangeState = (oldChamp = 0, newChamp = 0, reason = "champion-exchange", options = {}) => {
+  const nextChampionId = Number(newChamp || 0) || 0;
+  const preserveChampionLock = Boolean(options.preserveChampionLock);
+  window.riftAtlas.appendOverlayLog(
+    `[Rose] Champion exchange detectado (${reason}): ${oldChamp || "?"} -> ${newChamp || "?"}. Reseteando estado de inyeccion.`
+  ).catch(() => { });
+  penguApplyGeneration += 1;
+  penguSkinSyncGeneration += 1;
+  penguSkinSyncQueue = Promise.resolve();
+  clearRoseAuthoritativeSelection();
+  if (nextChampionId > 0) {
+    state.lastLockedChampionId = nextChampionId;
+  }
+  state.roseFinalizationCommitted = false;
+  state.roseFinalizationApplyStarted = false;
+  state.roseFinalizationSignature = "";
+  state.lastHoverWritten = false;
+  state.lastRoseInjectionTime = 0;
+  state.loadoutCountdownActive = false;
+  state.loadoutT0 = 0;
+  state.loadoutLeft0Ms = 0;
+  state.lastRemainMs = 0;
+  clearPenguApplyLock();
+  clearRoseFinalizationTimer();
+  penguBackgroundApplyKey = "";
+  penguBackgroundApplyInFlightKey = "";
+  lastPenguSkinSyncPayload = null;
+  lastPenguSkinSyncKey = "";
+  lastPenguSkinSyncAt = 0;
+  lastPenguLcuSelection = null;
+  lastPenguChromaSelection = null;
+  lastPenguChromaPanel = null;
+  state.penguChampionLocked = preserveChampionLock
+    ? state.penguChampionLocked || nextChampionId > 0
+    : false;
+  state.selectedCustomMod = null;
+  state.penguSessionQueuedSkins.clear();
+  state.queuedSkins.clear();
+  saveQueuedSkins();
+  renderSkinLibrary();
+  renderSelectionTray();
+  if (state.overlayRunning && window.riftAtlas.stopOverlay) {
+    window.riftAtlas.stopOverlay().catch(() => { });
+    state.overlayRunning = false;
+  }
+  window.riftAtlas.appendOverlayLog(
+    `[Rose] Exchange: overlay detenido, queued skins limpiados, apply locks reiniciados (gen=${penguApplyGeneration}).`
+  ).catch(() => { });
+};
+
 const startRoseEarlyMonitor = async (reason = "rose") => {
   if (!window.riftAtlas.startEarlyMonitor || !state.leagueGamePath) return false;
   if (["InProgress", "Reconnect"].includes(state.penguGameflowPhase)) return false;
@@ -3644,6 +3694,20 @@ async function handlePenguSkinSync(payload = {}) {
 
   const previousSkinSyncPayload = lastPenguSkinSyncPayload;
   if (payload.skin || payload.championId || payload.selectedSkinId || payload.skinId) {
+    lastPenguSkinSyncPayload = { ...payload };
+  }
+  const payloadChampionForExchange = getChampionIdFromSkinSyncPayload(payload);
+  if (
+    payloadChampionForExchange > 0 &&
+    state.lastLockedChampionId > 0 &&
+    payloadChampionForExchange !== state.lastLockedChampionId &&
+    ["ChampSelect", "FINALIZATION"].includes(String(state.penguGameflowPhase || ""))
+  ) {
+    resetPenguChampionExchangeState(
+      state.lastLockedChampionId,
+      payloadChampionForExchange,
+      "skin-sync-fallback"
+    );
     lastPenguSkinSyncPayload = { ...payload };
   }
   // Rose-style gate: si champion no esta locked y no es FINALIZATION, bloquear.
@@ -8460,7 +8524,16 @@ const bindEvents = () => {
           `;
         }
       } else if (cmd.type === "champion-exchange") {
+        const uiChampionId = Number(cmd.championId || 0);
         window.riftAtlas.appendOverlayLog(`[UiCommand] champion-exchange detectado por main loop.`).catch(() => { });
+        if (!uiChampionId || uiChampionId !== state.lastLockedChampionId || state.queuedSkins.size > 0) {
+          resetPenguChampionExchangeState(
+            state.lastLockedChampionId,
+            uiChampionId || state.lastLockedChampionId,
+            "ui-command",
+            { preserveChampionLock: true }
+          );
+        }
         setOverlayPanelStatus({
           label: "Champion exchange",
           message: "Campeon cambiado, reseteando overlay."
@@ -8503,8 +8576,19 @@ const bindEvents = () => {
         handlePenguPhaseChange(payload);
       }
       if (payload.type === "champion-locked") {
-        state.penguChampionLocked = true;
         const lockedChampionId = Number(payload.championId || 0);
+        if (
+          state.lastLockedChampionId > 0 &&
+          lockedChampionId > 0 &&
+          state.lastLockedChampionId !== lockedChampionId
+        ) {
+          resetPenguChampionExchangeState(
+            state.lastLockedChampionId,
+            lockedChampionId,
+            "champion-locked-fallback"
+          );
+        }
+        state.penguChampionLocked = true;
         state.lastLockedChampionId = lockedChampionId;
         const lockedSelectedSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
         if (lockedChampionId && lockedSelectedSkinId) {
@@ -8544,44 +8628,7 @@ const bindEvents = () => {
       if (payload.type === "champion-exchange") {
         const oldChamp = Number(payload.oldChampionId || 0);
         const newChamp = Number(payload.newChampionId || 0);
-        window.riftAtlas.appendOverlayLog(`[Rose] Champion exchange detectado: ${oldChamp} -> ${newChamp}. Reseteando estado de inyeccion.`).catch(() => { });
-        penguApplyGeneration += 1;
-        penguSkinSyncGeneration += 1;
-        penguSkinSyncQueue = Promise.resolve();
-        clearRoseAuthoritativeSelection();
-        state.lastLockedChampionId = 0;
-        state.roseFinalizationCommitted = false;
-        state.roseFinalizationApplyStarted = false;
-        state.roseFinalizationSignature = "";
-        state.lastHoverWritten = false;
-        state.lastRoseInjectionTime = 0;
-        state.loadoutCountdownActive = false;
-        state.loadoutT0 = 0;
-        state.loadoutLeft0Ms = 0;
-        state.lastRemainMs = 0;
-        clearPenguApplyLock();
-        clearRoseFinalizationTimer();
-        penguBackgroundApplyKey = "";
-        penguBackgroundApplyInFlightKey = "";
-        lastPenguSkinSyncPayload = null;
-        lastPenguSkinSyncKey = "";
-        lastPenguSkinSyncAt = 0;
-        lastPenguLcuSelection = null;
-        lastPenguChromaSelection = null;
-        lastPenguChromaPanel = null;
-        state.penguChampionLocked = false;
-        // Rose: en exchange se limpia TODO, incluyendo selected_custom_mod.
-        state.selectedCustomMod = null;
-        state.penguSessionQueuedSkins.clear();
-        state.queuedSkins.clear();
-        saveQueuedSkins();
-        renderSkinLibrary();
-        renderSelectionTray();
-        if (state.overlayRunning && window.riftAtlas.stopOverlay) {
-          window.riftAtlas.stopOverlay().catch(() => { });
-          state.overlayRunning = false;
-        }
-        window.riftAtlas.appendOverlayLog(`[Rose] Exchange: overlay detenido, queued skins limpiados, apply locks reiniciados (gen=${penguApplyGeneration}).`).catch(() => { });
+        resetPenguChampionExchangeState(oldChamp, newChamp, payload.source || "champion-exchange");
       }
       if (payload.type === "loadout-finalization") {
         handlePenguLoadoutFinalization(payload);

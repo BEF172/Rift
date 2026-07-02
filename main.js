@@ -47,6 +47,9 @@ const penguBridgeClients = new Set();
 let penguAutoActivationTimer = null;
 let penguAutoActivationInFlight = false;
 let penguAutoActivationCompleted = false;
+let penguLastLeagueReadySignature = "";
+let penguLastAutoActivationAt = 0;
+let penguLastBridgeConnectedAt = 0;
 const startupFlags = {
   showTutorial: process.argv.includes("--rift-atlas-show-tutorial")
 };
@@ -3212,9 +3215,9 @@ const ensurePenguProxyInstalled = async (executablePath, leagueClientPath) => {
   try {
     const configPath = await writeRosePenguConfig({ executablePath, leagueClientPath });
     await runPenguLoaderCli(executablePath, ["--set-league-path", leagueClientPath, "--silent"]).catch(() => {});
+    await writePenguActiveFlag();
     const activated = await runPenguLoaderCli(executablePath, ["--force-activate", "--silent"]).then(() => true).catch(() => false);
     if (activated) {
-      await writePenguActiveFlag();
       await cleanupLegacyPenguIFEO();
       const proxyPath = path.join(leagueClientPath, "d3d9.dll");
       return { proxyInstalled: true, proxyPath, configPath, activated, ifeoInstalled: false, method: "force-activate" };
@@ -3348,6 +3351,9 @@ const runPenguLoaderCli = async (executablePath, args = []) =>
     }
   });
 
+const PENGU_BRIDGE_CONNECT_GRACE_MS = 45000;
+const PENGU_REACTIVATION_COOLDOWN_MS = 90000;
+
 const launchPenguLoader = async ({ allowElevation = false, requireLeagueReady = false, source = "manual" } = {}) => {
   const executablePath = await findBundledPenguLoaderExecutable();
   if (!executablePath) {
@@ -3383,9 +3389,9 @@ const launchPenguLoader = async ({ allowElevation = false, requireLeagueReady = 
     } else {
       await appendOverlayLog("[Pengu Loader] No se ejecuto --set-league-path porque no se encontro la carpeta Game de League.").catch(() => { });
     }
+    await writePenguActiveFlag();
     await runPenguLoaderCli(executablePath, ["--force-activate", "--silent"]);
     await cleanupLegacyPenguIFEO();
-    await writePenguActiveFlag();
     const proxyState = await getPenguLoaderActivationStatus(executablePath);
     let restartedClient = false;
     if (restartClient) {
@@ -3656,16 +3662,52 @@ const preparePenguRuntime = async () => {
 };
 
 const tryAutoActivatePenguWhenLeagueReady = async () => {
-  if (penguAutoActivationCompleted || penguAutoActivationInFlight) return;
+  if (penguAutoActivationInFlight) return;
   penguAutoActivationInFlight = true;
   try {
     const executablePath = await findBundledPenguLoaderExecutable();
     if (!executablePath) return;
 
     const readyState = await getLeagueClientReadyState();
-    if (!readyState.ready) return;
+    if (!readyState.ready) {
+      penguAutoActivationCompleted = false;
+      penguLastLeagueReadySignature = "";
+      return;
+    }
 
-    await appendOverlayLog(`[Pengu Loader] League Client detectado estilo Rose. lockfile=${readyState.lockfilePath} client=${readyState.leagueClientPath}`).catch(() => { });
+    const now = Date.now();
+    const readySignature = `${readyState.lockfilePath || ""}|${readyState.leagueClientPath || ""}`;
+    if (readySignature !== penguLastLeagueReadySignature) {
+      penguLastLeagueReadySignature = readySignature;
+      penguAutoActivationCompleted = false;
+      penguLastAutoActivationAt = 0;
+      await appendOverlayLog(`[Pengu Loader] Nueva sesion LCU detectada estilo Rose. lockfile=${readyState.lockfilePath} client=${readyState.leagueClientPath}`).catch(() => { });
+    }
+
+    if (penguBridgeClients.size > 0) {
+      penguAutoActivationCompleted = true;
+      penguLastBridgeConnectedAt = now;
+      return;
+    }
+
+    const bridgeRecentlyDisconnected = penguLastBridgeConnectedAt > 0 &&
+      now - penguLastBridgeConnectedAt < PENGU_BRIDGE_CONNECT_GRACE_MS;
+    if (bridgeRecentlyDisconnected) return;
+
+    const waitingForBridge = penguAutoActivationCompleted &&
+      penguLastAutoActivationAt > 0 &&
+      now - penguLastAutoActivationAt < PENGU_BRIDGE_CONNECT_GRACE_MS;
+    if (waitingForBridge) return;
+
+    const recentlyRetried = penguLastAutoActivationAt > 0 &&
+      now - penguLastAutoActivationAt < PENGU_REACTIVATION_COOLDOWN_MS;
+    if (recentlyRetried) return;
+
+    const reason = penguAutoActivationCompleted
+      ? `bridge no reconecto tras ${Math.round((now - penguLastAutoActivationAt) / 1000)}s`
+      : "League listo sin bridge Pengu";
+    await appendOverlayLog(`[Pengu Loader] Reactivando estilo Rose: ${reason}. lockfile=${readyState.lockfilePath} client=${readyState.leagueClientPath}`).catch(() => { });
+    penguLastAutoActivationAt = now;
     const result = await launchPenguLoader({
       allowElevation: true,
       requireLeagueReady: true,
@@ -3673,7 +3715,7 @@ const tryAutoActivatePenguWhenLeagueReady = async () => {
     });
     penguAutoActivationCompleted = Boolean(result?.activated || result?.proxyInstalled || result?.active);
     if (penguAutoActivationCompleted) {
-      await appendOverlayLog("[Pengu Loader] Auto-activacion estilo Rose completada.").catch(() => { });
+      await appendOverlayLog(`[Pengu Loader] Auto-activacion estilo Rose completada; esperando bridge Pengu. restarted=${result?.restartedClient ? "si" : "no"} method=${result?.method || "?"}`).catch(() => { });
     }
   } catch (error) {
     await appendOverlayLog(`[Pengu Loader] Auto-activacion estilo Rose fallo: ${error.message || error}`).catch(() => { });
@@ -6217,6 +6259,8 @@ const startPenguBridgeServer = () => {
 
   penguBridgeServer.on("connection", (socket, request) => {
     penguBridgeClients.add(socket);
+    penguAutoActivationCompleted = true;
+    penguLastBridgeConnectedAt = Date.now();
     sendPenguBridgeToWindows("pengu:bridge-status", {
       connected: true,
       clients: penguBridgeClients.size,
@@ -6265,6 +6309,9 @@ const startPenguBridgeServer = () => {
 
     socket.on("close", () => {
       penguBridgeClients.delete(socket);
+      if (penguBridgeClients.size === 0) {
+        penguAutoActivationCompleted = false;
+      }
       sendPenguBridgeToWindows("pengu:bridge-status", {
         connected: penguBridgeClients.size > 0,
         clients: penguBridgeClients.size

@@ -109,12 +109,12 @@ impl UiCommand {
         }
     }
 
-    pub fn champion_exchange() -> Self {
+    pub fn champion_exchange(champion_id: Option<i32>) -> Self {
         Self {
             cmd_type: "champion-exchange".into(),
             skin_id: None,
             skin_name: None,
-            champion_id: None,
+            champion_id,
             champion_name: None,
             has_chromas: None,
             chroma_id: None,
@@ -237,7 +237,7 @@ fn process_ui_updates_sync(
 
     // Phase 2: Champion exchange (Rose: champion_exchange_triggered)
     if pending.champion_exchange {
-        let _ = handle.emit("ui:command", UiCommand::champion_exchange());
+        let _ = handle.emit("ui:command", UiCommand::champion_exchange(current_champ_id));
         activity = true;
     }
 

@@ -331,6 +331,8 @@
   const BRIDGE_PORT_STORAGE_KEY = "rift_atlas_bridge_port";
   let lastLoggedSkin = null;
   let championLockAnnounced = false;
+  let lastChampionExchangeSignature = "";
+  let lastChampionExchangeAt = 0;
   let pollTimer = null;
   let observer = null;
   let bridgeSocket = null;
@@ -907,6 +909,12 @@
     const champChanged = championId !== lastWsChampId;
     if (!skinChanged && !champChanged) return;
 
+    const oldChampionId = Number(lastWsChampId || 0);
+    if (champChanged && oldChampionId && championId && oldChampionId !== championId) {
+      sendChampionExchange(oldChampionId, championId, "skin-selector-info");
+      championLockAnnounced = false;
+    }
+
     lastWsSkinId = skinId;
     lastWsChampId = championId;
 
@@ -925,6 +933,22 @@
       lastLoggedSkin = name;
       logHover(name);
     }
+  }
+
+  function sendChampionExchange(oldChampionId, newChampionId, source = "unknown") {
+    const signature = `${oldChampionId}->${newChampionId}`;
+    const now = Date.now();
+    if (signature === lastChampionExchangeSignature && now - lastChampionExchangeAt < 3000) return;
+    lastChampionExchangeSignature = signature;
+    lastChampionExchangeAt = now;
+    sendBridgePayload({
+      type: "champion-exchange",
+      oldChampionId,
+      newChampionId,
+      source,
+      timestamp: now
+    });
+    dbg(`champion-exchange:${signature}:${source}`);
   }
 
   function interceptChampSelectWs() {
@@ -1066,6 +1090,12 @@
       const skinChanged = skinId && skinId !== lastWsSkinId;
       const champChanged = championId !== lastWsChampId;
       if (!skinChanged && !champChanged) return;
+
+      const oldChampionId = Number(lastWsChampId || 0);
+      if (champChanged && oldChampionId && championId && oldChampionId !== championId) {
+        sendChampionExchange(oldChampionId, championId, "session-poll");
+        championLockAnnounced = false;
+      }
 
       lastWsSkinId = skinId;
       lastWsChampId = championId;
