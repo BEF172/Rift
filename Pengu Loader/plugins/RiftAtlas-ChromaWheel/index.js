@@ -1265,33 +1265,18 @@
     if (!Number.isFinite(numericId) || numericId <= 0) return false;
     if (numericId % 1000 === 0) return false;
 
-    const stateSkinId = getNumericId(skinMonitorState?.skinId);
-    if (
-      Number.isFinite(stateSkinId) &&
-      stateSkinId === numericId &&
-      skinMonitorState?.canonical === true &&
-      skinMonitorState?.hasChromas === false
-    ) {
-      return false;
-    }
-
-    if (skinChromaCache.has(numericId) && skinChromaCache.get(numericId) === false) {
-      return false;
-    }
-
-    const baseSkinId = chromaParentMap.get(numericId);
-    if (
-      Number.isFinite(baseSkinId) &&
-      skinChromaCache.has(baseSkinId) &&
-      skinChromaCache.get(baseSkinId) === false
-    ) {
-      return false;
-    }
-
     return Boolean(
-      (Number.isFinite(stateSkinId) && stateSkinId === numericId && skinMonitorState?.hasChromas === true) ||
+      skinMonitorState?.hasChromas ||
       hasKnownChromas(numericId)
     );
+  }
+
+  function normalizeSkinMonitorState(detail) {
+    if (!detail) return null;
+    return {
+      ...detail,
+      hasChromas: Boolean(detail.hasChromas),
+    };
   }
 
   function registerChromaChildren(baseSkinId, childSkins) {
@@ -3966,7 +3951,7 @@
       championId: data.championId || null,
       skinId: effectiveSkinId,
       name: data.name || null,
-      hasChromas: data.hasChromas,
+      hasChromas: Boolean(data.hasChromas),
       canonical: data.canonical === true,
     };
     log.info("[DIAG] skinMonitorState now", JSON.stringify(skinMonitorState));
@@ -4004,7 +3989,7 @@
     }
 
     if (window.__roseSkinState) {
-      skinMonitorState = window.__roseSkinState;
+      skinMonitorState = normalizeSkinMonitorState(window.__roseSkinState);
       maybeInferChampionLockedFromSkinState(skinMonitorState);
 
       // Warm champion data up front so button visibility can recover even if
@@ -4058,7 +4043,7 @@
       const detail = event?.detail;
       emitBridgeLog("skin_state_update", detail || {});
       const prevState = skinMonitorState;
-      skinMonitorState = detail || null;
+      skinMonitorState = normalizeSkinMonitorState(detail);
       maybeInferChampionLockedFromSkinState(skinMonitorState);
 
       // Reset selected chroma data when skin changes (not just chroma selection)
