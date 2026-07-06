@@ -316,6 +316,10 @@ async fn handle_incoming_message(
 
     let received_at = chrono::Utc::now().timestamp_millis();
 
+    // Rose-style skin-sync may arrive without a "type" field (only {skin,...}).
+    let is_rose_skin_sync = msg_type == "skin-sync" ||
+        (msg_type == "unknown" && json.get("skin").is_some() && json.get("type").is_none());
+
     // Log specific message types
     match msg_type {
         "skin-sync" | "skin-apply" | "skin-apply-result" => {
@@ -329,13 +333,18 @@ async fn handle_incoming_message(
             .unwrap_or_default();
             println!("[Pengu Carousel] {}", &short[..short.len().min(1200)]);
         }
-        _ => {}
+        _ => {
+            if is_rose_skin_sync {
+                println!("[Pengu Skin] {}", &text[..text.len().min(500)]);
+            }
+        }
     }
 
     // Rose-style: update UI overlay state from plugin messages
     {
         let overlay = handle.state::<AppState>().ui_overlay.clone();
-        match msg_type {
+        let msg_type_eff = if is_rose_skin_sync { "skin-sync" } else { msg_type };
+        match msg_type_eff {
             "skin-sync" => {
                 if let Ok(mut w) = overlay.write() {
                     if let Some(sid) = json.get("selectedSkinId").or_else(|| json.get("skinId")).and_then(|v| v.as_u64()) {

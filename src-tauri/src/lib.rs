@@ -610,6 +610,7 @@ pub fn run() {
             // Rose-style: wait for LCU to be reachable, then activate Pengu
             // (instead of a fixed 1500ms sleep). This matches Rose's flow:
             // start threads -> wait for WS -> activate Pengu -> init injection.
+            let startup_handle = app.handle().clone();
             let startup_app_dir = app_data.to_string_lossy().to_string();
             let startup_token_dir = writable_data.to_string_lossy().to_string();
             let startup_shutdown_cleanup = state.shutdown_cleanup_started.clone();
@@ -642,10 +643,19 @@ pub fn run() {
                 if startup_shutdown_cleanup.load(Ordering::SeqCst) {
                     return;
                 }
+                match commands::detect_league_path().await {
+                    Ok(result) => {
+                        let _ = startup_handle.emit("app:league-detected", result);
+                    }
+                    Err(e) => {
+                        eprintln!("[Startup] detect_league_path after LCU ready failed: {}", e);
+                    }
+                }
                 commands::pengu_startup_init(&startup_app_dir, &startup_token_dir);
             });
 
             // Auto-activation watcher (checkea League cada 2.5s como Electron)
+            let watcher_handle = app.handle().clone();
             let watcher_app_dir = app_data.to_string_lossy().to_string();
             let watcher_token_dir = writable_data.to_string_lossy().to_string();
             let watcher_shutdown_cleanup = state.shutdown_cleanup_started.clone();
@@ -653,10 +663,29 @@ pub fn run() {
                 let mut interval = tokio::time::interval(std::time::Duration::from_millis(2500));
                 // Skip first tick (immediate), wait for interval
                 interval.tick().await;
+                let mut last_league_signature = String::new();
                 loop {
                     interval.tick().await;
                     if watcher_shutdown_cleanup.load(Ordering::SeqCst) {
                         break;
+                    }
+                    match commands::detect_league_path().await {
+                        Ok(result) => {
+                            if result["detected"].as_bool().unwrap_or(false) {
+                                let signature = format!(
+                                    "{}|{}",
+                                    result["leagueGamePath"].as_str().unwrap_or(""),
+                                    result["leagueClientPath"].as_str().unwrap_or("")
+                                );
+                                if !signature.is_empty() && signature != last_league_signature {
+                                    last_league_signature = signature;
+                                    let _ = watcher_handle.emit("app:league-detected", result);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[PenguAutoAct] detect_league_path failed: {}", e);
+                        }
                     }
                     commands::pengu_try_auto_activate(&watcher_app_dir, &watcher_token_dir);
                 }
@@ -784,6 +813,7 @@ pub fn run() {
             commands::get_champion_build,
             // LCU (Rose-style overlay source of truth)
             commands::get_lcu_champion_skins,
+            commands::get_lcu_owned_skins,
             commands::force_lcu_skin_selection,
             commands::wait_for_lcu_finalization_threshold,
             commands::check_champion_lock,
@@ -883,7 +913,6 @@ pub fn run() {
             commands::on_champ_select_exit,
             commands::get_base_skin_tracker_stats,
             commands::clear_base_skin_tracker_samples,
-            commands::clear_lcu_cache,
             // Debug console
             commands::debug_print,
         ])

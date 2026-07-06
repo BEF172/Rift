@@ -7,8 +7,6 @@ const CSLOL_REPO_API: &str =
 const HITORI_RELEASE_API: &str =
     "https://api.github.com/repos/hitori-rebocchi/hitori-bocchi/releases/latest";
 const LEAGUE_SKINS_REPO_API: &str = "https://api.github.com/repos/Alban1911/LeagueSkins";
-const PENGU_DISTRO_RELEASE_API: &str =
-    "https://api.github.com/repos/PenguLoader/distro/releases/latest";
 const ROSE_PENGU_REPO_API: &str = "https://api.github.com/repos/Tariolle/ROSE-Pengu";
 const MOD_PACKAGE_EXTENSIONS: &[&str] = &[".fantome", ".zip", ".wad", ".wad.client", ".rse"];
 
@@ -55,7 +53,7 @@ where
     let mut file =
         std::fs::File::create(dest).map_err(|e| format!("Error creating file: {}", e))?;
     let mut downloaded = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; 256 * 1024];
 
     loop {
         let read = std::io::Read::read(&mut response, &mut buffer)
@@ -623,10 +621,16 @@ where
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Error creating temp dir: {}", e))?;
 
     let zip_path = temp_dir.join("LeagueSkins.zip");
+    let download_started_at = std::time::Instant::now();
     download_file_with_progress(
         &download_url,
         &zip_path.to_string_lossy(),
         |downloaded, total| {
+            let elapsed = download_started_at.elapsed().as_secs_f64().max(0.001);
+            let bytes_per_second = (downloaded as f64 / elapsed) as u64;
+            let eta_seconds = total
+                .filter(|value| *value > downloaded && bytes_per_second > 0)
+                .map(|value| (value - downloaded).div_ceil(bytes_per_second));
             let percent = total
                 .filter(|value| *value > 0)
                 .map(|value| ((downloaded as f64 / value as f64) * 75.0).round() as u64)
@@ -637,6 +641,8 @@ where
                 "percent": percent.min(75),
                 "downloaded": downloaded,
                 "total": total,
+                "bytesPerSecond": bytes_per_second,
+                "etaSeconds": eta_seconds,
             }));
         },
     )?;
@@ -994,42 +1000,16 @@ where
             )
         }
         Err(_) => {
-            let release = github_api_get(PENGU_DISTRO_RELEASE_API)?;
-            let asset = release["assets"]
-                .as_array()
-                .and_then(|assets| {
-                    assets
-                        .iter()
-                        .find(|a| {
-                            a["name"]
-                                .as_str()
-                                .map(|n| n.to_lowercase().ends_with("portable.zip"))
-                                .unwrap_or(false)
-                        })
-                        .or_else(|| {
-                            assets.iter().find(|a| {
-                                a["name"]
-                                    .as_str()
-                                    .map(|n| n.to_lowercase().ends_with(".zip"))
-                                    .unwrap_or(false)
-                            })
-                        })
-                })
-                .ok_or("No pude encontrar un ZIP de Pengu Loader para descargar.")?;
+            // Fallback: try direct download without API (rate-limit safe)
+            // NEVER fall back to PenguLoader/distro — that installs the wrong Pengu.
+            let branch = "main";
             (
-                release["tag_name"]
-                    .as_str()
-                    .or_else(|| release["name"].as_str())
-                    .unwrap_or("Pengu Loader")
-                    .to_string(),
-                asset["name"]
-                    .as_str()
-                    .unwrap_or("pengu-loader.zip")
-                    .to_string(),
-                asset["browser_download_url"]
-                    .as_str()
-                    .ok_or("No download URL")?
-                    .to_string(),
+                "ROSE-Pengu".to_string(),
+                format!("ROSE-Pengu-{}.zip", branch),
+                format!(
+                    "https://codeload.github.com/Tariolle/ROSE-Pengu/zip/refs/heads/{}",
+                    branch
+                ),
             )
         }
     };

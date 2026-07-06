@@ -61,18 +61,37 @@ pub fn save_paths(league_path: &str, client_path: &str) {
 }
 
 pub fn load_injection_threshold() -> f64 {
-    let ini = read_ini();
-    ini.section(Some("General"))
+    let mut ini = read_ini();
+    let raw_value = ini
+        .section(Some("General"))
         .and_then(|s| s.get("injection_threshold"))
+        .map(|v| v.trim().to_string());
+    let migrated_rose_default = ini
+        .section(Some("General"))
+        .and_then(|s| s.get("injection_threshold_rose_default_migrated"))
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if !migrated_rose_default && matches!(raw_value.as_deref(), Some("0.5" | "0.50")) {
+        ini.with_section(Some("General"))
+            .set("injection_threshold", "0.30")
+            .set("injection_threshold_rose_default_migrated", "1");
+        write_ini(&ini);
+        return 0.3;
+    }
+
+    raw_value
+        .as_deref()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v >= 0.0)
-        .unwrap_or(0.5)
+        .unwrap_or(0.3)
 }
 
 pub fn save_injection_threshold(value: f64) {
     let mut ini = read_ini();
     ini.with_section(Some("General"))
-        .set("injection_threshold", &format!("{:.2}", value));
+        .set("injection_threshold", &format!("{:.2}", value))
+        .set("injection_threshold_rose_default_migrated", "1");
     write_ini(&ini);
 }
 

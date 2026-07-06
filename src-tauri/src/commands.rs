@@ -23,6 +23,11 @@ pub async fn get_lcu_champion_skins(champion_id: u64) -> Result<serde_json::Valu
 }
 
 #[tauri::command]
+pub async fn get_lcu_owned_skins() -> Result<serde_json::Value, String> {
+    gameflow::fetch_owned_skins().await
+}
+
+#[tauri::command]
 pub async fn force_lcu_skin_selection(
     champion_id: u64,
     selected_skin_id: u64,
@@ -4874,24 +4879,8 @@ pub(crate) fn pengu_install_rift_plugin_inner(app_dir: &str) -> Result<serde_jso
     std::fs::create_dir_all(&plugins_dir)
         .map_err(|e| format!("Error creando carpeta plugins: {}", e))?;
 
-    // Replace our complete managed plugin set atomically enough for startup.
-    // This removes stale RiftAtlas plugins left by older builds without touching
-    // third-party Pengu plugins owned by the user.
-    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let managed = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.starts_with("RiftAtlas-"))
-                .unwrap_or(false);
-            if managed && path.is_dir() {
-                std::fs::remove_dir_all(path).ok();
-            }
-        }
-    }
-
     let mut installed_plugins: Vec<String> = Vec::new();
+    let mut source_plugins = std::collections::HashSet::new();
 
     // Read all plugin subdirectories from source
     if let Ok(entries) = std::fs::read_dir(&source_root) {
@@ -4908,15 +4897,29 @@ pub(crate) fn pengu_install_rift_plugin_inner(app_dir: &str) -> Result<serde_jso
             if !plugin_name.starts_with("RiftAtlas-") {
                 continue;
             }
+            source_plugins.insert(plugin_name.clone());
             let plugin_dest = plugins_dir.join(&plugin_name);
-            if plugin_dest.exists() {
-                std::fs::remove_dir_all(&plugin_dest).ok();
-            }
             if let Err(e) = copy_dir_recursive(&path, &plugin_dest) {
                 eprintln!("[PenguPlugin] Error copiando {}: {}", plugin_name, e);
                 continue;
             }
             installed_plugins.push(plugin_name);
+        }
+    }
+
+    // Rose-style runtime sync: overlay current bundled files onto the runtime
+    // directory instead of deleting active plugin folders. Deleting first can
+    // race LeagueClientUx while Pengu is enumerating plugins after a restart.
+    // Only remove managed plugin folders that no longer exist in this build.
+    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(plugin_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if plugin_name.starts_with("RiftAtlas-") && path.is_dir() && !source_plugins.contains(plugin_name) {
+                std::fs::remove_dir_all(path).ok();
+            }
         }
     }
 
@@ -5357,6 +5360,9 @@ pub fn run_pengu_loader_cli(executable_path: &str, args: &[&str]) -> Result<Stri
         .to_path_buf();
     let mut cmd = Command::new(executable_path);
     cmd.args(args).current_dir(&loader_dir);
+    // ROSE-Pengu reads/writes `%LOCALAPPDATA%\Rose` internally. Scope
+    // LOCALAPPDATA to Rift Atlas so it uses `%LOCALAPPDATA%\Rift Atlas\Rose`.
+    cmd.env("LOCALAPPDATA", crate::writable_data_dir());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -6013,9 +6019,4 @@ pub fn get_base_skin_tracker_stats() -> serde_json::Value {
 #[tauri::command]
 pub fn clear_base_skin_tracker_samples() {
     crate::base_skin_tracker::clear_samples();
-}
-
-#[tauri::command]
-pub fn clear_lcu_cache() {
-    crate::gameflow::lcu_cache_clear();
 }

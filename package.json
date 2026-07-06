@@ -1,6 +1,6 @@
 {
   "name": "rift-atlas",
-  "version": "2.1.7",
+  "version": "2.1.8",
   "description": "Aplicacion desktop de League of Legends basada en Data Dragon.",
   "main": "main.js",
   "scripts": {
@@ -13,8 +13,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "setup": "tauri build",
-    "setup:debug": "tauri build --debug"
+    "setup": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$env:TAURI_SIGNING_PRIVATE_KEY=(Get-Content \\\"$env:USERPROFILE\\.tauri\\rift-atlas.key\\\" -Raw); $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD=(Get-Content \\\"$env:USERPROFILE\\.tauri\\rift-atlas.key.password\\\" -Raw); npx tauri build\"",
+    "setup:debug": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$env:TAURI_SIGNING_PRIVATE_KEY=(Get-Content \\\"$env:USERPROFILE\\.tauri\\rift-atlas.key\\\" -Raw); $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD=(Get-Content \\\"$env:USERPROFILE\\.tauri\\rift-atlas.key.password\\\" -Raw); npx tauri build --debug\""
   },
   "keywords": [
     "tauri",

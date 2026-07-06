@@ -304,35 +304,16 @@
   let debugButtonInjected = false;
   let debugButtonObserver = null;
   const SKIN_SELECTORS = [
-    ".skin-selection-item.skin-carousel-offset-2 .skin-name-text",
-    ".skin-selection-item.skin-carousel-offset-2 .skin-name",
-    ".skin-selection-item.skin-carousel-offset-2 .skin-selection-item-name",
-    ".skin-selection-item.skin-carousel-offset-2 .skin-selection-name",
-    ".champion-select .skin-name-text",
-    ".champion-select .skin-name",
-    ".skin-selection-item.skin-carousel-offset-2 [class*='skin-name']",
-    ".skin-selection-item.skin-carousel-offset-2 [class*='SkinName']",
     ".skin-name-text",
-    ".skin-name"
-  ];
-  const SKIN_ALT_SELECTORS = [
-    ".skin-selection-item.skin-carousel-offset-2 .skin-selection-item-name",
-    ".skin-selection-item.skin-carousel-offset-2 .skin-selection-name",
-    ".skin-selection-item.skin-carousel-offset-2 [class*='skin-selection'] [class*='name']",
-    ".skin-selection-item.skin-carousel-offset-2 [class*='skin-selection'] [class*='Name']"
+    ".skin-name",
   ];
   const POLL_INTERVAL_MS = 250;
-  // Rose resynchronizes the FINALIZATION timer every 200 ms.
-  const FLOW_POLL_INTERVAL_MS = 200;
   const RETRY_BASE_MS = 1000;
   const RETRY_MAX_MS = 30000;
   const DISCOVERY_START_PORT = 50000;
   const DISCOVERY_END_PORT = 50010;
   const BRIDGE_PORT_STORAGE_KEY = "rift_atlas_bridge_port";
   let lastLoggedSkin = null;
-  let championLockAnnounced = false;
-  let lastChampionExchangeSignature = "";
-  let lastChampionExchangeAt = 0;
   let pollTimer = null;
   let observer = null;
   let bridgeSocket = null;
@@ -349,14 +330,7 @@
   let lastDebugUpdate = 0;
   let bridgePort = 0;
   let bridgeDiscoveryPromise = null;
-  let lastWsSkinId = null;
-  let lastWsChampId = null;
-  let flowPollTimer = null;
   let lastGameflowPhase = "";
-  let lastAuthoritativePhaseAt = Date.now();
-  let ownedSkinIds = new Set();
-  let ownedSkinFetchAt = 0;
-  let forcedBaseSyncSuppression = null;
   const subscribers = new Map();
   const readyCallbacks = new Set();
 
@@ -531,15 +505,13 @@
     const currentSkin = readCurrentSkin() || "";
     const lastPayload = lastSentPayload ? JSON.stringify(lastSentPayload).slice(0, 300) : "";
     const escape = (v) => String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-    const champId = lastWsChampId;
-    const skId = lastWsSkinId;
     box.innerHTML = `
       <div style="display:flex;justify-content:space-between;margin-bottom:6px;color:#f2d36b;font-weight:700;">
         <span>Rift Atlas</span>
         <span>${escape(new Date().toLocaleTimeString())}</span>
       </div>
       <div><b>monitor:</b> ${monitoring?"on":"off"} | <b>bridge:</b> ${bridgeReady?"ok":"wait("+bridgeQueue.length+")"} | <b>sent:</b> ${sendCount}</div>
-      <div><b>skin:</b> ${escape(currentSkin||"-")} | <b>champ:</b> ${champId??"-"} | <b>skinId:</b> ${skId??"-"}</div>
+      <div><b>skin:</b> ${escape(currentSkin||"-")}</div>
       <div><b>event:</b> ${escape(lastEvent)}</div>
       <div><b>error:</b> ${escape(lastError||"-")}</div>
       <div style="margin-top:4px;word-break:break-word;font-size:11px;color:#9bd9f5;">${escape(lastPayload)}</div>`;
@@ -551,160 +523,64 @@
   }
 
   function readCurrentSkin() {
-    // Rose reads the visible skin label directly. Do this before relying on
-    // carousel offset classes, which can lag while the carousel animates.
-    for (const selector of [".skin-name-text", ".skin-name"]) {
+    // Rose parity: the visible global skin label is the source of truth.
+    // Do not read selected/center carousel items; those can still represent
+    // the owned LCU skin while the main label already shows the hovered skin.
+    for (const selector of SKIN_SELECTORS) {
       const nodes = document.querySelectorAll(selector);
       if (!nodes.length) continue;
+
       let candidate = null;
+
       nodes.forEach((node) => {
         const name = node.textContent.trim();
         if (!name) return;
-        if (isVisible(node)) {
-          candidate = name;
-        } else if (!candidate) {
-          candidate = name;
-        }
+
+        if (isVisible(node)) candidate = name;
+        else if (!candidate) candidate = name;
       });
+
       if (candidate) return candidate;
-    }
-
-    const centerItem = document.querySelector(".skin-selection-item.skin-carousel-offset-2");
-    if (centerItem) {
-      const centerSelectors = [
-        ".skin-name-text",
-        ".skin-name",
-        ".skin-selection-item-name",
-        ".skin-selection-name",
-        "[class*='skin-name']",
-        "[class*='SkinName']",
-        "[class*='name']",
-        "[class*='Name']"
-      ];
-      for (const selector of centerSelectors) {
-        const nodes = centerItem.querySelectorAll(selector);
-        for (const node of nodes) {
-          const name = node.textContent.trim();
-          if (name && name.length > 1 && isVisible(node)) return name;
-        }
-      }
-    }
-
-    for (const selector of SKIN_SELECTORS) {
-      const nodes = document.querySelectorAll(selector);
-      if (nodes.length) {
-        let candidate = null;
-        nodes.forEach((node) => {
-          const name = node.textContent.trim();
-          if (!name) return;
-          if (isVisible(node)) {
-            candidate = name;
-          } else if (!candidate) {
-            candidate = name;
-          }
-        });
-        if (candidate) return candidate;
-      }
-    }
-
-    for (const selector of SKIN_ALT_SELECTORS) {
-      const node = document.querySelector(selector);
-      if (node) {
-        const name = node.textContent.trim();
-        if (name && name.length > 1) return name;
-      }
-    }
-
-    if (centerItem) {
-      const dataSkinId = centerItem.getAttribute("data-skin-id");
-      const thumb = centerItem.querySelector(".skin-selection-thumbnail");
-      if (thumb) {
-        const bg = thumb.style.backgroundImage || window.getComputedStyle(thumb).backgroundImage;
-        const m = bg.match(/champion-splashes\/(\d+)\/(\d+)\.jpg/);
-        if (m) {
-          if (dataSkinId && Number(dataSkinId) > 0) return `champion-${m[1]}-skin-${dataSkinId}`;
-          return `champion-${m[1]}-skin-${m[2]}`;
-        }
-      }
-
-      const els = centerItem.querySelectorAll("*");
-      const texts = [];
-      els.forEach((el) => {
-        const t = (el.textContent || "").trim();
-        if (t.length > 3 && !/^[\d\s%]+$/.test(t) && !el.closest("script,style")) texts.push(t);
-      });
-      if (texts.length) {
-        return texts.sort((a, b) => b.length - a.length)[0];
-      }
-
-      const splashEl = centerItem.querySelector("[class*='splash'], [class*='Splash'], .skin-selection-thumbnail");
-      if (splashEl) {
-        const bg = splashEl.style.backgroundImage || window.getComputedStyle(splashEl).backgroundImage;
-        const m = bg.match(/champion-splashes\/(\d+)\/(\d+)\.jpg/);
-        if (m) return `champion-${m[1]}-skin-${dataSkinId || m[2]}`;
-      }
-    }
-
-    const anySelected = document.querySelector(".skin-selection-item.skin-selection-item-selected");
-    if (anySelected) {
-      const txtEl = anySelected.querySelector("[class*='name'], [class*='Name']");
-      if (txtEl) {
-        const name = txtEl.textContent.trim();
-        if (name) return name;
-      }
     }
 
     return null;
   }
 
-  let logHoverDebounceTimer = null;
   let logHoverLastSkin = "";
+
+  // Rose-style minimal skin-sync: the visible DOM name is the only source of
+  // truth. We send it WITHOUT a "type" field because Rose's renderer treats a
+  // payload with only {skin, originalName, timestamp} as a skin-sync and does
+  // NOT require a prior champion-locked event. Rift Atlas previously tagged it
+  // with type/source, which activated a strict lock gate and broke injection
+  // when the lock event was late or missing.
+  function sendRoseSkinSync(name, extra = {}) {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    logHoverLastSkin = cleanName;
+    const localPayload = {
+      type: "skin-sync",
+      skin: cleanName,
+      originalName: cleanName,
+      timestamp: Date.now(),
+      ...extra
+    };
+    notifySubscribers(localPayload);
+    const bridgePayload = {
+      skin: cleanName,
+      originalName: cleanName,
+      timestamp: localPayload.timestamp,
+      ...extra
+    };
+    _sendRaw(bridgePayload);
+    sendCount++;
+    dbg("send:skin-sync");
+  }
+
   function scheduleStableSkinSync(skinName = "") {
     const cleanName = String(skinName || readCurrentSkin() || logHoverLastSkin || "").trim();
-    if (cleanName) logHoverLastSkin = cleanName;
-    if (logHoverDebounceTimer) {
-      clearTimeout(logHoverDebounceTimer);
-      logHoverDebounceTimer = null;
-    }
-    if (lastGameflowPhase && lastGameflowPhase !== "ChampSelect") return;
-    const stableName = String(cleanName || readCurrentSkin() || logHoverLastSkin || "").trim();
-    if (!stableName) return;
-    if (forcedBaseSyncSuppression && Date.now() > forcedBaseSyncSuppression.until) {
-      forcedBaseSyncSuppression = null;
-    }
-    if (
-      forcedBaseSyncSuppression &&
-      Number(lastWsChampId || 0) === forcedBaseSyncSuppression.championId &&
-      Number(lastWsSkinId || 0) === forcedBaseSyncSuppression.baseSkinId
-    ) {
-      dbg(`skin-sync-base-suppressed:${forcedBaseSyncSuppression.baseSkinId}`);
-      return;
-    }
-    // Rose-style: enviar solo el nombre textual del DOM. El backend resuelve
-    // la skin a partir de este nombre usando el catalogo LCU. NO enviamos
-    // championId ni selectedSkinId aqui, porque si el LCU aun no actualizo el
-    // ID (skin no owned / animacion del carrusel), esos IDs pueden ser stale y
-    // sobrescribir el nombre correcto.
-    // Usamos un debounce muy corto (100ms) para no saturar con frames intermedios.
-    const debounceMs = 100;
-    const captureName = String(skinName || "").trim();
-    logHoverDebounceTimer = setTimeout(() => {
-      logHoverDebounceTimer = null;
-      const currentName = String(readCurrentSkin() || "").trim();
-      const explicitName = captureName || logHoverLastSkin || stableName;
-      // Rose treats the visible carousel text as the authoritative skin. If
-      // the DOM changed during the debounce window, send that latest value
-      // instead of the stale name captured by an older event.
-      const finalName = currentName || explicitName;
-      if (!finalName) return;
-      logHoverLastSkin = finalName;
-      sendBridgePayload({
-        type: "skin-sync",
-        skin: finalName,
-        originalName: finalName,
-        timestamp: Date.now()
-      });
-    }, debounceMs);
+    if (!cleanName) return;
+    sendRoseSkinSync(cleanName);
   }
 
   function logHover(skinName) {
@@ -712,11 +588,19 @@
     if (!cleanName) return;
     console.log(`${LOG_PREFIX} Hovered skin: ${cleanName}`);
     dbg("skin:" + cleanName);
-    logHoverLastSkin = cleanName;
-    // Rose never couples the DOM name with selectedSkinId: the LCU ID can still
-    // describe the previously equipped owned skin. The desktop resolves this
-    // name and publishes the canonical skin-state afterwards.
-    scheduleStableSkinSync(cleanName);
+    sendRoseSkinSync(cleanName);
+  }
+
+  function resyncSkinAfterConnect() {
+    try {
+      const current = readCurrentSkin();
+      const name = String(current || logHoverLastSkin || lastLoggedSkin || "").trim();
+      if (!name) return;
+      sendRoseSkinSync(name, { reconnect: true });
+      dbg("skin-resync");
+    } catch {
+      // best-effort Rose parity
+    }
   }
 
   function sendBridgePayload(obj) {
@@ -742,18 +626,6 @@
     window.dispatchEvent(new CustomEvent("rift-atlas-skin-state", { detail: state }));
     window.__roseSkinState = state;
     window.dispatchEvent(new CustomEvent("lu-skin-monitor-state", { detail: state }));
-  }
-
-  function dispatchSkinState(state) {
-    publishLocalSkinState(state);
-    sendBridgePayload({
-      type: "skin-state",
-      championId: state.championId,
-      skinId: state.skinId,
-      name: state.name,
-      owned: Number(state.skinId || 0) > 0 ? ownedSkinIds.has(Number(state.skinId)) : false,
-      ownedCount: ownedSkinIds.size
-    });
   }
 
   async function discoverBridgePort() {
@@ -805,6 +677,7 @@
         const p = bridgeQueue.shift();
         try { bridgeSocket.send(p); } catch (e) { bridgeQueue.unshift(p); break; }
       }
+      resyncSkinAfterConnect();
       notifyReady();
     });
     bridgeSocket.addEventListener("close", () => {
@@ -883,401 +756,22 @@
     if (!name || name === lastLoggedSkin) return;
     lastLoggedSkin = name;
     logHover(name);
-
   }
 
-  function dispatchLcuSelectionState(championId, selectedSkinId, extra = {}) {
-    const detail = {
-      championId: Number(championId || 0) || null,
-      selectedSkinId: Number(selectedSkinId || 0) || null,
-      ...extra,
-    };
-    window.__riftAtlasLcuSelectionState = detail;
-    window.dispatchEvent(new CustomEvent("rift-atlas-lcu-selection-state", { detail }));
-    sendBridgePayload({ type: "lcu-selection-state", ...detail });
-  }
-
-  function handleSkinSelectorInfo(data) {
-    if (!data || typeof data.selectedSkinId !== "number") return;
-    const skinId = data.selectedSkinId > 0 ? data.selectedSkinId : null;
-
-    let championId = data.championId || null;
-    if (!championId && skinId > 0) championId = Math.floor(skinId / 1000);
-    if (!skinId && !championId) return;
-
-    const skinChanged = skinId !== lastWsSkinId;
-    const champChanged = championId !== lastWsChampId;
-    if (!skinChanged && !champChanged) return;
-
-    const oldChampionId = Number(lastWsChampId || 0);
-    if (champChanged && oldChampionId && championId && oldChampionId !== championId) {
-      sendChampionExchange(oldChampionId, championId, "skin-selector-info");
-      championLockAnnounced = false;
-    }
-
-    lastWsSkinId = skinId;
-    lastWsChampId = championId;
-
-    if (!championLockAnnounced && skinId) {
-      championLockAnnounced = true;
-      sendBridgePayload({ type: "champion-locked", locked: true, championId, selectedSkinId: skinId, name: readCurrentSkin() || null });
-      fetchOwnedSkinIds({ force: true }).catch(() => null);
-    }
-
-    const name = readCurrentSkin() || null;
-    console.log(`${LOG_PREFIX} WS skin: id=${skinId}, champ=${championId}, name="${name}"`);
-
-    dispatchLcuSelectionState(championId, skinId, { name });
-
-    if (name && name !== lastLoggedSkin) {
-      lastLoggedSkin = name;
-      logHover(name);
-    }
-  }
-
-  function sendChampionExchange(oldChampionId, newChampionId, source = "unknown") {
-    const signature = `${oldChampionId}->${newChampionId}`;
-    const now = Date.now();
-    if (signature === lastChampionExchangeSignature && now - lastChampionExchangeAt < 3000) return;
-    lastChampionExchangeSignature = signature;
-    lastChampionExchangeAt = now;
-    sendBridgePayload({
-      type: "champion-exchange",
-      oldChampionId,
-      newChampionId,
-      source,
-      timestamp: now
-    });
-    dbg(`champion-exchange:${signature}:${source}`);
-  }
-
-  function interceptChampSelectWs() {
-    if (typeof window.rcp?.postInit === "function") {
-      window.rcp.postInit("rcp-fe-lol-champ-select", (api) => {
-        try {
-          let ws = null;
-          try { ws = api.champSelectBinding?.socket?._websocket; } catch {}
-          if (!ws && api.champSelectBinding?.socket?.readyState !== undefined) {
-            try { ws = api.champSelectBinding.socket; } catch {}
+  function installFindMatchObserver() {
+    try {
+      const performanceObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          if (entry.name && entry.name.includes("sfx-lobby-button-find-match-hover")) {
+            sendBridgePayload({ type: "find-match-hover", timestamp: Date.now() });
+            dbg("find-match-hover");
           }
-          if (!ws) {
-            try {
-              const desc = Object.getOwnPropertyDescriptor(api.champSelectBinding, "socket");
-              if (desc?.get) {
-                const socket = desc.get.call(api.champSelectBinding);
-                if (socket?._websocket) ws = socket._websocket;
-                else if (socket?.readyState !== undefined) ws = socket;
-              }
-            } catch {}
-          }
-          if (!ws || typeof ws.addEventListener !== "function") {
-            console.warn(`${LOG_PREFIX} No ChampSelect WebSocket found, trying to fetch session directly`);
-            return;
-          }
-          const orig = ws.onmessage || null;
-          ws.onmessage = function (event) {
-            try {
-              const payload = JSON.parse(event.data);
-              if (payload?.[1] === "OnJsonApiEvent") {
-                const ed = payload[2];
-                if (ed?.uri === "/lol-champ-select/v1/skin-selector-info") {
-                  handleSkinSelectorInfo(ed.data);
-                }
-              }
-            } catch { /* ignore */ }
-            if (typeof orig === "function") return orig.call(this, event);
-          };
-          console.log(`${LOG_PREFIX} ChampSelect WS intercepted`);
-        } catch (e) {
-          console.warn(`${LOG_PREFIX} Failed to intercept ChampSelect WS:`, e);
         }
       });
-    } else {
-      console.warn(`${LOG_PREFIX} rcp.postInit not available, will rely on session fetch only`);
-    }
-  }
-
-  async function readChampSelectSession() {
-    const resp = await window.fetch("/lol-champ-select/v1/session", { credentials: "include" });
-    if (!resp.ok) return null;
-    return resp.json();
-  }
-
-  async function readGameflowPhase() {
-    const resp = await window.fetch("/lol-gameflow/v1/gameflow-phase", { credentials: "include" });
-    if (!resp.ok) return "";
-    const text = await resp.text();
-    return text.replace(/^"|"$/g, "").trim();
-  }
-
-  async function readSkinSelectorInfo() {
-    const resp = await window.fetch("/lol-champ-select/v1/skin-selector-info", { credentials: "include" });
-    if (!resp.ok) return null;
-    return resp.json();
-  }
-
-  function getMyPickAction(session = {}) {
-    const myCellId = session.localPlayerCellId;
-    return session.actions?.flat()?.find(
-      (a) => a.actorCellId === myCellId && a.type === "pick"
-    ) || null;
-  }
-
-  function getMyTeamSelection(session = {}) {
-    const myCellId = session.localPlayerCellId;
-    return session.myTeam?.find((player) => player.cellId === myCellId) || null;
-  }
-
-  function extractInventorySkinId(item) {
-    if (!item || typeof item !== "object") return 0;
-    return Number(item.itemId || item.skinId || item.id || item.inventoryTypeItemId || 0);
-  }
-
-  async function fetchOwnedSkinIds(options = {}) {
-    if (stopped || !window.fetch) return ownedSkinIds;
-    const now = Date.now();
-    if (!options.force && ownedSkinIds.size && now - ownedSkinFetchAt < 60000) {
-      return ownedSkinIds;
-    }
-    try {
-      const resp = await window.fetch("/lol-inventory/v2/inventory/CHAMPION_SKIN", { credentials: "include" });
-      if (!resp.ok) {
-        if (resp.status !== 404) dbg("owned-http", `${resp.status}`);
-        return ownedSkinIds;
-      }
-      const data = await resp.json();
-      if (!Array.isArray(data)) return ownedSkinIds;
-      ownedSkinIds = new Set(
-        data.map(extractInventorySkinId)
-          .filter((id) => Number.isFinite(id) && id > 0)
-      );
-      ownedSkinFetchAt = now;
-      sendBridgePayload({
-        type: "owned-skins",
-        ownedSkinIds: [...ownedSkinIds],
-        count: ownedSkinIds.size,
-        timestamp: Date.now()
-      });
-      dbg("owned:" + ownedSkinIds.size);
+      performanceObserver.observe({ type: "resource", buffered: false });
+      dbg("find-match-observer");
     } catch (err) {
-      dbg("owned-err", err);
-    }
-    return ownedSkinIds;
-  }
-
-  async function fetchSessionSkin() {
-    if (stopped) return;
-    try {
-      const [session, selectorInfo] = await Promise.all([
-        readChampSelectSession().catch(() => null),
-        readSkinSelectorInfo().catch(() => null)
-      ]);
-      if (!session) return;
-      const myAction = getMyPickAction(session);
-      const mySelection = getMyTeamSelection(session);
-      const championId = Number(selectorInfo?.championId || myAction?.championId || mySelection?.championId || 0);
-      if (!championId) return;
-
-      const rawSkinId = Number(
-        selectorInfo?.selectedSkinId ||
-        mySelection?.selectedSkinId ||
-        myAction?.skinId ||
-        0
-      );
-      if (rawSkinId === 0) return;
-      const skinId = rawSkinId > 0 ? rawSkinId : null;
-
-      const skinChanged = skinId && skinId !== lastWsSkinId;
-      const champChanged = championId !== lastWsChampId;
-      if (!skinChanged && !champChanged) return;
-
-      const oldChampionId = Number(lastWsChampId || 0);
-      if (champChanged && oldChampionId && championId && oldChampionId !== championId) {
-        sendChampionExchange(oldChampionId, championId, "session-poll");
-        championLockAnnounced = false;
-      }
-
-      lastWsSkinId = skinId;
-      lastWsChampId = championId;
-
-      if (!championLockAnnounced && skinId) {
-        championLockAnnounced = true;
-        sendBridgePayload({ type: "champion-locked", locked: true, championId, selectedSkinId: skinId, name: readCurrentSkin() || null });
-        fetchOwnedSkinIds({ force: true }).catch(() => null);
-      }
-
-      const name = readCurrentSkin() || null;
-      if (skinChanged || champChanged) {
-        console.log(`${LOG_PREFIX} Session skin: id=${skinId}, champ=${championId}, name="${name}"`);
-      }
-
-      dispatchLcuSelectionState(championId, skinId, { name });
-
-      if (name && name !== lastLoggedSkin) {
-        lastLoggedSkin = name;
-        logHover(name);
-      }
-    } catch (fetchErr) {
-      dbg("session-err", fetchErr);
-    }
-  }
-
-  async function pollGameflowPhase() {
-    if (stopped || !window.fetch) return;
-    try {
-      const phase = await readGameflowPhase().catch(() => "");
-      if (phase && phase !== lastGameflowPhase && Date.now() - lastAuthoritativePhaseAt > 5000) {
-        const previousPhase = lastGameflowPhase || "";
-        lastGameflowPhase = phase;
-        sendBridgePayload({
-          type: "phase-change",
-          phase,
-          previousPhase,
-          source: "pengu-phase-fallback",
-          timestamp: Date.now()
-        });
-      }
-    } catch (err) {
-      dbg("flow-poll-err", err);
-    }
-  }
-
-  async function forceSelectedSkinId(payload = {}) {
-    const selectedSkinId = Number(payload.selectedSkinId || payload.skinId || 0);
-    if (!selectedSkinId || !window.fetch) return;
-    const targetSkinId = Number(payload.targetSkinId || 0);
-    const championId = Number(payload.championId || lastWsChampId || 0);
-    if (championId && targetSkinId && targetSkinId !== selectedSkinId) {
-      // Rose broadcasts "skip-base-skin" before forcing an unowned target to
-      // champion base. Keep the visible target authoritative for five seconds
-      // so the forced LCU echo cannot replace the package queued for injection.
-      forcedBaseSyncSuppression = {
-        championId,
-        baseSkinId: selectedSkinId,
-        targetSkinId,
-        skinName: String(readCurrentSkin() || logHoverLastSkin || "").trim(),
-        until: Date.now() + 15000,
-      };
-    }
-    let forceOk = false;
-    let requestAccepted = false;
-    let method = "";
-    let verifiedSkinId = 0;
-    let forceError = "";
-    const forceRequestId = String(payload.forceRequestId || "");
-    const readResponseText = async (resp) => {
-      try {
-        return (await resp.text()).slice(0, 240);
-      } catch {
-        return "";
-      }
-    };
-    try {
-      const verifySelection = async (attempt = 1) => {
-        for (let poll = 0; poll < 5; poll += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 120 + attempt * 80));
-          const verifySession = await readChampSelectSession().catch(() => null);
-          const verifySelector = await readSkinSelectorInfo().catch(() => null);
-          // Rose treats myTeam.selectedSkinId as the authority. SelectorInfo can
-          // briefly retain the previous owned skin while the DOM shows a new one.
-          verifiedSkinId = Number(
-            getMyTeamSelection(verifySession || {})?.selectedSkinId ||
-            verifySelector?.selectedSkinId ||
-            0
-          );
-          if (verifiedSkinId === selectedSkinId) return true;
-        }
-        return false;
-      };
-
-      for (let attempt = 1; attempt <= 3 && !forceOk; attempt += 1) {
-        const session = await readChampSelectSession().catch(() => null);
-        const action = session ? getMyPickAction(session) : null;
-
-        if (action?.id != null && !action.completed) {
-          const actionResp = await window.fetch(`/lol-champ-select/v1/session/actions/${action.id}`, {
-            method: "PATCH",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ selectedSkinId }),
-          });
-          if (actionResp.ok) {
-            requestAccepted = true;
-            method = "action";
-            forceOk = await verifySelection(attempt);
-          } else {
-            forceError = `action ${actionResp.status} ${await readResponseText(actionResp)}`;
-            dbg("force-action-http", forceError);
-          }
-        } else {
-          forceError = "sin pick action";
-        }
-
-        // A 2xx action response only means the request was accepted. Rose falls
-        // back to my-selection whenever myTeam does not confirm the desired ID.
-        if (!forceOk) {
-          const resp = await window.fetch("/lol-champ-select/v1/session/my-selection", {
-            method: "PATCH",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ selectedSkinId }),
-          });
-          if (resp.ok) {
-            requestAccepted = true;
-            method = "my-selection";
-            forceOk = await verifySelection(attempt);
-          } else {
-            forceError = `my-selection ${resp.status} ${await readResponseText(resp)}`;
-            dbg("force-skin-http", forceError);
-          }
-        }
-
-        if (!forceOk) {
-          forceError = `LCU no confirmo ${selectedSkinId}; actual=${verifiedSkinId || "?"}`;
-          dbg("force-skin-unconfirmed", forceError);
-        }
-      }
-
-      if (forceOk) forceError = "";
-      if (!forceOk) forcedBaseSyncSuppression = null;
-      if (verifiedSkinId === selectedSkinId) {
-        lastWsSkinId = selectedSkinId;
-      }
-      if (payload.championId) lastWsChampId = Number(payload.championId);
-      dispatchLcuSelectionState(lastWsChampId, lastWsSkinId, { forced: true });
-      sendBridgePayload({
-        type: "force-skin-result",
-        championId: lastWsChampId,
-        skinId: lastWsSkinId,
-        name: readCurrentSkin() || payload.name || null,
-        forced: true,
-        forceOk,
-        requestAccepted,
-        forceMethod: method,
-        forceError,
-        verifiedSkinId,
-        forceRequestId,
-        owned: ownedSkinIds.has(selectedSkinId),
-        ownedCount: ownedSkinIds.size
-      });
-    } catch (err) {
-      dbg("force-skin-err", err);
-      forcedBaseSyncSuppression = null;
-      sendBridgePayload({
-        type: "force-skin-result",
-        championId: championId || lastWsChampId,
-        skinId: lastWsSkinId,
-        name: readCurrentSkin() || payload.name || null,
-        forced: true,
-        forceOk: false,
-        requestAccepted,
-        forceMethod: method,
-        forceError: err?.message || String(err),
-        verifiedSkinId,
-        forceRequestId,
-        owned: ownedSkinIds.has(selectedSkinId),
-        ownedCount: ownedSkinIds.size
-      });
+      dbg("find-match-observer-err", err);
     }
   }
 
@@ -1287,58 +781,25 @@
     retryDelay = RETRY_BASE_MS;
     ensureBridgeApi();
     connectBridge();
+    installFindMatchObserver();
     subscribe("debug-mode", (payload = {}) => setDebugMode(payload.enabled));
     subscribe("debug-toggle", () => toggleDebugBox());
-    subscribe("skip-base-skin", (payload = {}) => {
-      const championId = Number(payload.championId || lastWsChampId || 0);
-      const baseSkinId = Number(payload.baseSkinId || 0);
-      const targetSkinId = Number(payload.targetSkinId || 0);
-      if (!championId || !baseSkinId || !targetSkinId) return;
-      forcedBaseSyncSuppression = {
-        championId,
-        baseSkinId,
-        targetSkinId,
-        skinName: String(payload.skinName || readCurrentSkin() || logHoverLastSkin || "").trim(),
-        until: Date.now() + Math.max(1000, Number(payload.durationMs || 15000)),
-      };
-      dbg(`skip-base-skin:${baseSkinId}->${targetSkinId}`);
-    });
-    subscribe("skip-base-skin-clear", () => {
-      forcedBaseSyncSuppression = null;
-      dbg("skip-base-skin-clear");
-    });
-    subscribe("force-skin", forceSelectedSkinId);
     subscribe("phase-change", (payload = {}) => {
       const phase = String(payload.phase || "");
       if (!phase) return;
-      if (payload.source === "lcu-gameflow-monitor") {
-        lastAuthoritativePhaseAt = Date.now();
-      }
       lastGameflowPhase = phase;
       if (phase === "InProgress") stopMonitoring();
       else startMonitoring();
       if (["Lobby", "ChampSelect"].includes(phase)) {
         lastLoggedSkin = null;
-        championLockAnnounced = false;
-      }
-      if (!["ChampSelect", "FINALIZATION"].includes(phase)) {
-        forcedBaseSyncSuppression = null;
       }
     });
     startMonitoring();
-    interceptChampSelectWs();
-    fetchOwnedSkinIds({ force: true }).catch(() => null);
-    setInterval(fetchSessionSkin, 3000);
-    if (!flowPollTimer) {
-      flowPollTimer = setInterval(pollGameflowPhase, FLOW_POLL_INTERVAL_MS);
-      pollGameflowPhase().catch(() => null);
-    }
   }
 
   function stop() {
     stopped = true;
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-    if (flowPollTimer) { clearInterval(flowPollTimer); flowPollTimer = null; }
     stopMonitoring();
     if (bridgeSocket) { bridgeSocket.close(); bridgeSocket = null; }
   }

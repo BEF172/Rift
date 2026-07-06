@@ -1,6 +1,7 @@
-use crate::{gameflow, junction, overlay, AppState};
+use crate::{junction, overlay, AppState};
 use std::collections::HashSet;
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,7 @@ struct RoseRunner {
     pid: u32,
     overlay_path: String,
     exited: Arc<AtomicBool>,
+    hook_ready: Arc<AtomicBool>,
 }
 
 struct RoseBuild {
@@ -282,7 +284,9 @@ fn start_runoverlay(
     let app_data = crate::writable_data_dir().to_string_lossy().to_string();
     command.env("LOCALAPPDATA", &app_data);
 
-    command.stdout(Stdio::null()).stderr(Stdio::null());
+    // Pipe stdout/stderr so we can detect when the DLL hook is active before
+    // resuming League. A fixed delay is not reliable across systems.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -298,6 +302,55 @@ fn start_runoverlay(
 
     let exited = Arc::new(AtomicBool::new(false));
     let exited_thread = exited.clone();
+    let hook_ready = Arc::new(AtomicBool::new(false));
+    let hook_ready_stdout = hook_ready.clone();
+
+    // Read stdout to detect hook-ready markers (same logic as the LTK path).
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(text) = line {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        overlay::append_overlay_log(&format!("[runoverlay] {}", trimmed));
+                        let lower = trimmed.to_lowercase();
+                        if lower.contains("hook applied")
+                            || lower.contains("status: waiting for exit")
+                            || lower.contains("init in process")
+                            || lower.contains("init done")
+                            || lower.contains("overlay active")
+                        {
+                            hook_ready_stdout.store(true, Ordering::SeqCst);
+                        }
+                        if lower.contains("error")
+                            || lower.contains("failed")
+                            || lower.contains("not found")
+                        {
+                            overlay::append_overlay_log(&format!("[runoverlay:err] {}", trimmed));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Read stderr and log it for diagnostics.
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(text) = line {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        overlay::append_overlay_log(&format!("[runoverlay:err] {}", trimmed));
+                    }
+                }
+            }
+        });
+    }
+
+    // Monitor process exit.
     std::thread::spawn(move || {
         let status = child.wait();
         exited_thread.store(true, Ordering::SeqCst);
@@ -306,10 +359,12 @@ fn start_runoverlay(
             status.ok().and_then(|value| value.code())
         ));
     });
+
     Ok(RoseRunner {
         pid,
         overlay_path: overlay_dir.to_string_lossy().to_string(),
         exited,
+        hook_ready,
     })
 }
 
@@ -421,7 +476,7 @@ fn build_overlay(
     overlay::hide_overlay_dir(&overlay_dir.to_string_lossy());
 
     overlay::append_overlay_log(
-        "[Engine] mkoverlay OK; staging limpiado; overlay oculto; esperando League suspendido.",
+        "[Engine] mkoverlay OK; staging limpiado; overlay oculto; listo para runoverlay.",
     );
     Ok(RoseBuild {
         mod_tools,
@@ -490,74 +545,10 @@ pub async fn run_rose_overlay_v2(
         );
         overlay::append_overlay_log("[Engine] Early monitor iniciado desde run_rose_overlay_v2.");
     }
-    // Rose-style: esperar a que el early monitor suspenda League antes de mkoverlay.
-    // Si el early monitor no puede suspender (Vanguard/anti-cheat), proceder igual tras 5s.
-    {
-        let wait_start = std::time::Instant::now();
-        let hard_timeout = std::time::Duration::from_secs(120);
-        let soft_timeout = std::time::Duration::from_secs(15);
-        loop {
-            let suspended = state.early_monitor_pid.lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false);
-            if suspended {
-                overlay::append_overlay_log("[Engine] League suspendido, procediendo con mkoverlay.");
-                break;
-            }
-            if wait_start.elapsed() >= hard_timeout {
-                overlay::stop_early_monitor(
-                    &state.early_monitor_active,
-                    &state.early_monitor_pid,
-                    &state.early_monitor_runoverlay_started,
-                );
-                *state.active_overlay_run.lock().await = false;
-                return Err(
-                    "Timeout esperando que League of Legends se suspenda.".to_string()
-                );
-            }
-            if wait_start.elapsed() >= soft_timeout {
-                overlay::stop_early_monitor(
-                    &state.early_monitor_active,
-                    &state.early_monitor_pid,
-                    &state.early_monitor_runoverlay_started,
-                );
-                *state.active_overlay_run.lock().await = false;
-                return Err(
-                    "Early monitor no pudo suspender League; abortando inyeccion.".to_string()
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    }
-
-    // Rose-style: forzar la seleccion LCU ANTES de construir el overlay. Si el
-    // usuario cambio de skin (ej. Callejera -> Embrujada), esto asegura que el
-    // LCU refleje el objetivo correcto y el overlay no herede un ID stale.
-    if let (Some(champion_id), Some(selected_skin_id)) = (
-        payload.get("championId").and_then(|value| value.as_u64()),
-        payload.get("selectedSkinId").and_then(|value| value.as_u64()),
-    ) {
-        if champion_id > 0 && selected_skin_id > 0 {
-            overlay::append_overlay_log(&format!(
-                "[Engine] Forzando LCU skin antes de mkoverlay: champion={} skin={}",
-                champion_id, selected_skin_id
-            ));
-            match gameflow::force_selected_skin(champion_id, selected_skin_id).await {
-                Ok(force_result) => {
-                    overlay::append_overlay_log(&format!(
-                        "[Engine] LCU force result: {}",
-                        serde_json::to_string(&force_result).unwrap_or_default()
-                    ));
-                }
-                Err(error) => {
-                    overlay::append_overlay_log(&format!(
-                        "[Engine] LCU force fallo (continuando): {}",
-                        error
-                    ));
-                }
-            }
-        }
-    }
+    // Rose-style: the game monitor runs in the background while mkoverlay builds.
+    // Do not wait for League.exe to spawn/suspend before building, otherwise a
+    // fast transition to InProgress can make runoverlay arrive too late.
+    overlay::append_overlay_log("[Engine] Monitor temprano activo; procediendo con mkoverlay sin esperar League.");
 
     let payload_for_build = payload.clone();
     let result = match tokio::task::spawn_blocking(move || {
@@ -604,25 +595,16 @@ pub async fn run_rose_overlay_v2(
                     }
                 };
 
-            // Rose-style: add delay after runoverlay spawn before resuming.
-            // Rose's resume_game() has time.sleep(0.1) = 100ms delay after each
-            // resume attempt, plus Python subprocess overhead (~50-200ms).
-            // Total: ~250-400ms between spawn and resume.
-            // We use 300ms to be in the middle of Rose's range.
-            // This gives runoverlay time to:
-            // 1. Initialize the process
-            // 2. Load cslol-dll.dll
-            // 3. Hook CreateFileA before League loads WADs
-            // Without this delay, Rust's fast spawn+resume lets League load
-            // WADs before the DLL hook is in place, causing intermittent failures.
-            std::thread::sleep(Duration::from_millis(300));
-            
+            // Rose 1:1: resume as soon as runoverlay starts. The DLL hooks
+            // while League continues loading; waiting for hook stdout is not
+            // part of Rose's overlay_manager flow.
+            overlay::append_overlay_log("[Engine] runoverlay iniciado; resumiendo League (Rose 1:1).");
             overlay::stop_early_monitor(&state.early_monitor_active, &state.early_monitor_pid, &state.early_monitor_runoverlay_started);
             overlay::append_overlay_log("[Engine] game resumed; runoverlay running.");
 
             *state.running_overlay_process.lock().await = Some(runner.pid);
             *state.running_overlay_alive.lock().await = Some(runner.exited.clone());
-            *state.running_overlay_ready.lock().await = None;
+            *state.running_overlay_ready.lock().await = Some(runner.hook_ready.clone());
             *state.current_overlay_path.lock().await = runner.overlay_path.clone();
             *state.current_overlay_error.lock().await = String::new();
 

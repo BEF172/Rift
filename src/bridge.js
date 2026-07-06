@@ -89,12 +89,13 @@ const RIFT_ATLAS_API = {
   getTierLane: (payload) => invoke("get_tier_lane", { payload }),
   getChampionBuild: (champion) => invoke("get_champion_build", { champion }),
   getLcuChampionSkins: (championId) => invoke("get_lcu_champion_skins", { championId: Number(championId) || 0 }),
+  getLcuOwnedSkins: () => invoke("get_lcu_owned_skins"),
   forceLcuSkinSelection: (championId, selectedSkinId) => invoke("force_lcu_skin_selection", {
     championId: Number(championId) || 0,
     selectedSkinId: Number(selectedSkinId) || 0,
   }),
   waitForLcuFinalizationThreshold: (thresholdMs) => invoke("wait_for_lcu_finalization_threshold", {
-    thresholdMs: Number(thresholdMs) || 500,
+    thresholdMs: Number.isFinite(Number(thresholdMs)) ? Number(thresholdMs) : 300,
   }),
   checkChampionLock: () => invoke("check_champion_lock"),
   resolveLeagueSkinPackage: (championId, skinId, baseSkinId) => invoke("resolve_league_skin_package", {
@@ -248,7 +249,9 @@ const RIFT_ATLAS_API = {
 
   // ThresholdManager — configurable injection cooldown
   loadInjectionThreshold: () => invoke("load_injection_threshold"),
-  saveInjectionThreshold: (value) => invoke("save_injection_threshold", { value: Number(value) || 0.5 }),
+  saveInjectionThreshold: (value) => invoke("save_injection_threshold", {
+    value: Number.isFinite(Number(value)) ? Number(value) : 0.3,
+  }),
 
   // BaseSkinTracker — PATCH→confirmation latency tracking
   startBaseSkinTracking: (skinId) => invoke("start_base_skin_tracking", { skinId: Number(skinId) || 0 }),
@@ -256,9 +259,6 @@ const RIFT_ATLAS_API = {
   onChampSelectExit: () => invoke("on_champ_select_exit"),
   getBaseSkinTrackerStats: () => invoke("get_base_skin_tracker_stats"),
   clearBaseSkinTrackerSamples: () => invoke("clear_base_skin_tracker_samples"),
-
-  // LCU cache
-  clearLcuCache: () => invoke("clear_lcu_cache"),
 };
 
 // Expose as global API (same name as old preload)

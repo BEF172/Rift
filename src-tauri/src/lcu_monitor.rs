@@ -113,6 +113,11 @@ pub async fn start(handle: AppHandle) {
                     *state.current_gameflow_phase.lock().await = ph.clone();
                     broadcast_phase(&handle, &ph, &prev).await;
                     crate::overlay::check_cleanup(&handle, &ph, &prev).await;
+                    // Reset lock tracking whenever we enter ChampSelect so a stale
+                    // lock from the previous game cannot trigger a false exchange.
+                    if ph == "ChampSelect" && prev != "ChampSelect" {
+                        reset_champ_select_lock_tracking();
+                    }
                     if ph != "ChampSelect" {
                         reset_champ_select_lock_tracking();
                     }
@@ -474,6 +479,11 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                     *state.current_gameflow_phase.lock().await = phase.to_string();
                     broadcast_phase(handle, phase, &prev).await;
                     crate::overlay::check_cleanup(handle, phase, &prev).await;
+                    // Reset lock tracking whenever we enter ChampSelect so a stale
+                    // lock from the previous game cannot trigger a false exchange.
+                    if phase == "ChampSelect" && prev != "ChampSelect" {
+                        reset_champ_select_lock_tracking();
+                    }
                     if phase != "ChampSelect" {
                         reset_champ_select_lock_tracking();
                     }
@@ -499,7 +509,7 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                     .get("phase")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if left_ms > 0 {
+                if phase == "FINALIZATION" && left_ms > 0 {
                     let _ = handle.emit("pengu:message", serde_json::json!({
                         "type": "loadout-finalization",
                         "adjustedTimeLeftInPhase": left_ms,
@@ -664,6 +674,44 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                 }));
             }
 
+            // Rose-style: first local completed lock is handled directly from
+            // the champ-select session stream, not only by the slower recovery
+            // poller. This lets the renderer resolve skins/chromas before the
+            // FINALIZATION ticker fires.
+            if exchange.is_none() {
+                let first_local_lock = (|| -> Option<(u64, u64)> {
+                    let cell_id = LOCAL_CELL_ID.lock().ok()?;
+                    let my_cell = (*cell_id)?;
+                    let &champ_id = new_locks.get(&my_cell)?;
+                    let already_known = LAST_LOCKS
+                        .lock()
+                        .ok()
+                        .and_then(|locks| locks.as_ref().and_then(|m| m.get(&my_cell).copied()))
+                        == Some(champ_id);
+                    if already_known || champ_id == 0 {
+                        None
+                    } else {
+                        Some((my_cell, champ_id))
+                    }
+                })();
+
+                if let Some((my_cell, champ_id)) = first_local_lock {
+                    let skin_id = extract_skin_id_for_cell(&event_data, Some(my_cell));
+                    if let Ok(mut overlay) = handle.state::<AppState>().ui_overlay.write() {
+                        overlay.own_champion_locked = true;
+                        overlay.locked_champ_id = Some(champ_id as i32);
+                        overlay.selected_skin_id = if skin_id > 0 { Some(skin_id as i32) } else { None };
+                    }
+                    let _ = handle.emit("pengu:message", serde_json::json!({
+                        "type": "champion-locked",
+                        "championId": champ_id,
+                        "selectedSkinId": skin_id,
+                        "source": "lcu-ws",
+                        "cellId": my_cell,
+                    }));
+                }
+            }
+
             // Persist current locks for next comparison
             if let Ok(mut locks) = LAST_LOCKS.lock() {
                 *locks = Some(new_locks.clone());
@@ -821,6 +869,9 @@ async fn on_lcu_reconnect(handle: &AppHandle) {
     commands::cleanup_pengu_proxy_on_startup(&app_data);
     commands::pengu_startup_init(&app_data, &token_dir);
     commands::pengu_install_rift_plugin_inner(&token_dir).ok();
+    if let Ok(result) = commands::detect_league_path().await {
+        let _ = handle.emit("app:league-detected", result);
+    }
 
     let _ = handle.emit("lcu:reconnect-done", serde_json::json!({
         "stage": "pengu_reactivated",
@@ -901,9 +952,7 @@ async fn check_initial_champion_state(handle: &AppHandle) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            if (action_type == "pick" && is_completed)
-                || (action_type == "ban" && is_completed)
-            {
+            if action_type == "pick" && is_completed {
                 let champ_id = match action.get("championId").and_then(|v| v.as_u64()) {
                     Some(c) => c,
                     None => continue,
