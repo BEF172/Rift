@@ -331,8 +331,12 @@
   let bridgePort = 0;
   let bridgeDiscoveryPromise = null;
   let lastGameflowPhase = "";
+  let lastBaseSkinSkipRequest = 0;
+  const BASE_SKIN_SKIP_REQUEST_TIME_WINDOW_MS = 5000;
   const subscribers = new Map();
   const readyCallbacks = new Set();
+  let bridgeErrorLogged = false;
+  let bridgeSetupWarned = false;
 
   function subscribe(type, cb) {
     if (!subscribers.has(type)) subscribers.set(type, new Set());
@@ -377,10 +381,39 @@
     }
   }
 
+  // Rose parity: sanitize skin name (dedicated function like Rose's sanitizeSkinName)
+  function sanitizeSkinName(name) {
+    return String(name || "").trim();
+  }
+
+  // Rose parity: dedicated flush function
+  function flushBridgeQueue() {
+    while (bridgeQueue.length) {
+      const raw = bridgeQueue.shift();
+      try { bridgeSocket.send(raw); } catch (e) {
+        console.warn(`${LOG_PREFIX} flush failed, re-queuing`, e);
+        bridgeQueue.unshift(raw);
+        resetBridgeSocket();
+        break;
+      }
+    }
+  }
+
+  // Rose parity: dedicated reset function
+  function resetBridgeSocket() {
+    try {
+      if (bridgeSocket) bridgeSocket.close();
+    } catch (e) {
+      console.warn(`${LOG_PREFIX} resetBridgeSocket error`, e);
+    }
+    bridgeSocket = null;
+    bridgeReady = false;
+  }
+
   function ensureBridgeApi() {
     if (!window.__roseBridge) {
       window.__roseBridge = {
-        send: (payload) => _sendRaw(payload),
+        send: (payload) => sendBridgePayload(payload),
         subscribe,
         unsubscribe,
         onReady,
@@ -389,18 +422,37 @@
       };
       console.log(`${LOG_PREFIX} Created window.__roseBridge (standalone mode, port=${bridgePort})`);
     }
-
-    window.__roseBridge.send = (payload) => _sendRaw(payload);
+    // Rose parity: expose bridgeEmit early so consumer plugins can find it before bridge connects
+    window.__roseBridgeEmit = (payload) => sendBridgePayload(payload);
+    window.__roseBridge.send = (payload) => sendBridgePayload(payload);
   }
 
   function _sendRaw(payload) {
-    const raw = JSON.stringify(payload);
-    if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
+    const raw = typeof payload === "string" ? payload : JSON.stringify(payload);
+    if (!bridgeSocket || bridgeSocket.readyState === WebSocket.CLOSING || bridgeSocket.readyState === WebSocket.CLOSED) {
       bridgeQueue.push(raw);
       connectBridge();
       return;
     }
-    bridgeSocket.send(raw);
+    if (bridgeSocket.readyState === WebSocket.CONNECTING) {
+      bridgeQueue.push(raw);
+      return;
+    }
+    try {
+      bridgeSocket.send(raw);
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} Bridge send failed`, error);
+      bridgeQueue.push(raw);
+      resetBridgeSocket();
+    }
+  }
+
+  function resetBridgeSocket() {
+    if (bridgeSocket) {
+      try { bridgeSocket.close(); } catch (_) { /* ignore */ }
+    }
+    bridgeSocket = null;
+    bridgeReady = false;
   }
 
   function toggleDebugBox() {
@@ -409,6 +461,44 @@
     const box = ensureDebugBox();
     if (!box) return;
     box.style.display = debugBoxVisible ? "" : "none";
+  }
+
+  function handleSkipBaseSkin() {
+    lastBaseSkinSkipRequest = Date.now();
+    console.log(`${LOG_PREFIX} received base skin skip request`);
+  }
+
+  function interceptChampSelectWebsocket() {
+    window.rcp?.postInit?.("rcp-fe-lol-champ-select", (api) => {
+      try {
+        const ws = api?.champSelectBinding?.socket?._websocket;
+        if (!ws || ws.__riftAtlasBaseSkipPatched) return;
+        const parentOnMessage = ws.onmessage;
+        ws.onmessage = function (event) {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload?.[1] === "OnJsonApiEvent") {
+              const eventData = payload[2];
+              if (
+                eventData?.uri === "/lol-champ-select/v1/skin-selector-info" &&
+                eventData?.data?.selectedSkinId &&
+                Date.now() - lastBaseSkinSkipRequest < BASE_SKIN_SKIP_REQUEST_TIME_WINDOW_MS
+              ) {
+                console.log(`${LOG_PREFIX} skipping visual base skin update`);
+                return;
+              }
+            }
+          } catch (error) {
+            console.warn(`${LOG_PREFIX} champ-select ws intercept error`, error);
+          }
+          return parentOnMessage?.call(this, event);
+        };
+        ws.__riftAtlasBaseSkipPatched = true;
+        console.log(`${LOG_PREFIX} champ-select websocket interception active`);
+      } catch (error) {
+        console.warn(`${LOG_PREFIX} failed champ-select websocket interception`, error);
+      }
+    });
   }
 
   function removeDebugUi() {
@@ -555,20 +645,20 @@
   // with type/source, which activated a strict lock gate and broke injection
   // when the lock event was late or missing.
   function sendRoseSkinSync(name, extra = {}) {
-    const cleanName = String(name || "").trim();
+    const cleanName = sanitizeSkinName(name);
     if (!cleanName) return;
     logHoverLastSkin = cleanName;
     const localPayload = {
       type: "skin-sync",
       skin: cleanName,
-      originalName: cleanName,
+      originalName: name,
       timestamp: Date.now(),
       ...extra
     };
     notifySubscribers(localPayload);
     const bridgePayload = {
       skin: cleanName,
-      originalName: cleanName,
+      originalName: name,
       timestamp: localPayload.timestamp,
       ...extra
     };
@@ -578,13 +668,13 @@
   }
 
   function scheduleStableSkinSync(skinName = "") {
-    const cleanName = String(skinName || readCurrentSkin() || logHoverLastSkin || "").trim();
+    const cleanName = sanitizeSkinName(skinName || readCurrentSkin() || logHoverLastSkin);
     if (!cleanName) return;
     sendRoseSkinSync(cleanName);
   }
 
   function logHover(skinName) {
-    const cleanName = String(skinName || "").trim();
+    const cleanName = sanitizeSkinName(skinName);
     if (!cleanName) return;
     console.log(`${LOG_PREFIX} Hovered skin: ${cleanName}`);
     dbg("skin:" + cleanName);
@@ -594,7 +684,7 @@
   function resyncSkinAfterConnect() {
     try {
       const current = readCurrentSkin();
-      const name = String(current || logHoverLastSkin || lastLoggedSkin || "").trim();
+      const name = sanitizeSkinName(current || logHoverLastSkin || lastLoggedSkin);
       if (!name) return;
       sendRoseSkinSync(name, { reconnect: true });
       dbg("skin-resync");
@@ -610,10 +700,8 @@
       sendCount++;
       dbg("send:" + (obj.type || "data"));
 
-      // Rose's Python backend republishes state to every UI plugin. All Rift
-      // Atlas plugins share this bridge in one LeagueClient window, so publish
-      // locally once and send upstream once—no second monitor/socket required.
-      notifySubscribers(payload);
+      // Rose parity: only notify subscribers for INCOMING bridge messages, not outgoing.
+      // Subscribers are notified when the bridge delivers data TO us, not when we send data out.
       _sendRaw(payload);
     } catch (e) {
       lastError = e.message;
@@ -622,10 +710,20 @@
   }
 
   function publishLocalSkinState(state) {
-    window.__riftAtlasSkinState = state;
-    window.dispatchEvent(new CustomEvent("rift-atlas-skin-state", { detail: state }));
-    window.__roseSkinState = state;
-    window.dispatchEvent(new CustomEvent("lu-skin-monitor-state", { detail: state }));
+    const detail = {
+      name: state?.name || lastLoggedSkin || null,
+      skinId: Number.isFinite(state?.skinId) ? state.skinId : null,
+      championId: Number.isFinite(state?.championId) ? state.championId : null,
+      hasChromas: Boolean(state?.hasChromas),
+      owned: state?.owned === true,
+      updatedAt: Date.now(),
+      canonical: state?.canonical === true,
+    };
+    window.__riftAtlasSkinState = detail;
+    window.dispatchEvent(new CustomEvent("rift-atlas-skin-state", { detail }));
+    window.__roseSkinState = detail;
+    if (detail?.name) window.__roseCurrentSkin = detail.name;
+    window.dispatchEvent(new CustomEvent("lu-skin-monitor-state", { detail }));
   }
 
   async function discoverBridgePort() {
@@ -671,43 +769,61 @@
     bridgeSocket.addEventListener("open", () => {
       bridgeReady = true;
       retryDelay = RETRY_BASE_MS;
+      bridgeErrorLogged = false;
+      bridgeSetupWarned = false;
       dbg("bridge-open");
       console.log(`[RiftAtlas Bridge] ✅ WebSocket CONECTADO a ws://127.0.0.1:${bridgePort}`);
-      while (bridgeQueue.length) {
-        const p = bridgeQueue.shift();
-        try { bridgeSocket.send(p); } catch (e) { bridgeQueue.unshift(p); break; }
-      }
+      // Rose parity: expose bridgeEmit on open (like Rose's start() handler)
+      window.__roseBridgeEmit = (payload) => sendBridgePayload(payload);
+      flushBridgeQueue();
       resyncSkinAfterConnect();
       notifyReady();
     });
     bridgeSocket.addEventListener("close", () => {
+      // Rose parity: keep port (don't reset to 0), just mark disconnected
       bridgeReady = false;
       bridgeSocket = null;
-      bridgePort = 0;
       dbg("bridge-close");
-      console.warn(`[RiftAtlas Bridge] ❌ WebSocket CERRADO, reintentando en ${retryDelay}ms`);
+      if (!bridgeErrorLogged) {
+        console.warn(`[RiftAtlas Bridge] ❌ WebSocket CERRADO, reintentando en ${retryDelay}ms`);
+        bridgeErrorLogged = true;
+      }
       scheduleRetry();
     });
     bridgeSocket.addEventListener("error", (e) => {
       lastError = e?.message || "ws-error";
       bridgeReady = false;
       dbg("bridge-err");
-      console.error(`[RiftAtlas Bridge] ⚠️ WebSocket ERROR: ${lastError}`);
+      if (!bridgeSetupWarned) {
+        console.error(`[RiftAtlas Bridge] ⚠️ WebSocket ERROR: ${lastError}`);
+        bridgeSetupWarned = true;
+      }
     });
     bridgeSocket.addEventListener("message", (e) => {
       dbg("recv");
       try {
         const data = JSON.parse(e.data);
         publishCachedBridgeState(data);
-        if (data?.type === "skin-state" && data?.source === "rift-atlas-app") {
-          publishLocalSkinState({
-            championId: Number(data.championId || 0) || null,
-            skinId: Number(data.skinId || 0) || null,
-            name: data.name || null,
-            hasChromas: Boolean(data.hasChromas),
-            owned: data.owned === true,
-            canonical: true,
-          });
+        // Rose-style: accept skin-state from bridge (source="rift-atlas-bridge") OR
+        // from renderer (source="rift-atlas-app"). The bridge generates skin-state
+        // directly after receiving skin-sync, just like Rose's Python backend.
+        if (data?.type === "skin-state") {
+            const skinName = data.skinName || data.name || null;
+            if (skinName) lastLoggedSkin = skinName;
+            publishLocalSkinState({
+              championId: Number.isFinite(data.championId) ? data.championId : null,
+              skinId: Number.isFinite(data.skinId) ? data.skinId : null,
+              name: skinName,
+              hasChromas: Boolean(data.hasChromas),
+              owned: data.isOwned?.status === "owned" || data.owned === true,
+              canonical: true,
+            });
+        }
+        // Rose-style: dispatch custom event for champion-locked (CustomWheel compatibility)
+        if (data?.type === "champion-locked") {
+          window.dispatchEvent(
+            new CustomEvent("rose-custom-wheel-champion-locked", { detail: data })
+          );
         }
         notifySubscribers(data);
       } catch { /* ignore */ }
@@ -737,6 +853,10 @@
     monitoring = true;
     console.log(`${LOG_PREFIX} Starting skin monitoring`);
     dbg("monitor-on");
+    // Rose-style: force re-report on monitoring restart. The DOM may still show
+    // the previous skin name, but we need to send skin-sync so downstream plugins
+    // (ChromaWheel) re-initialize after a phase transition reset.
+    lastLoggedSkin = null;
     attachObservers();
     reportSkinIfChanged();
   }
@@ -784,16 +904,20 @@
     installFindMatchObserver();
     subscribe("debug-mode", (payload = {}) => setDebugMode(payload.enabled));
     subscribe("debug-toggle", () => toggleDebugBox());
+    subscribe("skip-base-skin", handleSkipBaseSkin);
     subscribe("phase-change", (payload = {}) => {
       const phase = String(payload.phase || "");
       if (!phase) return;
       lastGameflowPhase = phase;
       if (phase === "InProgress") stopMonitoring();
       else startMonitoring();
-      if (["Lobby", "ChampSelect"].includes(phase)) {
+      // Rose-style: only reset on Lobby (not ChampSelect), dispatch custom event
+      if (phase === "Lobby") {
         lastLoggedSkin = null;
+        window.dispatchEvent(new CustomEvent("rose-custom-wheel-reset"));
       }
     });
+    interceptChampSelectWebsocket();
     startMonitoring();
   }
 

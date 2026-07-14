@@ -925,7 +925,6 @@ const initializeRoseChampSelectSession = async (reason = "ChampSelect", options 
   cleanupStaleQueueKeys();
   lastPenguSkinSyncKey = "";
   lastPenguSkinSyncAt = 0;
-  roseChampSelectPreForceSignature = "";
   state.roseFinalizationApplyStarted = false;
   state.roseFinalizationCommitted = false;
   state.roseFinalizationSignature = "";
@@ -987,7 +986,6 @@ const resetPenguChampionExchangeState = (oldChamp = 0, newChamp = 0, reason = "c
   lastPenguSkinSyncKey = "";
   lastPenguSkinSyncAt = 0;
   lastPenguLcuSelection = null;
-  roseChampSelectPreForceSignature = "";
   lastPenguChromaSelection = null;
   lastPenguChromaPanel = null;
   state.penguChampionLocked = preserveChampionLock
@@ -1006,6 +1004,7 @@ const resetPenguChampionExchangeState = (oldChamp = 0, newChamp = 0, reason = "c
   window.riftAtlas.appendOverlayLog(
     `[Rose] Exchange: overlay detenido, queued skins limpiados, apply locks reiniciados (gen=${penguApplyGeneration}).`
   ).catch(() => { });
+  startRoseLocalFinalizationTicker();
   return true;
 };
 
@@ -1055,6 +1054,9 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
     window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION apply saltado: fase=${injectPhase} (${reason}).`).catch(() => { });
     return false;
   }
+  // Rose 1:1: trigger_injection() line 64 — mark BEFORE any logic so the
+  // ticker never re-enters while we compute + force + inject.
+  state.lastHoverWritten = true;
   // Rose 1:1: target_skin_id = selected_custom_mod.get("skin_id", ui_skin_id).
   // A queued custom mod selected by the user wins unconditionally. Otherwise
   // fall back to the skin resolved from the DOM hover.
@@ -1067,6 +1069,7 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
     state.lastLockedChampionId ||
     0
   );
+  const effectiveSkinId = Number(roseAuthoritativeSelection.effectiveSkinId || 0);
   if (state.selectedCustomMod?.skinKey) {
     const modSkin = getSkinByKey(state.selectedCustomMod.skinKey);
     const modChampionId = Number(state.selectedCustomMod.championId || getSkinSyncChampionNumber(modSkin || {}) || 0);
@@ -1080,43 +1083,63 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
       ).catch(() => { });
     }
   }
-  if (!skinToInject && roseAuthoritativeSelection.effectiveSkinId > 0) {
+  if (!skinToInject && effectiveSkinId > 0) {
     skinToInject = roseAuthoritativeSelection.skinKey ? getSkinByKey(roseAuthoritativeSelection.skinKey) : null;
   }
-  // Rose 1:1: for owned skins without a local LeagueSkins package, force the
-  // LCU selection directly. The game loads the skin from Riot's servers — we
-  // only need to PATCH the correct selectedSkinId in champ select.
-  if (!skinToInject && roseAuthoritativeSelection.effectiveSkinId > 0 && currentChampionId > 0) {
-    const effectiveOwnership = getRoseSkinOwnershipState(roseAuthoritativeSelection.effectiveSkinId);
-    if (effectiveOwnership === true || effectiveOwnership === null) {
-      const targetId = roseAuthoritativeSelection.effectiveSkinId;
+  // Fallback: try to find skin from library by skin ID (matching Rose's
+  // synchronous state.last_hovered_skin_id → SkinScraper lookup).
+  if (!skinToInject && effectiveSkinId > 0 && currentChampionId > 0) {
+    const fallbackKey = `${currentChampionId}_${effectiveSkinId}`;
+    const fallbackSkin = getSkinByKey(fallbackKey) || getSkinByKey(String(effectiveSkinId));
+    if (fallbackSkin) {
+      skinToInject = fallbackSkin;
       window.riftAtlas.appendOverlayLog(
-        `[Rose] FINALIZATION: skin owned (id=${targetId}) sin paquete local; forzando LCU directamente (no hay paquete local para mkoverlay).`
+        `[Rose] FINALIZATION: skin ${effectiveSkinId} found via fallback lookup (key=${fallbackKey}).`
       ).catch(() => { });
-      try {
-        const forceResult = await window.riftAtlas.forceLcuSkinSelection(currentChampionId, targetId)
-          .catch((error) => ({ forceOk: false, forceError: error?.message || String(error) }));
-        if (forceResult?.forceOk) {
-          state.lastHoverWritten = true;
-          state.roseFinalizationCommitted = true;
-          window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION: LCU force confirmado para skin owned ${targetId}.`).catch(() => { });
-          return true;
-        }
-        window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION: LCU force no confirmado para ${targetId}: ${forceResult?.forceError || "desconocido"} — permitiendo reintentar.`).catch(() => { });
-      } catch (error) {
-        window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION: error forzando LCU para owned ${targetId}: ${error.message || error} — permitiendo reintentar.`).catch(() => { });
-      }
     }
   }
-  // Rose 1:1: si no hay skin resuelta, saltar
+  // Rose 1:1: trigger_injection() decision tree — force LCU FIRST, then inject.
+  // Rose always calls _force_owned_skin() or _force_base_skin() BEFORE
+  // inject_skin_immediately(). The force and injection are atomic — never
+  // return early from force failure without also attempting injection.
+  if (currentChampionId > 0 && effectiveSkinId > 0) {
+    const effectiveOwnership = getRoseSkinOwnershipState(effectiveSkinId);
+    const baseSkinId = currentChampionId * 1000;
+    // Rose line 520-530: owned skins → _force_owned_skin(effective_skin_id)
+    // Rose line 532-542: base owned + chroma → _force_owned_skin(effective_skin_id)
+    // Rose line 544-546: unowned → _inject_unowned_skin → _force_base_skin(base)
+    const forceDesired = (effectiveOwnership === true) ? effectiveSkinId : baseSkinId;
+    const forceLabel = (effectiveOwnership === true) ? "owned" : "unowned/base";
+    window.riftAtlas.appendOverlayLog(
+      `[Rose] FINALIZATION: LCU force (${forceLabel}): championId=${currentChampionId} desired=${forceDesired} skin=${effectiveSkinId} owned=${effectiveOwnership === true ? "si" : effectiveOwnership === false ? "no" : "unknown"}`
+    ).catch(() => { });
+    try {
+      await window.riftAtlas.forceLcuSkinSelection(currentChampionId, forceDesired)
+        .then((result) => {
+          window.riftAtlas.appendOverlayLog(
+            `[Rose] FINALIZATION: LCU force result: forceOk=${result?.forceOk} method=${result?.forceMethod || "?"} verified=${result?.verifiedSkinId || "?"} branch=${result?.branch || "?"}`
+          ).catch(() => { });
+        })
+        .catch((error) => {
+          window.riftAtlas.appendOverlayLog(
+            `[Rose] FINALIZATION: LCU force error: ${error?.message || error}`
+          ).catch(() => { });
+        });
+    } catch (error) {
+      window.riftAtlas.appendOverlayLog(`[Rose] FINALIZATION: LCU force exception: ${error?.message || error}`).catch(() => { });
+    }
+  }
+  // Rose 1:1: always continue to overlay injection after force. Never abort.
   if (!skinToInject) {
-    window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION: no hay skin resuelta; saltando inyeccion (Rose: last_hovered_skin_id is None).").catch(() => { });
-    return false;
+    window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION: no hay skin resuelta para overlay; force LCU completado.").catch(() => { });
+    state.roseFinalizationCommitted = true;
+    return true;
   }
   const skin = skinToInject;
   if (!skin) {
     window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION: skin resuelta no encontrada en libreria.").catch(() => { });
-    return false;
+    state.roseFinalizationCommitted = true;
+    return true;
   }
   if (customModWonFinalization) {
     const modChampionId = Number(getSkinSyncChampionNumber(skin) || currentChampionId || 0);
@@ -1132,25 +1155,16 @@ const triggerRoseFinalizationApply = async (reason = "finalization") => {
       originalName: skin.skin || skin.name || payload.originalName || payload.skin || String(modTargetSkinId || ""),
     }, skin);
   }
-  // Commit guards only after we are sure we have a valid skin to inject. Rose
-  // sets last_hover_written at the start of injection and never aborts based on
-  // a name-vs-package similarity check.
-  state.lastHoverWritten = true;
   state.roseFinalizationCommitted = true;
   state.roseFinalizationApplyStarted = true;
   let applied = false;
   try {
     lastPenguSkinSyncPayload = { ...payload };
-    // Rose does not run a separate LCU PATCH from the FINALIZATION ticker.
-    // The owned/unowned branch happens once inside the injection path, so the
-    // client is not visibly sent to base before the actual apply starts.
+    // Rose 1:1: overlay injection always runs after LCU force.
     applied = Boolean(await handlePenguSkinApply({ ...payload, key: getSkinKey(skin), type: payload.type || "loadout-finalization" }));
     return applied;
   } finally {
     if (!applied) {
-      // Unlike Rose, Rift Atlas's finalization guards persist across games.
-      // Reset them so the next ChampSelect/FINALIZATION cycle can still try to
-      // inject.
       state.lastHoverWritten = false;
       state.roseFinalizationCommitted = false;
       window.riftAtlas.appendOverlayLog("[Rose] FINALIZATION: inyeccion no aplicada; reseteando guards para permitir fallback.").catch(() => { });
@@ -2171,7 +2185,6 @@ let penguBackgroundApplyAt = 0;
 let penguBackgroundApplyPromise = Promise.resolve();
 let penguBackgroundApplyInFlightKey = "";
 let penguSkinSyncQueue = Promise.resolve();
-let roseChampSelectPreForceSignature = "";
 let penguApplyGeneration = 0;
 let penguSkinSyncGeneration = 0;
 
@@ -2431,17 +2444,19 @@ const getRoseEffectiveSkinDecision = (skin = {}, payload = {}, championId = 0) =
 
   const effectiveOwnership = getRoseSkinOwnershipState(effectiveSkinId);
   const uiOwnership = getRoseSkinOwnershipState(uiSkinId);
-  // Rose 1:1: always force the BASE skin (championId × 1000) in the LCU.
-  // The LCU silently accepts PATCHes on completed/locked actions (204) but does
-  // NOT actually change selectedSkinId for non-base skins. The base skin is always
-  // accepted because it is always "owned". The WAD overlay then remaps
-  // skins/skin{base} → target skin textures in-game.
+  // Rose 1:1: for owned skins, PATCH the actual skin ID to the LCU so the
+  // game loads it from Riot's servers. For unowned skins, PATCH the base skin
+  // and let the WAD overlay remap textures.
   let desiredSkinId = championBaseId;
   let branch = "always-force-base";
 
   if (effectiveSkinId > 0 && effectiveOwnership === true) {
+    // Rose _force_owned_skin(): PATCH actual owned skin ID
+    desiredSkinId = effectiveSkinId;
     branch = "owned-effective";
   } else if (uiSkinId > 0 && uiOwnership === true && effectiveSkinId !== uiSkinId) {
+    // Rose: chroma on owned base — force the chroma ID (which is owned)
+    desiredSkinId = effectiveSkinId;
     branch = "owned-base-selected-chroma";
   }
 
@@ -2464,11 +2479,6 @@ const getOverlayForceSkinId = (skin = {}, payload = {}, championId = 0) => {
   const targetSkinId = getOverlayTargetSkinId(skin, numericChampionId);
   const payloadChromaId = Number(payload.chromaId || payload.selectedChromaId || 0);
   const payloadBaseSkinId = Number(payload.baseSkinId || 0);
-  // Form/Chroma special cases: if the payload chroma is a form, resolve to base
-  const formBaseId = getFormBaseSkinId(payloadChromaId);
-  if (formBaseId) {
-    return formBaseId;
-  }
 
   if (targetSkinId > 0 || payloadChromaId > 0) {
     return getRoseEffectiveSkinDecision(skin, payload, numericChampionId).desiredSkinId;
@@ -2532,6 +2542,12 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
       window.riftAtlas.appendOverlayLog(`[TrackerDiag] calling startBaseSkinTracking(${desiredSkinId})`).catch(() => {});
       window.riftAtlas.startBaseSkinTracking(desiredSkinId);
     }
+    window.riftAtlas.sendPenguMessage?.({
+      type: "skip-base-skin",
+      championId,
+      selectedSkinId: desiredSkinId,
+      timestamp: Date.now(),
+    }).catch(() => {});
     result = await window.riftAtlas.forceLcuSkinSelection(championId, desiredSkinId)
       .catch((error) => ({
         forceOk: false,
@@ -2585,58 +2601,6 @@ const maybeForceLeagueSkinForOverlay = async (skin = {}, payload = {}) => {
   lastRoseForceSkinResult = result || null;
   lastPenguLcuSelection = { championId, selectedSkinId: verifiedSkinId, at: Date.now() };
   window.riftAtlas.appendOverlayLog(`[Rose] force-skin confirmado por LCU: ${verifiedSkinId} via ${result.forceMethod || "desconocido"}.`).catch(() => { });
-  return true;
-};
-
-const maybePreForceLeagueSkinDuringChampSelect = async (skin = {}, payload = {}) => {
-  const phase = String(state.penguGameflowPhase || "");
-  const canStillPatchLcu = phase === "FINALIZATION";
-  if (!canStillPatchLcu || state.roseFinalizationApplyStarted || state.roseFinalizationCommitted) {
-    return false;
-  }
-  const championId = Number(
-    getChampionIdFromSkinSyncPayload(payload) ||
-    getSkinSyncChampionNumber(skin) ||
-    state.lastLockedChampionId ||
-    0
-  );
-  if (!championId) return false;
-  const targetSkinId = getOverlayTargetSkinId(skin, championId);
-  if (!targetSkinId || targetSkinId === championId * 1000) return false;
-
-  if (targetSkinId % 1000 !== 0 && !state.penguOwnedSkinsReady) {
-    fetchLcuOwnedSkinsFallback();
-    await waitForPenguOwnedSkinsReady(2500);
-  }
-
-  const decision = getRoseEffectiveSkinDecision(skin, payload, championId);
-  const desiredSkinId = Number(decision.desiredSkinId || 0);
-  if (!desiredSkinId) return false;
-  const actualSkinId = lastPenguLcuSelection?.championId === championId
-    ? Number(lastPenguLcuSelection.selectedSkinId || 0)
-    : Number(payload.actualLcuSkinId || 0);
-  if (actualSkinId === desiredSkinId) return false;
-
-  const signature = [
-    championId,
-    phase,
-    decision.uiSkinId || 0,
-    decision.effectiveSkinId || 0,
-    desiredSkinId,
-    actualSkinId || 0,
-    state.penguOwnedSkinsReady ? "owned-ready" : "owned-pending",
-  ].join(":");
-  if (signature === roseChampSelectPreForceSignature) return false;
-  roseChampSelectPreForceSignature = signature;
-
-  window.riftAtlas.appendOverlayLog(
-    `[RosePreForce] ${phase} pre-force: championId=${championId} actual=${actualSkinId || "?"} desired=${desiredSkinId} target=${targetSkinId} ui=${decision.uiSkinId || "?"} effective=${decision.effectiveSkinId || "?"} branch=${decision.branch}.`
-  ).catch(() => { });
-  await maybeForceLeagueSkinForOverlay(skin, {
-    ...payload,
-    championId,
-    actualLcuSkinId: actualSkinId || payload.actualLcuSkinId || 0,
-  });
   return true;
 };
 
@@ -2841,32 +2805,6 @@ const applyPenguSelectedSkin = async (key = "", payloadSnapshot = null) => {
         return false;
       }
 
-      // When LCU force fails, the LCU keeps a different skin (e.g. 518040 Cosplayer)
-      // than the target (e.g. 518029 Embrujada). The mkoverlay WAD will contain mod
-      // files at skins/skin{target}/... paths, but the game loads skins/skin{actual}/...
-      // and finds nothing. Fix: include the base skin package for the actual LCU skin
-      // so the WAD has files for both paths. This matches Rose behavior.
-      let actualLcuBasePackage = null;
-      if (!mainForceOk) {
-        const actualLcuSkinId = Number(lastRoseForceSkinResult?.verifiedSkinId || 0);
-        const desiredTargetSkinId = getOverlayTargetSkinId(penguSkin, activeChampionId);
-        if (actualLcuSkinId > 0 && actualLcuSkinId !== desiredTargetSkinId) {
-          const actualLcuBaseSkinId = actualLcuSkinId - (actualLcuSkinId % 1000) || activeChampionId * 1000;
-          actualLcuBasePackage = await getOrRegisterLeagueSkinPackage(
-            activeChampionId,
-            actualLcuSkinId,
-            actualLcuBaseSkinId,
-            `base-${actualLcuSkinId}`
-          ).catch((error) => {
-            window.riftAtlas.appendOverlayLog(`[Rose] No pude resolver paquete base para LCU skin actual ${actualLcuSkinId}: ${error.message || error}`).catch(() => { });
-            return null;
-          });
-          if (actualLcuBasePackage) {
-            window.riftAtlas.appendOverlayLog(`[Rose] Force fallo; incluyo paquete base para LCU skin actual ${actualLcuSkinId} (target era ${desiredTargetSkinId}).`).catch(() => { });
-          }
-        }
-      }
-
       // Rose forces LCU first, then starts InjectionManager/monitor. Keep the
       // same order so League is not suspended before the skin PATCH lands.
       await startRoseEarlyMonitor(`apply-${key}`);
@@ -2900,7 +2838,7 @@ const applyPenguSelectedSkin = async (key = "", payloadSnapshot = null) => {
       }
 
       // UNOWNED path: build overlay with skin WAD + base skin package
-      const selectedEntries = [customBasePackage, actualLcuBasePackage, penguSkin, ...supportEntries].filter(Boolean);
+      const selectedEntries = [customBasePackage, penguSkin, ...supportEntries].filter(Boolean);
       const extraMods = await getSelectedRoseExtraMods();
       window.riftAtlas.appendOverlayLog(`[Diagnostico] Modo Rose: mkoverlay fresco y unico para ${selectedEntries.length} mod(s).`).catch(() => { });
       if (!window.riftAtlas.runRoseOverlay) throw new Error("Runner RoseV2 no disponible; reinicia la aplicacion.");
@@ -3436,7 +3374,26 @@ const resolveRoseAuthoritativeSkinEntry = async (payload = {}, fallbackSkin = nu
   ).trim();
 
   if (originalSkinText || Number(resolvedPayload.chromaId || resolvedPayload.selectedChromaId || 0)) {
-    resolvedPayload = await resolveSkinSyncPayloadWithLcu(resolvedPayload);
+    // Rose-parity: if the bridge already resolved this skin (skin-state from
+    // Rust backend), use the cached resolution instead of re-resolving async.
+    // This prevents the async LCU HTTP calls from outlasting the FINALIZATION
+    // window and causing a 404 on the force PATCH.
+    const bridgeState = window.__roseSkinState;
+    const bridgeChampionId = Number(bridgeState?.championId || 0);
+    const bridgeSkinId = Number(bridgeState?.skinId || 0);
+    const payloadChampionId = getChampionIdFromSkinSyncPayload(resolvedPayload) || 0;
+    if (bridgeSkinId > 0 && bridgeChampionId > 0 && payloadChampionId > 0 &&
+        bridgeChampionId === payloadChampionId &&
+        bridgeState?.name && originalSkinText &&
+        bridgeState.name.toLowerCase() === originalSkinText.toLowerCase()) {
+      resolvedPayload.resolvedSkinId = bridgeSkinId;
+      resolvedPayload.resolvedSkinName = bridgeState.name;
+      window.riftAtlas?.appendOverlayLog?.(
+        `[RoseResolver] using bridge-cached resolution: '${originalSkinText}' -> skinId=${bridgeSkinId} (skipping async LCU)`
+      ).catch?.(() => {});
+    } else {
+      resolvedPayload = await resolveSkinSyncPayloadWithLcu(resolvedPayload);
+    }
   }
 
   const championId = Number(
@@ -3786,11 +3743,19 @@ const findSkinFromPenguSync = (payload = {}) => {
   const baseSkinId = Number(payload.baseSkinId || 0);
   const championId = getChampionIdFromSkinSyncPayload(payload);
 
-  const queuedCustomMods = state.customMods.filter((skin) => state.queuedSkins.has(getSkinKey(skin)));
-  const nonQueuedCustomMods = state.customMods.filter((skin) => !state.queuedSkins.has(getSkinKey(skin)));
-  const candidates = [...queuedCustomMods, ...nonQueuedCustomMods, ...state.skinLibrary]
-    .filter((skin) => getSkinKey(skin) && skin.path)
-    .filter((skin, index, array) => array.findIndex((entry) => getSkinKey(entry) === getSkinKey(skin)) === index);
+const queuedCustomMods = state.customMods.filter((skin) => state.queuedSkins.has(getSkinKey(skin)));
+   const nonQueuedCustomMods = state.customMods.filter((skin) => !state.queuedSkins.has(getSkinKey(skin)));
+   
+   const skinLibrary = state.skinLibrary.filter((skin) => {
+     if (skin.custom) return true;
+     if (skin.queued) return true;
+     const isLcuOwned = skin.baseImageSkinNum && skin.baseImageSkinNum % 1000 === 0;
+     return !isLcuOwned;
+   });
+   
+   const candidates = [...queuedCustomMods, ...nonQueuedCustomMods, ...skinLibrary]
+     .filter((skin) => getSkinKey(skin) && skin.path)
+     .filter((skin, index, array) => array.findIndex((entry) => getSkinKey(entry) === getSkinKey(skin)) === index);
   if (payload.resolvedPackagePath) {
     const directPackage = candidates.find((entry) => getSkinKey(entry) === payload.resolvedPackagePath);
     if (directPackage) return directPackage;
@@ -3853,10 +3818,21 @@ const findSkinFromPenguSync = (payload = {}) => {
     return null;
   }
 
-  const queuedMatchNames = getPenguPayloadMatchNames(payload);
+const queuedMatchNames = getPenguPayloadMatchNames(payload);
   const exactQueuedNameMatch = queuedMatchNames.length ? candidates.find((entry) => {
     const skinChampionId = getSkinSyncChampionNumber(entry);
     if (championId && skinChampionId && skinChampionId !== championId) return false;
+    
+    // Prioritize queued custom mods (user intent) over LCU-owned fallback
+    if (state.queuedSkins.has(getSkinKey(entry))) {
+      return getPenguSkinMatchNames(entry).some((name) => queuedMatchNames.includes(normalizeSkinSyncText(name)));
+    }
+    
+    // Skip LCU-owned skins for name-driven resolution to prioritize user intent
+    if (!entry.custom && !state.queuedSkins.has(getSkinKey(entry))) {
+      return false;
+    }
+    
     return getPenguSkinMatchNames(entry).some((name) => queuedMatchNames.includes(normalizeSkinSyncText(name)));
   }) : null;
   if (exactQueuedNameMatch) {
@@ -3877,6 +3853,12 @@ const findSkinFromPenguSync = (payload = {}) => {
     const exactNameMatch = candidates.find((skin) => {
       const skinChampionId = getSkinSyncChampionNumber(skin);
       if (championId && skinChampionId && skinChampionId !== championId) return false;
+      
+      // Skip LCU-owned skins to prioritize user intent and queued mods
+      if (!skin.custom && !state.queuedSkins.has(getSkinKey(skin))) {
+        return false;
+      }
+      
       const names = getPenguSkinMatchNames(skin);
       return names.some((name) => payloadMatchNames.includes(normalizeSkinSyncText(name)));
     });
@@ -4027,9 +4009,13 @@ const queuePenguSelectionForFinalization = async (payload, key) => {
     `[Rose] estado canonico: championId=${preparedPayload.championId || "?"} requestedSkinId=${preparedPayload.requestedSkinId || "?"} actualLcuSkinId=${preparedPayload.actualLcuSkinId || lastPenguLcuSelection?.selectedSkinId || "?"} name=${preparedPayload.resolvedSkinName || preparedPayload.skin || "?"} deferred=${deferred}.`
   ).catch(() => { });
   if (deferred) {
-    maybePreForceLeagueSkinDuringChampSelect(skin, preparedPayload).catch((error) => {
-      window.riftAtlas.appendOverlayLog(`[RosePreForce] pre-force fallo: ${error.message || error}`).catch(() => { });
-    });
+    if (state.roseFinalizationCommitted || state.lastHoverWritten) {
+      state.roseFinalizationCommitted = false;
+      state.lastHoverWritten = false;
+      state.roseFinalizationApplyStarted = false;
+      window.riftAtlas.appendOverlayLog(`[Rose] Nueva seleccion difiere finalizacion previa; reiniciando guards para permitir re-aplicacion.`).catch(() => { });
+    }
+    startRoseLocalFinalizationTicker();
     window.riftAtlas.appendOverlayLog(
       `[Rose] Seleccion actualizada; inyeccion diferida al ticker local monotonic de ${state.skinWriteMs}ms.`
     ).catch(() => { });
