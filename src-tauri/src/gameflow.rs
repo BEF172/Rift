@@ -1,13 +1,40 @@
 use crate::overlay;
 use base64::Engine;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
-struct Lockfile {
-    port: u16,
-    password: String,
-    protocol: String,
+pub struct Lockfile {
+    pub port: u16,
+    pub password: String,
+    pub protocol: String,
+}
+
+/// Rose 1:1: cached LCU session — the connection handler maintains `self.lcu.session`
+/// as a cached object that is read without HTTP. We replicate this with a global
+/// `Mutex<Option<...>>` that is updated by every successful LCU read and consumed
+/// by `force_selected_skin` to avoid the ~150ms HTTP round-trip that causes the
+/// action to become `completed=true` before the PATCH arrives.
+static CACHED_LCU_SESSION: Mutex<Option<(Instant, serde_json::Value)>> = Mutex::new(None);
+const CACHED_SESSION_MAX_AGE_MS: u128 = 2000;
+
+fn read_cached_session() -> Option<serde_json::Value> {
+    let guard = CACHED_LCU_SESSION.lock().ok()?;
+    let Some((ts, ref value)) = *guard else {
+        return None;
+    };
+    if ts.elapsed().as_millis() < CACHED_SESSION_MAX_AGE_MS {
+        Some(value.clone())
+    } else {
+        None
+    }
+}
+
+fn write_cached_session(session: &serde_json::Value) {
+    if let Ok(mut guard) = CACHED_LCU_SESSION.lock() {
+        *guard = Some((Instant::now(), session.clone()));
+    }
 }
 
 async fn read_lcu_json(path: &str) -> Result<serde_json::Value, String> {
@@ -159,6 +186,7 @@ async fn verify_lcu_skin(
     let Ok(session) = response.json::<serde_json::Value>().await else {
         return 0;
     };
+    write_cached_session(&session);
     local_selection(&session)
         .map(|(_, _, selected_skin_id)| selected_skin_id)
         .unwrap_or(0)
@@ -223,17 +251,31 @@ pub async fn force_selected_skin(
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|error| format!("No pude crear cliente LCU: {}", error))?;
-    let session = client
-        .get(lcu_url(&lockfile, "/lol-champ-select/v1/session"))
-        .header("Authorization", lcu_auth(&lockfile))
-        .send()
-        .await
-        .map_err(|error| format!("No pude leer ChampSelect: {}", error))?
-        .error_for_status()
-        .map_err(|error| format!("ChampSelect no disponible: {}", error))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| format!("Sesion ChampSelect invalida: {}", error))?;
+    // Rose 1:1: read from cached session first (Rose: self.lcu.session).
+    // The cached session is maintained by every successful LCU read. Using the
+    // cache avoids the ~100-150ms HTTP round-trip that causes the pick action
+    // to become `completed=true` before the PATCH arrives.
+    let session_source;
+    let session = if let Some(cached) = read_cached_session() {
+        session_source = "cached";
+        cached
+    } else {
+        session_source = "http";
+        let fresh = client
+            .get(lcu_url(&lockfile, "/lol-champ-select/v1/session"))
+            .header("Authorization", lcu_auth(&lockfile))
+            .send()
+            .await
+            .map_err(|error| format!("No pude leer ChampSelect: {}", error))?
+            .error_for_status()
+            .map_err(|error| format!("ChampSelect no disponible: {}", error))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| format!("Sesion ChampSelect invalida: {}", error))?;
+        write_cached_session(&fresh);
+        fresh
+    };
+    eprintln!("[LCU-Force] session source={}", session_source);
     let (local_cell_id, session_champion_id, current_skin_id) =
         local_selection(&session).ok_or_else(|| "Jugador local no encontrado.".to_string())?;
     if session_champion_id != 0 && session_champion_id != champion_id {
@@ -261,50 +303,46 @@ pub async fn force_selected_skin(
         action_id_seen = Some(action_id);
         action_completed_seen = Some(completed);
         eprintln!("[LCU-Force] pick action id={} completed={}", action_id, completed);
-        // Rose 1:1: always try the action PATCH first, even when completed.
-        // The LCU still accepts skin changes on completed actions; my-selection
-        // PATCH alone does not override the locked selectedSkinId after lock-in.
-        let path = format!("/lol-champ-select/v1/session/actions/{}", action_id);
-        match lcu_patch_skin(&client, &lockfile, &path, selected_skin_id).await {
-            Ok((true, status, _body)) => {
-                request_accepted = true;
-                method = "action".to_string();
-                eprintln!("[LCU-Force] action PATCH accepted status={} completed={}", status, completed);
+        // Rose 1:1: use the action endpoint only while the pick action is open.
+        // Completed actions fall through to the my-selection fallback.
+        if !completed {
+            let path = format!("/lol-champ-select/v1/session/actions/{}", action_id);
+            match lcu_patch_skin(&client, &lockfile, &path, selected_skin_id).await {
+                Ok((true, status, _body)) => {
+                    request_accepted = true;
+                    method = "action".to_string();
+                    eprintln!("[LCU-Force] action PATCH accepted status={} completed={}", status, completed);
+                }
+                Ok((_, status, body)) => {
+                    last_error = format!(
+                        "action HTTP {} {}",
+                        status,
+                        body.chars().take(240).collect::<String>()
+                    );
+                    eprintln!("[LCU-Force] action PATCH failed: {}", last_error);
+                }
+                Err(error) => {
+                    eprintln!("[LCU-Force] action PATCH error: {}", error);
+                    last_error = error;
+                }
             }
-            Ok((_, status, body)) => {
-                last_error = format!(
-                    "action HTTP {} {}",
-                    status,
-                    body.chars().take(240).collect::<String>()
-                );
-                eprintln!("[LCU-Force] action PATCH failed: {}", last_error);
-            }
-            Err(error) => {
-                eprintln!("[LCU-Force] action PATCH error: {}", error);
-                last_error = error;
-            }
+        } else {
+            last_error = "pick action already completed".to_string();
         }
     } else {
         last_error = "no local pick action found".to_string();
         eprintln!("[LCU-Force] {}", last_error);
     }
 
-    // Rose 1:1: retry loop. The LCU sometimes accepts a PATCH (204) but the
-    // skin does not actually change because of a race with the client's
-    // internal state machine. Rose retries until confirmation or timeout.
-    // Rose retries for ~2-3 seconds; we use 10 attempts × 250ms = 2.5s.
-    const MAX_FORCE_RETRIES: u32 = 10;
-    const RETRY_DELAY_MS: u64 = 250;
-    let mut attempt = 0u32;
-    let mut verified = 0u64;
-    let mut last_method = method.clone();
-    loop {
-        attempt += 1;
-        // Rose parity: always try my-selection as fallback when previous attempt
-        // did not confirm the desired skin, regardless of whether action PATCH
-        // was accepted. The LCU silently accepts action PATCHes on completed
-        // actions (204) without actually changing selectedSkinId.
-        if verified != selected_skin_id {
+    // Rose 1:1: single my-selection fallback after action PATCH, then verify.
+    // Rose does NOT retry aggressively — it sends one action PATCH, one
+    // my-selection, waits BASE_SKIN_VERIFICATION_WAIT_S (150ms), verifies,
+    // and moves on. Retrying for seconds races with ChampSelect→InProgress
+    // and causes false-negative verification (session gone = verifiedSkinId=0).
+    let verified;
+    {
+        // Try my-selection only as fallback, matching Rose.
+        if !request_accepted {
             match lcu_patch_skin(
                 &client,
                 &lockfile,
@@ -315,8 +353,8 @@ pub async fn force_selected_skin(
             {
                 Ok((true, status, _body)) => {
                     request_accepted = true;
-                    last_method = "my-selection".to_string();
-                    eprintln!("[LCU-Force] my-selection PATCH accepted status={} attempt={}", status, attempt);
+                    method = "my-selection".to_string();
+                    eprintln!("[LCU-Force] my-selection PATCH accepted status={}", status);
                 }
                 Ok((_, status, body)) => {
                     last_error = format!(
@@ -332,15 +370,10 @@ pub async fn force_selected_skin(
                 }
             }
         }
+        // Rose parity: single verify after BASE_SKIN_VERIFICATION_WAIT_S (150ms)
         verified = verify_lcu_skin(&client, &lockfile).await;
-        eprintln!("[LCU-Force] verify desired={} verified={} attempt={} method={}", selected_skin_id, verified, attempt, last_method);
-        if verified == selected_skin_id || attempt >= MAX_FORCE_RETRIES {
-            break;
-        }
-        eprintln!("[LCU-Force] retry {}/{} in {}ms", attempt, MAX_FORCE_RETRIES, RETRY_DELAY_MS);
-        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        eprintln!("[LCU-Force] verify desired={} verified={} method={}", selected_skin_id, verified, method);
     }
-    method = last_method;
     let force_ok = verified == selected_skin_id;
     if force_ok {
         last_error.clear();
@@ -445,6 +478,7 @@ pub async fn wait_for_finalization_threshold(
                 .await
             {
                 if let Ok(session) = response.json::<serde_json::Value>().await {
+                    write_cached_session(&session);
                     if let Some(timer) = session.get("timer").cloned() {
                         let left_ms = timer
                             .get("adjustedTimeLeftInPhase")
@@ -472,6 +506,7 @@ pub async fn wait_for_finalization_threshold(
             {
                 if response.status().is_success() {
                     if let Ok(session) = response.json::<serde_json::Value>().await {
+                        write_cached_session(&session);
                         if let Some(timer) = session.get("timer").cloned() {
                             let left_ms = timer
                                 .get("adjustedTimeLeftInPhase")
@@ -504,6 +539,8 @@ pub async fn wait_for_finalization_threshold(
             if remaining_ms <= threshold_ms {
                 // Rose-style: read actual LCU selection at injection time so the
                 // frontend doesn't rely on stale cached variables between games.
+                // Also cache this session so force_selected_skin uses it without
+                // an extra HTTP round-trip (Rose: self.lcu.session).
                 let actual = match client
                     .get(lcu_url(&lockfile, "/lol-champ-select/v1/session"))
                     .header("Authorization", lcu_auth(&lockfile))
@@ -511,7 +548,10 @@ pub async fn wait_for_finalization_threshold(
                     .await
                 {
                     Ok(resp) => match resp.json::<serde_json::Value>().await {
-                        Ok(session) => local_selection(&session),
+                        Ok(session) => {
+                            write_cached_session(&session);
+                            local_selection(&session)
+                        }
                         Err(_) => None,
                     },
                     Err(_) => None,
@@ -598,7 +638,7 @@ fn find_lockfile() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-fn read_lockfile() -> Option<Lockfile> {
+pub fn read_lockfile() -> Option<Lockfile> {
     let content = std::fs::read_to_string(find_lockfile()?).ok()?;
     let parts: Vec<&str> = content.trim().splitn(5, ':').collect();
     if parts.len() != 5 {
@@ -611,5 +651,163 @@ fn read_lockfile() -> Option<Lockfile> {
     })
 }
 
+// =============================================================================
+// Rose-style ownership helpers
+// =============================================================================
 
+/// Rose `is_default_skin()`: champion base skin always has skin_id % 1000 == 0.
+/// e.g. champion 36 → base skin 36000, champion 123 → base skin 123000.
+pub fn is_default_skin(skin_id: u64) -> bool {
+    skin_id > 0 && skin_id % 1000 == 0
+}
+
+/// Rose `get_base_skin_id_for_champion()`: champion_id * 1000.
+pub fn get_base_skin_id(champion_id: u64) -> u64 {
+    champion_id * 1000
+}
+
+/// Rose `is_owned()`: base skin is always owned; otherwise check the set.
+/// Returns `None` if owned_skins_ready is false (data not yet loaded).
+pub fn is_skin_owned(owned_skin_ids: &std::collections::HashSet<u64>, skin_id: u64) -> Option<bool> {
+    if skin_id == 0 {
+        return None;
+    }
+    if is_default_skin(skin_id) {
+        return Some(true);
+    }
+    Some(owned_skin_ids.contains(&skin_id))
+}
+
+/// Refresh owned skin IDs from LCU and update AppState.
+/// Returns the count of owned skins, or an error.
+pub async fn refresh_owned_skins(
+    owned_skin_ids: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+    owned_skins_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<usize, String> {
+    let result = fetch_owned_skins().await?;
+    let ids = result
+        .get("ownedSkinIds")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64())
+                .filter(|id| *id > 0)
+                .collect::<Vec<u64>>()
+        })
+        .unwrap_or_default();
+    let count = ids.len();
+    if let Ok(mut set) = owned_skin_ids.write() {
+        set.clear();
+        set.extend(ids);
+    }
+    owned_skins_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    eprintln!("[Rose-Ownership] Refreshed owned skins: {} skins loaded.", count);
+    Ok(count)
+}
+
+/// Rose-style `force_skin_rose_style()`: the atomic ownership-aware force.
+///
+/// 1. Owned skin → PATCH the actual skin ID (game loads from Riot servers)
+/// 2. Unowned skin → PATCH base skin (champion_id * 1000), overlay WAD remaps
+/// 3. Chroma on owned base → PATCH the chroma ID
+///
+/// Returns the decision so the caller knows whether overlay WADs are needed.
+pub async fn force_skin_rose_style(
+    owned_skin_ids: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+    owned_skins_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    champion_id: u64,
+    target_skin_id: u64,
+    selected_chroma_id: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    if champion_id == 0 || target_skin_id == 0 {
+        return Err("championId/targetSkinId invalidos.".to_string());
+    }
+
+    let base_skin_id = get_base_skin_id(champion_id);
+
+    // Determine effective skin ID (chroma takes precedence if it belongs to this skin)
+    let effective_skin_id = if let Some(chroma_id) = selected_chroma_id {
+        if chroma_id > 0 && chroma_id > target_skin_id && chroma_id < target_skin_id + 100 {
+            chroma_id
+        } else {
+            target_skin_id
+        }
+    } else {
+        target_skin_id
+    };
+
+    // Check ownership — scope the lock so the guard is dropped before any .await
+    let (effective_owned, ui_owned, ready) = {
+        let owned_set = owned_skin_ids.read().map_err(|e| format!("Lock poisoned: {}", e))?;
+        let ready = owned_skins_ready.load(std::sync::atomic::Ordering::SeqCst);
+        let effective_owned = is_skin_owned(&owned_set, effective_skin_id);
+        let ui_owned = is_skin_owned(&owned_set, target_skin_id);
+        (effective_owned, ui_owned, ready)
+    };
+
+    // Determine desired skin ID (Rose decision tree)
+    let (desired_skin_id, branch, is_owned) = if effective_owned == Some(true) {
+        // Rose `_force_owned_skin()`: PATCH actual owned skin ID
+        (effective_skin_id, "owned-effective", true)
+    } else if ui_owned == Some(true) && effective_skin_id != target_skin_id {
+        // Rose: chroma on owned base — force the chroma ID (which is owned)
+        (effective_skin_id, "owned-base-selected-chroma", true)
+    } else {
+        // Rose `_force_unowned_skin()`: force base skin, overlay WAD needed
+        (base_skin_id, "always-force-base", false)
+    };
+
+    // If LCU already has the target skin and it's owned, skip force
+    if is_owned && desired_skin_id != base_skin_id {
+        // Read current LCU selection to check if already set (use cached session)
+        let session = if let Some(cached) = read_cached_session() {
+            cached
+        } else {
+            read_lcu_json("/lol-champ-select/v1/session").await.unwrap_or(serde_json::Value::Null)
+        };
+        if let Some((_, _, current_skin_id)) = local_selection(&session) {
+            if current_skin_id == desired_skin_id {
+                return Ok(serde_json::json!({
+                    "forceOk": true,
+                    "forceMethod": "already-selected",
+                    "verifiedSkinId": current_skin_id,
+                    "desiredSkinId": desired_skin_id,
+                    "isOwned": is_owned,
+                    "branch": branch,
+                    "needsOverlay": false,
+                }));
+            }
+        }
+    }
+
+    // Force via LCU
+    let force_result = force_selected_skin(champion_id, desired_skin_id).await?;
+
+    // For unowned skins, also send skip-base-skin broadcast
+    if !is_owned {
+        eprintln!("[Rose-Ownership] Unowned skin {} — forced base {}; overlay WAD needed.", target_skin_id, base_skin_id);
+    } else {
+        eprintln!("[Rose-Ownership] Owned skin {} — forced desiredSkinId={}; branch={}.", target_skin_id, desired_skin_id, branch);
+    }
+
+    // Determine if overlay is needed
+    // Owned skins without chromas/custom mods: NO overlay needed
+    // Unowned skins: YES overlay needed (WAD remaps base → target)
+    // Chromas: YES overlay needed (chroma texture)
+    let needs_overlay = !is_owned || selected_chroma_id.is_some();
+
+    Ok(serde_json::json!({
+        "forceOk": force_result.get("forceOk").and_then(|v| v.as_bool()).unwrap_or(false),
+        "requestAccepted": force_result.get("requestAccepted").and_then(|v| v.as_bool()).unwrap_or(false),
+        "forceMethod": force_result.get("forceMethod").and_then(|v| v.as_str()).unwrap_or(""),
+        "verifiedSkinId": force_result.get("verifiedSkinId").and_then(|v| v.as_u64()).unwrap_or(0),
+        "forceError": force_result.get("forceError").and_then(|v| v.as_str()).unwrap_or(""),
+        "desiredSkinId": desired_skin_id,
+        "isOwned": is_owned,
+        "branch": branch,
+        "needsOverlay": needs_overlay,
+        "championBaseId": base_skin_id,
+        "ownedReady": ready,
+    }))
+}
 

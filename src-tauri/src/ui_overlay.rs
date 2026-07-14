@@ -1,7 +1,9 @@
+use crate::AppState;
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 /// Rose-style SharedState fields relevant to the main loop UI decisions.
 pub struct UiOverlayState {
@@ -21,6 +23,7 @@ pub struct UiOverlayState {
     pub reset_skin_notification: bool,
     pub is_swiftplay_mode: bool,
     pub game_mode: Option<String>,
+    pub map_id: Option<u64>,
     pub queue_id: Option<u64>,
     // Debounce tracking (owned by main loop, not shared)
     pub last_notified_skin_id: Option<i32>,
@@ -45,6 +48,7 @@ impl UiOverlayState {
             reset_skin_notification: false,
             is_swiftplay_mode: false,
             game_mode: None,
+            map_id: None,
             queue_id: None,
             last_notified_skin_id: None,
         }
@@ -167,6 +171,84 @@ pub async fn run_ui_overlay_loop(
     eprintln!("[UiOverlay] Main loop stopped (shutdown).");
 }
 
+/// Query the local skin library cache to check whether a skin has chromas.
+/// Returns true if any entry for `champion_id` has a variant whose base skin
+/// number matches `skin_id % 1000`.  This mirrors the same logic used by the
+/// WebSocket `handle_chroma_data` handler and Rose's `get_chromas_for_skin`.
+fn skin_has_chromas(handle: &tauri::AppHandle, champion_id: i32, skin_id: i32) -> bool {
+    let state = handle.state::<AppState>();
+    let app_dir: String = match state.app_data_dir.try_lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return false,
+    };
+    let cache_path = PathBuf::from(&app_dir)
+        .join("cache")
+        .join("skin-library-index.json");
+    let content = match std::fs::read_to_string(&cache_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let all_skins = payload
+        .get("skins")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let champion_key = champion_id.to_string();
+    let champion_entries: Vec<&serde_json::Value> = all_skins
+        .iter()
+        .filter(|s| {
+            // Match championId as string (e.g. "123")
+            s.get("championId").and_then(|v| v.as_str()).unwrap_or("") == champion_key
+                // Match championId as number (e.g. 123)
+                || s.get("championId").and_then(|v| v.as_u64()).map(|n| n.to_string()).unwrap_or_default() == champion_key
+                // Match championKey as string
+                || s.get("championKey").and_then(|v| v.as_str()).unwrap_or("") == champion_key
+                // Match rawChampion as string
+                || s.get("rawChampion").and_then(|v| v.as_str()).unwrap_or("") == champion_key
+                // Match rawChampion as number
+                || s.get("rawChampion").and_then(|v| v.as_u64()).map(|n| n.to_string()).unwrap_or_default() == champion_key
+        })
+        .collect();
+    let target_skin_num = (skin_id % 1000) as u64;
+    let champion_id_num = champion_id as u64;
+    let has = champion_entries.iter().any(|e| {
+        let raw = e
+            .get("rawSkin")
+            .or_else(|| e.get("baseSkinId"))
+            .or_else(|| e.get("baseImageSkinNum"))
+            .or_else(|| e.get("imageSkinNum"))
+            .or_else(|| e.get("skinNum"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let base_id = if champion_id_num > 0 && raw < 1000 {
+            champion_id_num * 1000 + raw
+        } else {
+            raw
+        };
+        let variant_id = e
+            .get("variantId")
+            .or_else(|| e.get("rawVariant"))
+            .or_else(|| e.get("variantImageSkinNum"))
+            .or_else(|| e.get("variantNum"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let variant_id = if champion_id_num > 0 && variant_id < 1000 {
+            champion_id_num * 1000 + variant_id
+        } else {
+            variant_id
+        };
+        base_id > 0
+            && variant_id > 0
+            && variant_id != base_id
+            && (base_id % 1000 == target_skin_num || variant_id % 1000 == target_skin_num)
+    });
+    has
+}
+
 /// Synchronous helper that acquires the lock, processes UI, drops the lock,
 /// and returns whether any UI activity is pending.  This keeps the non‑Send
 /// `RwLockWriteGuard` out of the async state machine.
@@ -224,7 +306,7 @@ fn process_ui_updates_sync(
         if needs_notify {
             let champ_name = locked_champ_name.as_deref().unwrap_or("");
             let skin_name = current_skin_name.as_deref().unwrap_or("");
-            let has_chromas = false; // TODO: query from LCU scrapper
+            let has_chromas = skin_has_chromas(handle, champ_id, skin_id);
 
             let _ = handle.emit(
                 "ui:command",

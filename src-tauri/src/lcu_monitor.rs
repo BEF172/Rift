@@ -98,6 +98,9 @@ pub async fn start(handle: AppHandle) {
     let mut _last_lockfile: Option<Lockfile> = None;
     let mut ws_task: Option<tokio::task::JoinHandle<()>> = None;
     let ws_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Rose-style: null-phase grace period — only accept null phase after 3 consecutive nulls
+    let mut null_phase_count: u32 = 0;
+    const NULL_PHASE_GRACE: u32 = 3;
 
     loop {
         let lockfile = read_lockfile();
@@ -107,29 +110,44 @@ pub async fn start(handle: AppHandle) {
         if let Some(ref lf) = lockfile {
             let state = handle.state::<AppState>();
             let phase = read_phase_http(lf).await;
-            if let Some(ph) = phase {
+            // Rose-style: null-phase grace period — only accept null after NULL_PHASE_GRACE consecutive nulls
+            let phase = match phase {
+                Some(p) => { null_phase_count = 0; Some(p) }
+                None => {
+                    null_phase_count += 1;
+                    if null_phase_count >= NULL_PHASE_GRACE { None } else { continue }
+                }
+            };
+            if let Some(ref ph) = phase {
                 let prev = state.current_gameflow_phase.lock().await.clone();
-                if ph != prev {
+                if *ph != prev {
                     *state.current_gameflow_phase.lock().await = ph.clone();
-                    broadcast_phase(&handle, &ph, &prev).await;
-                    crate::overlay::check_cleanup(&handle, &ph, &prev).await;
+                    broadcast_phase(&handle, ph, &prev).await;
+                    crate::overlay::check_cleanup(&handle, ph, &prev).await;
                     // Reset lock tracking whenever we enter ChampSelect so a stale
                     // lock from the previous game cannot trigger a false exchange.
-                    if ph == "ChampSelect" && prev != "ChampSelect" {
+                    if ph.as_str() == "ChampSelect" && prev != "ChampSelect" {
                         reset_champ_select_lock_tracking();
+                        // Rose-style: clear owned skins cache on ChampSelect entry so
+                        // stale data from previous game doesn't affect skin forcing.
+                        if let Ok(mut set) = state.owned_skin_ids.write() {
+                            set.clear();
+                        }
+                        state.owned_skins_ready.store(false, Ordering::SeqCst);
                     }
-                    if ph != "ChampSelect" {
+                    if ph.as_str() != "ChampSelect" {
                         reset_champ_select_lock_tracking();
                     }
 
                     // Reset SwiftPlay state when leaving relevant phases
-                    if prev != ph {
+                    if prev != *ph {
                         let was_relevant = matches!(prev.as_str(), "Lobby" | "ChampSelect" | "Matchmaking" | "PreEndOfGame");
                         let now_relevant = matches!(ph.as_str(), "Lobby" | "ChampSelect" | "Matchmaking" | "PreEndOfGame");
                         if was_relevant && !now_relevant {
                             if let Ok(mut overlay) = state.ui_overlay.write() {
                                 overlay.is_swiftplay_mode = false;
                                 overlay.game_mode = None;
+                                overlay.map_id = None;
                                 overlay.queue_id = None;
                             }
                         }
@@ -144,10 +162,11 @@ pub async fn start(handle: AppHandle) {
                 last_swiftplay_check = now;
                 let current_phase = state.current_gameflow_phase.lock().await.clone();
                 if matches!(current_phase.as_str(), "Lobby" | "ChampSelect" | "Matchmaking" | "PreEndOfGame") {
-                    if let Some((is_sp, gm, qid)) = check_swiftplay(lf).await {
+                    if let Some((is_sp, gm, qid, mid)) = check_swiftplay(lf).await {
                         if let Ok(mut overlay) = state.ui_overlay.write() {
                             overlay.is_swiftplay_mode = is_sp;
                             overlay.game_mode = gm;
+                            overlay.map_id = mid;
                             overlay.queue_id = qid;
                         }
                     }
@@ -239,6 +258,23 @@ pub async fn start(handle: AppHandle) {
                 // Rose: _check_initial_champion_state after first WS + language
                 if !initial_ws_done && lcu_ok {
                     check_initial_champion_state(&handle).await;
+
+                    // Rose-style: refresh owned skins on initial LCU connection
+                    {
+                        let state = handle.state::<AppState>();
+                        match crate::gameflow::refresh_owned_skins(&state.owned_skin_ids, &state.owned_skins_ready).await {
+                            Ok(count) => {
+                                eprintln!("[LCUMonitor] Owned skins loaded on initial connect: {} skins.", count);
+                                let _ = handle.emit("lcu:owned-skins-refreshed", serde_json::json!({
+                                    "count": count,
+                                    "source": "initial-connect",
+                                }));
+                            }
+                            Err(error) => {
+                                eprintln!("[LCUMonitor] Failed to load owned skins on initial connect: {}", error);
+                            }
+                        }
+                    }
                 }
 
                 // Rose: reconnect callback (re-activate Pengu, re-init injection)
@@ -483,6 +519,11 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                     // lock from the previous game cannot trigger a false exchange.
                     if phase == "ChampSelect" && prev != "ChampSelect" {
                         reset_champ_select_lock_tracking();
+                        // Rose-style: clear owned skins cache on ChampSelect entry
+                        if let Ok(mut set) = state.owned_skin_ids.write() {
+                            set.clear();
+                        }
+                        state.owned_skins_ready.store(false, Ordering::SeqCst);
                     }
                     if phase != "ChampSelect" {
                         reset_champ_select_lock_tracking();
@@ -538,6 +579,8 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                                         overlay.locked_champ_id = Some(cid as i32);
                                     }
                                 }
+                                // Rose-style: feed base skin tracker when WS confirms skin
+                                crate::base_skin_tracker::on_skin_confirmed(skin_id);
                                 let _ = handle.emit("pengu:message", serde_json::json!({
                                     "type": "lcu-selection-state",
                                     "selectedSkinId": skin_id,
@@ -666,12 +709,7 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                 // Rose: skin scraper runs after exchange. Emit champion-locked
                 // with LCU skin data so frontend can resolve without waiting for DOM.
                 let new_skin_id = extract_skin_id_for_cell(&event_data, LOCAL_CELL_ID.lock().ok().and_then(|g| *g));
-                let _ = handle.emit("pengu:message", serde_json::json!({
-                    "type": "champion-locked",
-                    "championId": new_champ,
-                    "selectedSkinId": new_skin_id,
-                    "source": "lcu-ws-exchange",
-                }));
+                broadcast_champion_locked(handle, new_champ, new_skin_id, "lcu-ws-exchange", None).await;
             }
 
             // Rose-style: first local completed lock is handled directly from
@@ -702,13 +740,7 @@ async fn handle_wamp_event(handle: &AppHandle, text: &str) {
                         overlay.locked_champ_id = Some(champ_id as i32);
                         overlay.selected_skin_id = if skin_id > 0 { Some(skin_id as i32) } else { None };
                     }
-                    let _ = handle.emit("pengu:message", serde_json::json!({
-                        "type": "champion-locked",
-                        "championId": champ_id,
-                        "selectedSkinId": skin_id,
-                        "source": "lcu-ws",
-                        "cellId": my_cell,
-                    }));
+                    broadcast_champion_locked(handle, champ_id, skin_id, "lcu-ws", Some(my_cell)).await;
                 }
             }
 
@@ -773,7 +805,7 @@ async fn read_phase_http(lockfile: &Lockfile) -> Option<String> {
 /// Rose-style SwiftPlay detection from LCU session data.
 /// Polls `/lol-gameflow/v1/session` for queue info and returns
 /// `(is_swiftplay, game_mode, queue_id)`. Returns `None` on failure.
-async fn check_swiftplay(lockfile: &Lockfile) -> Option<(bool, Option<String>, Option<u64>)> {
+async fn check_swiftplay(lockfile: &Lockfile) -> Option<(bool, Option<String>, Option<u64>, Option<u64>)> {
     let auth = base64::engine::general_purpose::STANDARD
         .encode(format!("riot:{}", lockfile.password));
     let url = format!(
@@ -798,10 +830,11 @@ async fn check_swiftplay(lockfile: &Lockfile) -> Option<(bool, Option<String>, O
     let queue = session.get("gameData")?.get("queue")?;
     let game_mode = queue.get("gameMode").and_then(|v| v.as_str()).map(String::from);
     let queue_id = queue.get("queueId").and_then(|v| v.as_u64());
+    let map_id = session.get("gameData")?.get("map").and_then(|v| v.get("mapId")).and_then(|v| v.as_u64());
     let is_swiftplay = game_mode.as_deref().map(|m| m == "SWIFTPLAY" || m == "BRAWL").unwrap_or(false)
         || queue_id == Some(480);
 
-    Some((is_swiftplay, game_mode, queue_id))
+    Some((is_swiftplay, game_mode, queue_id, map_id))
 }
 
 /// Detect LCU language (Rose: LCUProperties.client_language)
@@ -871,6 +904,23 @@ async fn on_lcu_reconnect(handle: &AppHandle) {
     commands::pengu_install_rift_plugin_inner(&token_dir).ok();
     if let Ok(result) = commands::detect_league_path().await {
         let _ = handle.emit("app:league-detected", result);
+    }
+
+    // Rose-style: refresh owned skins from LCU on reconnect
+    {
+        let state = handle.state::<AppState>();
+        match crate::gameflow::refresh_owned_skins(&state.owned_skin_ids, &state.owned_skins_ready).await {
+            Ok(count) => {
+                eprintln!("[LCUMonitor] Owned skins refreshed on reconnect: {} skins.", count);
+                let _ = handle.emit("lcu:owned-skins-refreshed", serde_json::json!({
+                    "count": count,
+                    "source": "reconnect",
+                }));
+            }
+            Err(error) => {
+                eprintln!("[LCUMonitor] Failed to refresh owned skins on reconnect: {}", error);
+            }
+        }
     }
 
     let _ = handle.emit("lcu:reconnect-done", serde_json::json!({
@@ -972,13 +1022,7 @@ async fn check_initial_champion_state(handle: &AppHandle) {
                 if let Ok(mut locks) = LAST_LOCKS.lock() {
                     *locks = Some(lk);
                 }
-                let _ = handle.emit("pengu:message", serde_json::json!({
-                    "type": "champion-locked",
-                    "championId": champ_id,
-                    "selectedSkinId": skin_id,
-                    "source": "lcu-monitor-late-lock",
-                    "cellId": my_cell,
-                }));
+                broadcast_champion_locked(handle, champ_id, skin_id, "lcu-monitor-late-lock", Some(my_cell)).await;
                 return;
             }
         }
@@ -986,20 +1030,48 @@ async fn check_initial_champion_state(handle: &AppHandle) {
 }
 
 /// Broadcast phase change to frontend and bridge (Rose-style)
-async fn broadcast_phase(handle: &AppHandle, phase: &str, previous: &str) {
+async fn broadcast_champion_locked(handle: &AppHandle, champion_id: u64, skin_id: u64, source: &str, cell_id: Option<u64>) {
+    let state = handle.state::<AppState>();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut payload = serde_json::json!({
+        "type": "champion-locked",
+        "locked": true,
+        "championId": champion_id,
+        "selectedSkinId": skin_id,
+        "source": source,
+        "timestamp": now_ms,
+    });
+    if let Some(cid) = cell_id {
+        payload["cellId"] = serde_json::json!(cid);
+    }
+    let _ = handle.emit("pengu:message", payload.clone());
+    if let Ok(text) = serde_json::to_string(&payload) {
+        if let Some(tx) = state.pengu_bridge_tx.lock().await.as_ref() {
+            let _ = tx.send(text);
+        }
+    }
+}
+
+async fn broadcast_phase(handle: &AppHandle, phase: &str, _previous: &str) {
     let state = handle.state::<AppState>();
     // Read game mode info from overlay state (set by check_swiftplay polling)
-    let (game_mode, queue_id) = {
+    let (game_mode, map_id, queue_id) = {
         let overlay = state.ui_overlay.read().unwrap_or_else(|e| e.into_inner());
-        (overlay.game_mode.clone(), overlay.queue_id)
+        (overlay.game_mode.clone(), overlay.map_id, overlay.queue_id)
     };
     let payload = serde_json::json!({
         "type": "phase-change",
         "phase": phase,
-        "previousPhase": previous,
         "gameMode": game_mode,
+        "mapId": map_id,
         "queueId": queue_id,
-        "source": "lcu-ws",
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
     });
     // Rose-style: update UI overlay state
     if let Ok(mut overlay) = state.ui_overlay.write() {

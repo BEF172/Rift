@@ -102,6 +102,7 @@ fn migrate_to_writable_data_dir(install_dir: &std::path::Path) {
 
 // App State
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -128,6 +129,10 @@ pub struct AppState {
     pub bridge_ready: Arc<AtomicBool>,
     pub ui_overlay: Arc<RwLock<ui_overlay::UiOverlayState>>,
     pub selected_mods: Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    /// Rose-style: owned skin IDs from LCU inventory, refreshed on connect.
+    pub owned_skin_ids: Arc<RwLock<HashSet<u64>>>,
+    /// Whether owned_skin_ids has been populated at least once from LCU.
+    pub owned_skins_ready: Arc<AtomicBool>,
 }
 
 fn begin_shutdown_cleanup(app: &AppHandle) {
@@ -489,6 +494,8 @@ pub fn run() {
             bridge_ready: Arc::new(AtomicBool::new(false)),
             ui_overlay: Arc::new(RwLock::new(ui_overlay::UiOverlayState::new())),
             selected_mods: Mutex::new(std::collections::HashMap::new()),
+            owned_skin_ids: Arc::new(RwLock::new(HashSet::new())),
+            owned_skins_ready: Arc::new(AtomicBool::new(false)),
         })
         .setup(move |app| {
             let app_data = install_dir();
@@ -815,6 +822,9 @@ pub fn run() {
             commands::get_lcu_champion_skins,
             commands::get_lcu_owned_skins,
             commands::force_lcu_skin_selection,
+            commands::force_skin_with_ownership_check,
+            commands::check_skin_ownership,
+            commands::refresh_owned_skins,
             commands::wait_for_lcu_finalization_threshold,
             commands::check_champion_lock,
             commands::resolve_league_skin_package,

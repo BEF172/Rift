@@ -35,6 +35,62 @@ pub async fn force_lcu_skin_selection(
     gameflow::force_selected_skin(champion_id, selected_skin_id).await
 }
 
+/// Rose-style: force skin with ownership check. Atomic operation that:
+/// 1. Checks if the skin is owned via LCU inventory
+/// 2. If owned → PATCH actual skin ID (game loads from Riot servers)
+/// 3. If unowned → PATCH base skin (champion_id * 1000), overlay WAD needed
+/// 4. Returns decision info so frontend knows whether to include overlay WADs
+#[tauri::command]
+pub async fn force_skin_with_ownership_check(
+    champion_id: u64,
+    target_skin_id: u64,
+    selected_chroma_id: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    gameflow::force_skin_rose_style(
+        &state.owned_skin_ids,
+        &state.owned_skins_ready,
+        champion_id,
+        target_skin_id,
+        selected_chroma_id,
+    )
+    .await
+}
+
+/// Rose-style: check if a skin ID is owned. Returns ownership status.
+/// Returns { owned: bool, ready: bool, isDefault: bool }
+#[tauri::command]
+pub async fn check_skin_ownership(
+    skin_id: u64,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let ready = state.owned_skins_ready.load(Ordering::SeqCst);
+    let is_default = gameflow::is_default_skin(skin_id);
+    let owned = if let Ok(set) = state.owned_skin_ids.read() {
+        gameflow::is_skin_owned(&set, skin_id)
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "skinId": skin_id,
+        "owned": owned,
+        "ready": ready,
+        "isDefault": is_default,
+    }))
+}
+
+/// Rose-style: refresh owned skins from LCU inventory.
+#[tauri::command]
+pub async fn refresh_owned_skins(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let count = gameflow::refresh_owned_skins(&state.owned_skin_ids, &state.owned_skins_ready).await?;
+    Ok(serde_json::json!({
+        "count": count,
+        "source": "manual-refresh",
+    }))
+}
+
 #[tauri::command]
 pub async fn wait_for_lcu_finalization_threshold(
     threshold_ms: u64,
@@ -4807,12 +4863,30 @@ pub(crate) fn pengu_install_rift_plugin_inner(app_dir: &str) -> Result<serde_jso
     // Build candidate root paths
     let mut root_candidates: Vec<PathBuf> = Vec::new();
 
-    // 1. Bundled resource dir (Tauri resource_dir)
+    // 1. Dev source tree. In debug, the Tauri resource copy can be stale until
+    // the next rebuild; prefer the live plugin source so "Reaplicar Pengu"
+    // installs the code being edited.
+    #[cfg(debug_assertions)]
+    {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        push_unique_path(
+            &mut root_candidates,
+            cwd.join("Pengu Loader").join("plugins"),
+        );
+
+        let cargo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        push_unique_path(
+            &mut root_candidates,
+            cargo_root.join("..").join("Pengu Loader").join("plugins"),
+        );
+    }
+
+    // 2. Bundled resource dir (Tauri resource_dir)
     if let Some(dir) = PENGU_PLUGIN_RESOURCE_DIR.get() {
         push_unique_path(&mut root_candidates, dir.clone());
     }
 
-    // 2. Relative to current_exe parent dir (production NSIS install)
+    // 3. Relative to current_exe parent dir (production NSIS install)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             push_unique_path(&mut root_candidates, parent.join("bundled-plugins"));
@@ -4823,7 +4897,7 @@ pub(crate) fn pengu_install_rift_plugin_inner(app_dir: &str) -> Result<serde_jso
         }
     }
 
-    // 3. Try relative to exe with ../ (Tauri NSIS may place resources one level up)
+    // 4. Try relative to exe with ../ (Tauri NSIS may place resources one level up)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             if let Some(grandparent) = parent.parent() {
@@ -4836,7 +4910,7 @@ pub(crate) fn pengu_install_rift_plugin_inner(app_dir: &str) -> Result<serde_jso
         }
     }
 
-    // 4. Dev-only fallbacks. Avoid leaking the CI compile path embedded by
+    // 5. Dev-only fallbacks. Avoid leaking the CI compile path embedded by
     // env!("CARGO_MANIFEST_DIR") into installed builds.
     let cwd = std::env::current_dir().unwrap_or_default();
     push_unique_path(
