@@ -20,6 +20,47 @@ const DISCOVERY_START_PORT: u16 = 50000;
 const DISCOVERY_END_PORT: u16 = 50010;
 const ASSET_PORT: u16 = 45732;
 
+/// Rose parity: form skin IDs that map to base skin IDs.
+/// When resolving preview paths, form IDs must be mapped to their base skin ID
+/// so files are found under the correct directory (e.g., skins/99/99007/99991/).
+static FORM_SKIN_MAP: std::sync::LazyLock<std::collections::HashMap<u64, u64>> =
+    std::sync::LazyLock::new(|| {
+        let mut m = std::collections::HashMap::new();
+        // Elementalist Lux (base 99007, forms 99991-99999)
+        for id in 99991..=99999 { m.insert(id, 99007); }
+        // Sahn Uzal Mordekaiser (base 82054, forms 82998-82999)
+        m.insert(82998, 82054); m.insert(82999, 82054);
+        // Spirit Blossom Morgana (base 25080, form 25999)
+        m.insert(25999, 25080);
+        // Radiant Sett (base 875066, forms 875998-875999)
+        m.insert(875998, 875066); m.insert(875999, 875066);
+        // K/DA Seraphine (base 147001, forms 147002-147003)
+        m.insert(147002, 147001); m.insert(147003, 147001);
+        // DJ Sona (base 37006, forms 37998-37999)
+        m.insert(37998, 37006); m.insert(37999, 37006);
+        // Arcane Fractured Jinx (base 222060, forms 222998-222999)
+        m.insert(222998, 222060); m.insert(222999, 222060);
+        // Risen Legend Kai'Sa (base 145070, form 145071)
+        m.insert(145071, 145070);
+        // Viego Broken Crown (base 234043, forms 234994-234999)
+        for id in 234994..=234999 { m.insert(id, 234043); }
+        // Gun Goddess Miss Fortune (base 21016, forms 21997-21999)
+        m.insert(21997, 21016); m.insert(21998, 21016); m.insert(21999, 21016);
+        // Immortalized Legend Kai'Sa (base 145070, HOL chroma 100001)
+        m.insert(100001, 145070);
+        // Immortalized Legend Ahri (base 103085, forms 103086-103087)
+        m.insert(103086, 103085); m.insert(103087, 103085);
+        // Ahri HOL chroma (base 103085, chroma 88888)
+        m.insert(88888, 103085);
+        m
+    });
+
+/// If `id` is a known form/chroma skin ID, return its base skin ID.
+/// Otherwise return `id` unchanged.
+fn resolve_form_to_base_skin_id(id: u64) -> u64 {
+    FORM_SKIN_MAP.get(&id).copied().unwrap_or(id)
+}
+
 /// Rose-style LCU skin data cache: championId -> Vec of {id, name, chromas}
 /// Populated lazily from the LCU API on first request per champion.
 static LCU_SKIN_CACHE: std::sync::LazyLock<Arc<RwLock<std::collections::HashMap<u64, Vec<LcuSkinEntry>>>>> =
@@ -826,7 +867,8 @@ async fn resolve_skin_state_from_cache(
 
     let normalized_input = skin_name.to_lowercase();
 
-    // Find matching skin entries by name (case-insensitive)
+    // Find matching skin entries by name (case-insensitive), scoped by champion
+    // when champion_id is known to prevent cross-champion name collisions
     let matching_entries: Vec<&serde_json::Value> = all_skins
         .iter()
         .filter(|s| {
@@ -840,8 +882,23 @@ async fn resolve_skin_state_from_cache(
                 .or_else(|| s.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            entry_name.to_lowercase() == normalized_input
-                || entry_display.to_lowercase() == normalized_input
+            let name_matches = entry_name.to_lowercase() == normalized_input
+                || entry_display.to_lowercase() == normalized_input;
+            if !name_matches {
+                return false;
+            }
+            // Champion-scoped: if we know the champion, skip entries for other champions
+            if champion_id > 0 {
+                let entry_champ = s.get("championId")
+                    .or_else(|| s.get("championKey"))
+                    .or_else(|| s.get("rawChampion"))
+                    .and_then(json_to_u64)
+                    .unwrap_or(0);
+                if entry_champ > 0 && entry_champ != champion_id {
+                    return false;
+                }
+            }
+            true
         })
         .collect();
 
@@ -1225,70 +1282,66 @@ async fn handle_local_preview(
     let state = _handle.state::<AppState>();
     let app_dir = state.app_data_dir.lock().await.clone();
 
-    // Primary search path: Rift Atlas LeagueSkins directory
+    // Rose parity: resolve form skin IDs back to base skin IDs for file search.
+    // Form skins (e.g., Elementalist Lux 99991) store files under the base skin
+    // directory (99007/99991/), not under the form ID directory.
+    let chroma_num = chroma_id;
+    let resolved_skin_id = resolve_form_to_base_skin_id(skin_id.parse::<u64>().unwrap_or(0));
+    let resolved_chroma_id = resolve_form_to_base_skin_id(chroma_num);
+
+    // Use the resolved base skin ID for directory search if it differs from the original
+    let effective_skin_id = if resolved_skin_id != skin_id.parse::<u64>().unwrap_or(0) {
+        resolved_skin_id.to_string()
+    } else {
+        skin_id.clone()
+    };
+
+    // Rift Atlas LeagueSkins directory
     let league_skins_dir = PathBuf::from(&app_dir)
         .join("downloaded-libraries")
         .join("LeagueSkins")
         .join("skins")
         .join(&champion_id);
 
-    // Fallback: Rose LOCALAPPDATA skins directory
-    let rose_skins_dir = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join("Rose")
-        .join("skins")
-        .join(&champion_id);
-
-    // Collect all candidate skin directories to search
-    let skin_dirs: Vec<PathBuf> = [&league_skins_dir, &rose_skins_dir]
-        .into_iter()
-        .filter(|d| d.exists())
-        .cloned()
-        .collect();
-
-    // If no existing dirs found, still try primary (for error path)
-    let skin_dirs = if skin_dirs.is_empty() {
+    let skin_dirs = if league_skins_dir.exists() {
         vec![league_skins_dir.clone()]
     } else {
-        skin_dirs
+        vec![league_skins_dir.clone()]
     };
 
     let extensions = [".png", ".jpg", ".jpeg", ".webp"];
     let chroma_str = chroma_id.to_string();
+    let effective_chroma_str = resolved_chroma_id.to_string();
     let mut full_path: Option<PathBuf> = None;
+
+    // Rose parity: also search under the resolved base skin ID directory.
+    // Form skins store files under the base skin directory, not the form ID directory.
+    let search_skin_ids: Vec<&str> = if effective_skin_id != skin_id {
+        vec![&effective_skin_id, &skin_id]
+    } else {
+        vec![&skin_id]
+    };
 
     // Search for preview image in multiple locations across all candidate dirs
     for base_dir in &skin_dirs {
-        // 1. Try base skin path: skins/{championId}/{skinId}/{skinId}.png
-        if chroma_str == skin_id {
-            let dir = base_dir.join(&skin_id);
-            for ext in &extensions {
-                let file = dir.join(format!("{}{}", skin_id, ext));
-                if file.exists() {
-                    full_path = Some(file);
-                    break;
+        for s_id in &search_skin_ids {
+            if full_path.is_some() { break; }
+
+            // 1. Try base skin path: skins/{championId}/{skinId}/{skinId}.png
+            if chroma_str == *s_id {
+                let dir = base_dir.join(s_id);
+                for ext in &extensions {
+                    let file = dir.join(format!("{}{}", s_id, ext));
+                    if file.exists() {
+                        full_path = Some(file);
+                        break;
+                    }
                 }
             }
-        }
 
-        // 2. Try direct file in skin directory: skins/{championId}/{skinId}/{chromaId}.png
-        if full_path.is_none() {
-            let dir = base_dir.join(&skin_id);
-            for ext in &extensions {
-                let file = dir.join(format!("{}{}", chroma_str, ext));
-                if file.exists() {
-                    full_path = Some(file);
-                    break;
-                }
-            }
-        }
-
-        // 3. Try chroma subfolder: skins/{championId}/{skinId}/{chromaId}/{chromaId}.png
-        if full_path.is_none() {
-            for s_id in [&skin_id, &chroma_str] {
-                let dir = base_dir.join(s_id).join(&chroma_str);
+            // 2. Try direct file in skin directory: skins/{championId}/{skinId}/{chromaId}.png
+            if full_path.is_none() {
+                let dir = base_dir.join(s_id);
                 for ext in &extensions {
                     let file = dir.join(format!("{}{}", chroma_str, ext));
                     if file.exists() {
@@ -1296,8 +1349,20 @@ async fn handle_local_preview(
                         break;
                     }
                 }
-                if full_path.is_some() {
-                    break;
+            }
+
+            // 3. Try chroma subfolder: skins/{championId}/{skinId}/{chromaId}/{chromaId}.png
+            if full_path.is_none() {
+                for c_id in [&chroma_str, &effective_chroma_str] {
+                    let dir = base_dir.join(s_id).join(c_id);
+                    for ext in &extensions {
+                        let file = dir.join(format!("{}{}", c_id, ext));
+                        if file.exists() {
+                            full_path = Some(file);
+                            break;
+                        }
+                    }
+                    if full_path.is_some() { break; }
                 }
             }
         }
@@ -1309,13 +1374,15 @@ async fn handle_local_preview(
 
     if let Some(ref path) = full_path {
         if path.exists() {
-            // Rose parity: always use .png in the preview URL regardless of actual file extension
+            // Rose parity: always use .png in the preview URL regardless of actual file extension.
+            // Use the resolved base skin ID in the URL so the HTTP handler finds the correct file.
+            let url_skin_id = resolved_skin_id;
             let response = serde_json::json!({
                 "type": "local-preview-url",
                 "championId": champion_id.parse::<u64>().unwrap_or(0),
-                "skinId": skin_id.parse::<u64>().unwrap_or(0),
+                "skinId": url_skin_id,
                 "chromaId": chroma_id,
-                "url": format!("http://localhost:{}/preview/{}/{}/{}/{}.png", ASSET_PORT, champion_id, skin_id, chroma_id, chroma_id),
+                "url": format!("http://localhost:{}/preview/{}/{}/{}/{}.png", ASSET_PORT, champion_id, url_skin_id, chroma_id, chroma_id),
                 "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
             });
             let _ = write
@@ -1375,26 +1442,18 @@ async fn handle_local_asset(
 
     let state = handle.state::<AppState>();
     let app_dir = state.app_data_dir.lock().await.clone();
-    let rose_assets = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join("Rose");
     let mut candidates = vec![
         PathBuf::from(&app_dir)
             .join("downloaded-libraries")
             .join("LeagueSkins")
             .join(&asset_path),
-        PathBuf::from(&app_dir).join("assets").join(&asset_path),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("assets")
-            .join(&asset_path),
-        rose_assets.join(&asset_path),
     ];
 
     if let Ok(resource_dir) = handle.path().resource_dir() {
         candidates.push(resource_dir.join("assets").join(&asset_path));
+    }
+
+    if let Ok(resource_dir) = handle.path().resource_dir() {
         candidates.push(resource_dir.join(&asset_path));
     }
 

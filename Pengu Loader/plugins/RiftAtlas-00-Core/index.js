@@ -466,6 +466,7 @@
   function handleSkipBaseSkin() {
     lastBaseSkinSkipRequest = Date.now();
     console.log(`${LOG_PREFIX} received base skin skip request`);
+    window.dispatchEvent(new CustomEvent("rift-atlas-hide-ui"));
   }
 
   function interceptChampSelectWebsocket() {

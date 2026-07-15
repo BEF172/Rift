@@ -606,8 +606,12 @@ pub fn run() {
             // Iniciar servidor de assets (previews HTTP, puerto 45732)
             // Asset server serves downloaded skins → writable data dir
             let asset_app_dir = writable_data.to_string_lossy().to_string();
+            let asset_source_dir = env!("CARGO_MANIFEST_DIR").to_string();
+            let asset_resource_dir = app.handle().path().resource_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
             tauri::async_runtime::spawn(async move {
-                asset_server::start_asset_server(asset_app_dir).await;
+                asset_server::start_asset_server(asset_app_dir, asset_source_dir, asset_resource_dir).await;
             });
 
             // Rose-style: cleanup old IFEO registry entry that can crash the client

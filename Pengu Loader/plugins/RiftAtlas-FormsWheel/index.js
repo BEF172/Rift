@@ -5496,6 +5496,14 @@
     }
   }
 
+  window.addEventListener("rift-atlas-hide-ui", () => {
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) {
+      log.info("[FormsWheel] Hiding panel on skip-base-skin");
+      panel.style.display = "none";
+    }
+  });
+
   if (typeof document === "undefined") {
     log.warn("document unavailable; aborting");
     return;

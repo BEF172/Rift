@@ -6,11 +6,37 @@ use tokio::net::{TcpListener, TcpStream};
 
 const ASSET_PORT: u16 = 45732;
 
-pub struct AssetState {
-    pub app_data_dir: String,
+/// Rose parity: form skin IDs that map to base skin IDs.
+static FORM_SKIN_MAP: std::sync::LazyLock<std::collections::HashMap<u64, u64>> =
+    std::sync::LazyLock::new(|| {
+        let mut m = std::collections::HashMap::new();
+        for id in 99991..=99999 { m.insert(id, 99007); }
+        m.insert(82998, 82054); m.insert(82999, 82054);
+        m.insert(25999, 25080);
+        m.insert(875998, 875066); m.insert(875999, 875066);
+        m.insert(147002, 147001); m.insert(147003, 147001);
+        m.insert(37998, 37006); m.insert(37999, 37006);
+        m.insert(222998, 222060); m.insert(222999, 222060);
+        m.insert(145071, 145070);
+        for id in 234994..=234999 { m.insert(id, 234043); }
+        m.insert(21997, 21016); m.insert(21998, 21016); m.insert(21999, 21016);
+        m.insert(100001, 145070);
+        m.insert(103086, 103085); m.insert(103087, 103085);
+        m.insert(88888, 103085);
+        m
+    });
+
+fn resolve_form_to_base_skin_id(id: u64) -> u64 {
+    FORM_SKIN_MAP.get(&id).copied().unwrap_or(id)
 }
 
-pub async fn start_asset_server(app_data_dir: String) {
+pub struct AssetState {
+    pub app_data_dir: String,
+    pub source_tree_dir: String,
+    pub resource_dir: String,
+}
+
+pub async fn start_asset_server(app_data_dir: String, source_tree_dir: String, resource_dir: String) {
     let addr = format!("127.0.0.1:{}", ASSET_PORT);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -23,7 +49,7 @@ pub async fn start_asset_server(app_data_dir: String) {
         }
     };
 
-    let state = Arc::new(AssetState { app_data_dir });
+    let state = Arc::new(AssetState { app_data_dir, source_tree_dir, resource_dir });
 
     loop {
         match listener.accept().await {
@@ -131,11 +157,29 @@ async fn handle_preview(path: &str, state: &Arc<AssetState>, origin: Option<&str
         return not_found();
     }
     let champion_id = parts[2];
-    let skin_id = parts[3];
-    let chroma_id = parts[4];
-    if !is_safe_id(champion_id) || !is_safe_id(skin_id) || !is_safe_id(chroma_id) {
+    let skin_id_raw = parts[3];
+    let chroma_id_raw = parts[4];
+    if !is_safe_id(champion_id) || !is_safe_id(skin_id_raw) || !is_safe_id(chroma_id_raw) {
         return not_found();
     }
+
+    // Rose parity: resolve form skin IDs to base skin IDs for file search
+    let skin_id_num = skin_id_raw.parse::<u64>().unwrap_or(0);
+    let chroma_id_num = chroma_id_raw.parse::<u64>().unwrap_or(0);
+    let resolved_skin_id = resolve_form_to_base_skin_id(skin_id_num);
+    let resolved_chroma_id = resolve_form_to_base_skin_id(chroma_id_num);
+
+    // Build search IDs: try resolved base skin ID first, then original
+    let skin_ids: Vec<String> = if resolved_skin_id != skin_id_num {
+        vec![resolved_skin_id.to_string(), skin_id_raw.to_string()]
+    } else {
+        vec![skin_id_raw.to_string()]
+    };
+    let chroma_ids: Vec<String> = if resolved_chroma_id != chroma_id_num {
+        vec![resolved_chroma_id.to_string(), chroma_id_raw.to_string()]
+    } else {
+        vec![chroma_id_raw.to_string()]
+    };
 
     let league_skins_dir = PathBuf::from(&state.app_data_dir)
         .join("downloaded-libraries")
@@ -156,15 +200,6 @@ async fn handle_preview(path: &str, state: &Arc<AssetState>, origin: Option<&str
         .join("skins")
         .join(champion_id);
 
-    let skin_ids = vec![
-        skin_id.to_string(),
-        format!("{}", skin_id.parse::<u64>().unwrap_or(0)),
-    ];
-    let chroma_ids = vec![
-        chroma_id.to_string(),
-        format!("{}", chroma_id.parse::<u64>().unwrap_or(0)),
-    ];
-
     let extensions = [".png", ".jpg", ".jpeg", ".webp"];
 
     // Search in all candidate directories
@@ -174,7 +209,7 @@ async fn handle_preview(path: &str, state: &Arc<AssetState>, origin: Option<&str
     ];
 
     for (base_dir, check_allowed) in &candidates {
-        if chroma_id == skin_id {
+        if chroma_id_raw == skin_id_raw {
             for s_id in &skin_ids {
                 let dir = base_dir.join(s_id);
                 for ext in &extensions {
@@ -257,15 +292,23 @@ async fn handle_asset(path: &str, state: &Arc<AssetState>, origin: Option<&str>)
         .join("downloaded-libraries")
         .join("LeagueSkins");
 
-    let rose_skins_root = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join("Rose");
+    // Source tree assets (dev builds): {project_root}/assets/
+    let source_tree_assets = PathBuf::from(&state.source_tree_dir)
+        .join("assets");
+
+    // App data assets: {app_data}/assets/
+    let app_data_assets = PathBuf::from(&state.app_data_dir)
+        .join("assets");
+
+    // Resource dir assets (installed builds): {install_dir}/assets/
+    let resource_assets = PathBuf::from(&state.resource_dir)
+        .join("assets");
 
     let candidates = vec![
         (league_skins_root.join(relative), Some(&league_skins_root)),
-        (rose_skins_root.join(relative), None),
+        (resource_assets.join(relative), None),
+        (app_data_assets.join(relative), None),
+        (source_tree_assets.join(relative), None),
     ];
 
     for (candidate, check_allowed) in &candidates {

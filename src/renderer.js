@@ -3289,7 +3289,10 @@ const resolveSkinSyncPayloadWithLcu = async (payload = {}) => {
       bestScore = score;
     }
   }
-  if (!best) return payload;
+  if (!best || bestScore < 0.6) {
+    window.riftAtlas.appendOverlayLog(`[RoseLCU] "${requestedName}" no resolvio en LCU (bestScore=${bestScore >= 0 ? bestScore.toFixed(3) : "N/A"} < 0.6).`).catch(() => { });
+    return payload;
+  }
   window.riftAtlas.appendOverlayLog(`[RoseLCU] "${requestedName}" -> skinId=${best.id} name="${best.name}" score=${bestScore.toFixed(3)}`).catch(() => { });
   const resolvedBaseSkinId = Number(skinMap.baseSkinByChroma?.get(best.id) || best.id);
   const resolvedHasChromas = [...(skinMap.baseSkinByChroma?.values?.() || [])]
@@ -3300,7 +3303,7 @@ const resolveSkinSyncPayloadWithLcu = async (payload = {}) => {
     resolvedBaseSkinId,
     resolvedSkinName: best.name,
     resolvedHasChromas,
-    resolutionSource: "lcu"
+    resolutionSource: "lcu-fuzzy"
   });
 };
 
@@ -4337,15 +4340,32 @@ async function handlePenguSkinSync(payload = {}) {
     }
     window.riftAtlas.appendOverlayLog(`[Diagnostico] NO se encontro skin local para: ${payload.skin || payload.selectedSkinId || payload.chromaId || "desconocida"}`).catch(() => { });
     // Rose keeps last_hovered_skin_id even when there is no local package. If
-    // the LCU resolved a real skin ID, commit it so FINALIZATION can at least
-    // force the owned/base skin in the client and so a queued custom mod for the
-    // same champion can still be injected.
+    // the LCU resolved a real skin ID, commit it and force the LCU to base/owned
+    // skin — mirroring Rose _inject_unowned_skin() which always forces base skin
+    // when the resolved skin is not owned.
     if (Number(payload.resolvedSkinId || 0) > 0) {
       const fallbackPayload = { ...payload, _noLocalPackage: true };
       commitRoseAuthoritativeSelection(fallbackPayload, pendingCustomMod);
       window.riftAtlas.appendOverlayLog(
         `[RoseResolver] seleccion autoritativa committeada sin paquete local: championId=${pendingChampionId} resolvedSkinId=${payload.resolvedSkinId}.`
       ).catch(() => { });
+      if (pendingCustomMod) {
+        window.riftAtlas.appendOverlayLog(
+          `[RoseResolver] sin paquete local pero hay custom mod programado: ${getSkinKey(pendingCustomMod)}.`
+        ).catch(() => { });
+      } else {
+        const fallbackSyntheticSkin = {
+          championId: pendingChampionId,
+          skinId: pendingSelectedSkinId,
+          custom: false,
+          path: "",
+        };
+        await maybeForceLeagueSkinForOverlay(fallbackSyntheticSkin, fallbackPayload).catch((error) => {
+          window.riftAtlas.appendOverlayLog(
+            `[RoseResolver] force base fallback error: ${error?.message || error}`
+          ).catch(() => { });
+        });
+      }
       return;
     }
     if (!pendingCustomMod) {
